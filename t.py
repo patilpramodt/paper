@@ -92,7 +92,7 @@ LOG_FILE       = "trader.log"
 PID_FILE       = "trader.pid"
 PREMARKET_TIME = dtime(9,  8)    # Start pre-market setup at 9:08 AM IST
 MARKET_START   = dtime(9, 14)    # Start WebSocket at 9:14 AM IST
-
+MARKET_END = dtime(15, 0)     # MarketHub forces WS close at 3:31 PM IST to avoid stale ticks next day
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LOGGING — Console + file, all strategies use same logger
