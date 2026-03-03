@@ -1,0 +1,104 @@
+==================================================
+
+PYTHON CORE
+
+==================================================
+
+pycache/ .py[cod] $py.class
+
+Compiled extensions
+
+.so .pyd *.dll
+
+Distribution / packaging
+
+.Python build/ dist/ develop-eggs/ downloads/ eggs/ .eggs/ lib/ lib64/
+parts/ sdist/ var/ .egg-info/ .installed.cfg .egg
+
+==================================================
+
+VIRTUAL ENVIRONMENT
+
+==================================================
+
+venv/ env/ ENV/ .venv/
+
+==================================================
+
+ENVIRONMENT VARIABLES / SECRETS
+
+==================================================
+
+.env .env. .env
+
+Zerodha / API tokens
+
+request_token.txt access_token.txt kite_session.json credentials.json
+api_keys.json token.json secrets.json
+
+==================================================
+
+LOG FILES
+
+==================================================
+
+.log logs/ .out
+
+==================================================
+
+CSV FILES (TRADES / SIGNALS / BACKTEST)
+
+==================================================
+
+*.csv !requirements.csv
+
+==================================================
+
+CACHE / DATA STORAGE
+
+==================================================
+
+.pickle .pkl .db .sqlite3 cache/ data_cache/
+
+==================================================
+
+JUPYTER
+
+==================================================
+
+.ipynb_checkpoints/
+
+==================================================
+
+TEST / COVERAGE
+
+==================================================
+
+.coverage htmlcov/ .pytest_cache/ .tox/
+
+==================================================
+
+IDE
+
+==================================================
+
+.vscode/ .idea/ *.iml
+
+==================================================
+
+OS FILES
+
+==================================================
+
+.DS_Store Thumbs.db
+
+==================================================
+
+ZIP / EXPORT FILES
+
+==================================================
+
+.zip .rar *.7z
+
+
+trader.pid
