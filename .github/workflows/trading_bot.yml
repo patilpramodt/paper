@@ -1,0 +1,42 @@
+name: Trading Bot - Auto Run
+
+on:
+  schedule:
+    - cron: '38 3 * * 1-5'   # 9:08 AM IST (UTC+5:30) Mon-Fri
+  workflow_dispatch:           # Manual trigger button in GitHub UI
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 420       # 7 hrs covers full trading day
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Trading Bot
+        env:
+          ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_USER_ID:     ${{ secrets.ZERODHA_USER_ID }}
+          ZERODHA_PASSWORD:    ${{ secrets.ZERODHA_PASSWORD }}
+          ZERODHA_TOTP_SECRET: ${{ secrets.ZERODHA_TOTP_SECRET }}
+        run: python t.py
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: |
+            logs/
+            trader.log
+            spike_trades.csv
+          retention-days: 30
