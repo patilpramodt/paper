@@ -553,7 +553,8 @@ class BBStochStrategy(BaseStrategy):
         bb    = sig.get("bb", {})
         stoch = sig.get("stoch", {})
         vwap_str = f"{vwap:.2f}" if vwap is not None else "N/A"
-        vol_str = f"{vol_ratio:.2f}x" if vol_ratio >= 0 else "N/A(no-data)"
+        vol_ratio_val = sig.get("vol_ratio", -1)
+        vol_str = f"{vol_ratio_val:.2f}x" if vol_ratio_val >= 0 else "N/A(no-data)"
         log.info(
             f"[BB_STOCH] {action:8s} | "
             f"Close={sig.get('close', 0):.2f} | "
