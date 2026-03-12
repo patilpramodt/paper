@@ -68,12 +68,11 @@ CFG = {
     # Bollinger Bands
     "bb_period"         : 20,       # rolling window for BB mean/std
     "bb_std"            : 2.0,      # number of std deviations for bands
-    "bb_squeeze_pct"    : 0.003,    # band-width / close < this = squeeze (skip)
-                                    # Lowered from 0.005 -> 0.003: allows entries on
-                                    # slow/compressed days while stoch+band-break still gate quality
+    "bb_squeeze_pct"    : 0.002,    # loosened: was 0.003 → 0.002 allows entries in tighter markets
+                                    # band-width / close < this = squeeze (skip)
 
     # Stochastic Oscillator
-    "stoch_k"           : 14,       # %K lookback period
+    "stoch_k"           : 9,        # %K lookback (lowered: was 14 → need=19 bars; 9 → need=14 bars matching min_bars)
     "stoch_d"           : 3,        # %D smoothing period (SMA of %K)
     "stoch_signal"      : 3,        # signal line smoothing
     "stoch_ob"          : 75,       # overbought level for PE reversal
@@ -81,7 +80,7 @@ CFG = {
 
     # Volume filter
     "vol_avg_period"    : 10,       # bars to compute average volume
-    "vol_mult"          : 1.2,      # current vol must be >= mult * avg_vol
+    "vol_mult"          : 1.0,      # loosened: was 1.2 (1.2 blocked valid signals on average-vol days)
 
     # VWAP
     "vwap_buffer"       : 10.0,     # allow entry within N pts of VWAP line
@@ -111,13 +110,13 @@ CFG = {
     "quantity"          : 35,       # lots
 
     # Signal persistence (candle bars)
-    "persistence"       : 2,        # signal must fire N consecutive 5-min bars
+    "persistence"       : 1,        # lowered: was 2 (10-min confirmation window misses fast 5m moves)
 
     # Minimum 5-min bars needed before first signal
-    # bb_period=20 is the binding constraint. stoch needs k+d+d=20 bars.
-    # 20 bars = 100 minutes from first candle. Reduced from 25 to allow
-    # trading even after a late bot start (25 bars = 125 min = often past noon).
-    "min_bars"          : 20,       # need >= bb_period
+    # With stoch_k=9: need = 9+3+2 = 14 bars → 14×5min = 70min from 9:15 = first signal ~10:25 AM
+    # BB now uses min_periods=bb_period//3 so it computes validly before 20 bars.
+    # Was 20 (100min from 9:15 → 10:55 AM, left only 3.5hrs trading window).
+    "min_bars"          : 14,       # was 20
 
     # CSV output
     "entry_csv"         : "logs/bb_stoch_entry.csv",
@@ -149,12 +148,18 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
     """
     Bollinger Bands on 'close'.
     Returns: mid, upper, lower, bw_pct (bandwidth as % of mid), squeeze (bool)
+
+    FIX: was returning squeeze=True unconditionally when len(df) < period.
+    This blocked BBStoch until bar 20 even when min_bars was lowered.
+    Now uses min_periods=period//3 so BB computes from partial history
+    and squeeze reflects actual bandwidth, not just data-unavailability.
     """
-    if len(df) < period:
+    if len(df) < 2:
         return {"mid": 0, "upper": 0, "lower": 0, "bw_pct": 0, "squeeze": True}
     close = df["close"].astype(float)
-    mid   = close.rolling(period).mean()
-    std   = close.rolling(period).std()
+    min_p = max(2, period // 3)   # allow partial-history computation
+    mid   = close.rolling(period, min_periods=min_p).mean()
+    std   = close.rolling(period, min_periods=min_p).std().fillna(0)
     upper = mid + nstd * std
     lower = mid - nstd * std
     m     = float(mid.iloc[-1])
@@ -168,8 +173,8 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
         "bw_pct"  : round(bw, 5),
         "squeeze" : bw < CFG["bb_squeeze_pct"],
         # Previous bar values (for crossover detection)
-        "prev_upper": round(float(upper.iloc[-2]), 2) if len(df) >= period + 1 else u,
-        "prev_lower": round(float(lower.iloc[-2]), 2) if len(df) >= period + 1 else l,
+        "prev_upper": round(float(upper.iloc[-2]), 2) if len(df) >= 2 else u,
+        "prev_lower": round(float(lower.iloc[-2]), 2) if len(df) >= 2 else l,
         "prev_close": round(float(close.iloc[-2]), 2) if len(df) >= 2 else float(close.iloc[-1]),
     }
 

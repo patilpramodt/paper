@@ -44,7 +44,7 @@ CANDLE_5M_USE       = 50
 # Session Windows
 # ------------------------------------------------------------------------------
 MARKET_OPEN         = (9,  15)
-SESSION_START       = (9,  45)   # No entries before this (opening chaos)
+SESSION_START       = (9,  30)   # No entries before this (was 9:45, missed early momentum)
 LUNCH_START         = (12, 30)
 LUNCH_END           = (13, 30)
 AFTERNOON_BLOCK     = (14, 30)   # Block NEW entries (dangerous reversal zone)
@@ -60,8 +60,8 @@ EXPIRY_ENTRY_CUTOFF = (12,  0)   # On expiry day  only trade morning session
 # Different from V6's ATR_MIN_PCT which checks absolute ATR level.
 # V6: "is ATR big enough?"  V7 also asks: "is ATR rising?"
 ATR_VOL_RATIO_WINDOW    = 20        # Rolling bars to compute mean ATR
-ATR_VOL_RATIO_MIN       = 0.8      # ATR / mean_ATR must be >= this
-ATR_VOL_RATIO_LUNCH_MIN = 1.0      # Stricter during lunch
+ATR_VOL_RATIO_MIN       = 0.70      # lowered: was 0.80 (allow slightly contracting vol)
+ATR_VOL_RATIO_LUNCH_MIN = 0.90      # lowered: was 1.0
 
 # ------------------------------------------------------------------------------
 # 
@@ -95,8 +95,8 @@ VWAP_BUFFER_PTS         = 5.0      # Allow entry within N pts of VWAP
 # ATR as % of spot must exceed this to allow ANY entries.
 # BankNifty at 50000: 0.08% = 40 pts ATR minimum
 # Below this = market not moving enough to hit your target
-ATR_MIN_PCT         = 0.030      # ATR/Spot * 100 must be >= this
-# NOTE: At BankNifty ~61000, 0.04% = ~24 pts ATR required.
+ATR_MIN_PCT         = 0.025      # lowered: was 0.030 (0.030 blocks normal-vol BankNifty days)
+# NOTE: At BankNifty ~61000, 0.025% = ~15 pts ATR required.
 # Old value was 0.08 (49 pts) which blocked all trades in low-vol markets.
 # Typical BankNifty ATR in normal markets: 20-50 pts (0.03-0.08%).
 # Raise back toward 0.06-0.08 on high-vol days if desired.
@@ -125,8 +125,8 @@ TRAIL_STEP          = 2.0       # Trail every N points after arm
 # 
 # EMA gap must be meaningful RELATIVE to ATR.
 # Prevents entering on tiny crosses during low-vol regimes.
-REGIME_EMA_ATR_RATIO    = 0.40  # ema_gap / atr14 must be >= this on 5-min
-REGIME_EMA_ATR_RATIO_1M = 0.25  # ema_gap / atr14 on 1-min
+REGIME_EMA_ATR_RATIO    = 0.25  # ema_gap / atr14 must be >= this on 5-min (lowered: was 0.40 — blocked all normal-trend days)
+REGIME_EMA_ATR_RATIO_1M = 0.15  # ema_gap / atr14 on 1-min (lowered: was 0.25)
 
 # ------------------------------------------------------------------------------
 # 
@@ -151,7 +151,7 @@ RSI_OVERSOLD        = 28
 # RSI must be rising (for CE) or falling (for PE).
 # 3-bar slope smoother than 1-bar.
 RSI_SLOPE_LOOKBACK  = 3         # RSI[now] - RSI[3 bars ago]
-RSI_SLOPE_MIN       = 1.5       # RSI must move at least 1.5 pts over 3 bars
+RSI_SLOPE_MIN       = 1.0       # lowered: was 1.5 (1.5 too strict in slow trends)
 
 # ------------------------------------------------------------------------------
 # 
@@ -175,7 +175,7 @@ MACD_SIGNAL_PERIOD  = 9
 #  V6 CORE FILTER 7  STRUCTURE BREAKOUT
 # 
 # Price must break above/below N-candle range before entry.
-STRUCTURE_LOOKBACK  = 5         # Number of candles to define the range
+STRUCTURE_LOOKBACK  = 3         # Number of candles to define the range (lowered: was 5 — too strict on ranging days)
 # For CE: close > max(high, last 5 candles)
 # For PE: close < min(low,  last 5 candles)
 
@@ -191,7 +191,7 @@ EMA_GAP_5M_FIXED    = 4.0       # Fallback fixed gap if ATR unavailable
 # ------------------------------------------------------------------------------
 # Signal Persistence
 # ------------------------------------------------------------------------------
-PERSISTENCE         = 2
+PERSISTENCE         = 1         # lowered: was 2 (2 consecutive bars = 2 min delay, misses moves)
 
 # ------------------------------------------------------------------------------
 # Lunch Window  Extra Strict

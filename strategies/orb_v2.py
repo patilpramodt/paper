@@ -30,11 +30,11 @@ CFG = {
     "or_start"          : dtime(9, 15),
     "or_end"            : dtime(9, 30),
     "entry_start"       : dtime(9, 40),
-    "entry_cutoff"      : dtime(10, 15),
+    "entry_cutoff"      : dtime(10, 30),  # widened: was 10:15 (missed slow breakouts)
     "time_stop"         : dtime(15, 15),
     "min_range"         : 180,
     "max_range"         : 400,
-    "gap_max_pct"       : 0.008,
+    "gap_max_pct"       : 0.012,  # widened: was 0.008 (blocked valid 0.8-1.2% gap days)
     "target_mult"       : 1.5,
     "trail_after_r"     : 1.0,
     "trail_sl_mult"     : 0.5,
@@ -51,16 +51,16 @@ CFG = {
     "st_period"         : 7,
     "st_mult"           : 3.0,
     "adx_period"        : 14,
-    "adx_min"           : 20,
+    "adx_min"           : 16,     # lowered: was 20 (ADX<20 common in first hour)
     "bb_period"         : 20,
     "bb_std"            : 2.0,
     "rsi_bull"          : 55,
     "rsi_bear"          : 45,
-    "vix_max"           : 20.0,
+    "vix_max"           : 24.0,   # raised: was 20.0 (India VIX routinely 20-24)
     "pcr_max"           : 1.3,
     "pcr_min"           : 0.7,
-    "min_score_normal"  : 5.0,
-    "min_score_0dte"    : 7.0,
+    "min_score_normal"  : 4.0,    # lowered: was 5.0 (score 5 rarely hit in calm markets)
+    "min_score_0dte"    : 6.0,    # lowered: was 7.0
     "slippage_pts"      : 2.0,
     "brokerage"         : 50,
     "csv_file"          : "orb_trades.csv",
@@ -242,8 +242,10 @@ class ORBStrategy(BaseStrategy):
             log.debug(f"[{self.name}]  PCR unavailable  skipping PCR filter")
 
         # Indicators + score
+        # NOTE: was 22, but entry window 9:40-10:30 = max 15 candles → 22 was unreachable.
+        # All indicators use min_periods=1 so 5 bars is sufficient for valid computation.
         candles = self._cb.get_closed()
-        if len(candles) < 22: return
+        if len(candles) < 5: return
         ind = self._compute_indicators(candles)
         if not ind: return
 

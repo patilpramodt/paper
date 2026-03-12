@@ -1,14 +1,12 @@
 name: Trading Bot - Auto Run
 
 on:
-  schedule:
-    - cron: '38 3 * * 1-5'   # 9:08 AM IST (UTC+5:30) Mon-Fri
   workflow_dispatch:           # Manual trigger button in GitHub UI
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 420       # 7 hrs covers full trading day
+    timeout-minutes: 355       # 7 hrs covers full trading day
 
     steps:
       - uses: actions/checkout@v4
@@ -19,9 +17,7 @@ jobs:
           cache: 'pip'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install scipy
+        run: pip install -r requirements.txt
 
       - name: Run Trading Bot
         env:
