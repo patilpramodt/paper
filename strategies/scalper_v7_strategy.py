@@ -107,6 +107,7 @@ class ScalperV7Strategy(BaseStrategy):
 
         #  Pre-market data (set in pre_market()) 
         self._instruments = None   # InstrumentStore from t.py (shared)
+        self._expiry_date = None   # nearest expiry date (from PreMarketData)
 
         #  Thread safety 
         self._lock = threading.Lock()
@@ -121,6 +122,7 @@ class ScalperV7Strategy(BaseStrategy):
         Returns True to activate today, False to skip.
         """
         self._instruments = instruments
+        self._expiry_date = premarket_data.expiry_date
         self._risk.reset_day()
 
         # Crash recovery  restore any trade open from previous run
@@ -464,14 +466,13 @@ class ScalperV7Strategy(BaseStrategy):
                 adj_strike = strike - strike_offset if opt_type == "CE" else strike + strike_offset
                 log.info(f"[ScalperV7] Expiry ITM offset: strike {strike}  {adj_strike}")
 
-            token = self._instruments.get_option_token(
-                strike    = adj_strike,
-                opt_type  = opt_type,
+            token, sym = self._instruments.get_option_token(
+                strike      = adj_strike,
+                opt_type    = opt_type,
+                expiry_date = self._expiry_date,
             )
             if token:
-                # Build tradingsymbol for logging (InstrumentStore may have it)
-                sym = getattr(self._instruments, "get_option_symbol", lambda *a: None)(adj_strike, opt_type) or f"BANKNIFTY_{adj_strike}{opt_type}"
-                return sym, token
+                return sym or f"BANKNIFTY_{adj_strike}{opt_type}", token
 
         except Exception as e:
             log.warning(f"[ScalperV7] InstrumentStore lookup failed: {e}  falling back to raw scan")
@@ -526,3 +527,4 @@ class ScalperV7Strategy(BaseStrategy):
         except Exception as e:
             log.error(f"[ScalperV7] Raw instrument scan failed: {e}")
             return None, None
+
