@@ -145,7 +145,6 @@ class PreMarketData:
                     from_date=datetime.combine(today - timedelta(days=7), dtime(9, 15)),
                     to_date=datetime.combine(today - timedelta(days=1), dtime(15, 30)),
                     interval="day",
-                    timeout=15,   # FIX: was 7s, now 15s
                 )
                 if raw:
                     prev = raw[-1]
@@ -170,7 +169,6 @@ class PreMarketData:
                     from_date=datetime.combine(today - timedelta(days=7), dtime(15, 20)),
                     to_date=datetime.combine(today - timedelta(days=1), dtime(15, 30)),
                     interval="5minute",
-                    timeout=15,
                 )
                 if raw5m:
                     last5m = raw5m[-1]
@@ -196,7 +194,6 @@ class PreMarketData:
                 from_date=datetime.now() - timedelta(days=300),
                 to_date=datetime.now(),
                 interval="day",
-                timeout=15,
             )
             if len(raw) >= 50:
                 closes = pd.Series([r["close"] for r in raw])
