@@ -52,7 +52,14 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
+
+# ── IST timezone (UTC+5:30) ───────────────────────────────────────────────────
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist():
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return datetime.now(tz=IST).replace(tzinfo=None)
 
 # ── Load .env file for local runs (silently ignored if file doesn't exist) ──
 try:
@@ -151,10 +158,6 @@ def main():
     acquire_pid_lock()
 
     # ── AUTO LOGIN ────────────────────────────────────────────────────────────
-    # Reads credentials from environment variables (or config_secrets.env).
-    #   - If token.json exists and was created TODAY  reuses it instantly.
-    #   - Otherwise  performs full TOTP login and writes a fresh token.json.
-    # MarketHub.load_kite() reads token.json as before — nothing else changes.
     log.info("=" * 60)
     log.info("  AUTO LOGIN")
     log.info("=" * 60)
@@ -178,7 +181,7 @@ def main():
     log.info(f"{len(strategies)} strategies loaded: {[s.name for s in strategies]}")
 
     # ── Sleep until pre-market setup time (9:08 AM IST) ──────────────────────
-    now = datetime.now()
+    now = now_ist()   # ← IST fix: was datetime.now() which gave UTC on GitHub
     if now.time() < PREMARKET_TIME:
         wait = (datetime.combine(now.date(), PREMARKET_TIME) - now).seconds
         log.info(f"Waiting {wait}s until 9:08 AM IST pre-market setup...")
@@ -192,7 +195,6 @@ def main():
     pm.fetch_all(hub.kite, index_token=260105, instruments=instruments)
 
     # Live refresh: VIX every 5 min, PCR every 10 min (market hours only).
-    # Keeps last known value on fetch failure — never blocks trading.
     pm.start_live_refresh(hub._done, vix_interval=300, pcr_interval=600)
 
     # ── Call each strategy's pre_market() with shared data ───────────────────
@@ -216,13 +218,10 @@ def main():
         return
 
     # ── Backfill historical candles (warm up indicators for late starts) ──────
-    # Fetches today's 5-min bars from 9:15 AM -> now, replays into strategies.
-    # If bot starts at 9:14 AM this is a no-op (no completed bars yet).
-    # If bot starts at 1:30 PM this fills ~80 candles of indicator history.
     hub.backfill(hub.kite, index_token=260105)
 
     # ── Sleep until WebSocket start time (9:14 AM IST) ───────────────────────
-    now = datetime.now()
+    now = now_ist()   # ← IST fix: was datetime.now() which gave UTC on GitHub
     if now.time() < MARKET_START:
         wait = (datetime.combine(now.date(), MARKET_START) - now).seconds
         log.info(f"Waiting {wait}s until 9:14 AM IST to start WebSocket...")
