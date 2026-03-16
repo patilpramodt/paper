@@ -16,13 +16,19 @@ import csv
 import logging
 import os
 import threading
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 
 from core.base_strategy import BaseStrategy
 from core.candle import SecondCandleBuilder
 
 log = logging.getLogger("strategy.spike")
+
+# IST FIX: GitHub Actions runners are UTC
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    return datetime.now(tz=_IST).replace(tzinfo=None)
 
 CFG = {
     "quantity"               : 15,
@@ -78,10 +84,9 @@ class SpikeStrategy(BaseStrategy):
     # ── Pre-market ────────────────────────────────────────────────────────────
 
     def pre_market(self, pm, instruments) -> bool:
-        from datetime import datetime
         from core.instruments import get_atm_strike
 
-        now = datetime.now().time()
+        now = _now_ist().time()  # FIX: was datetime.now() — UTC on GitHub
         if now >= CFG["spike_exit_time"]:
             log.warning(f"[{self.name}] Started after spike window — skipping today.")
             self._trade_done = True
