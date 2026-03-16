@@ -13,6 +13,13 @@ import csv
 import os
 import time
 import datetime as dt
+
+# IST FIX: GitHub Actions runners are UTC — timestamps must be IST
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+def _now_ist() -> dt.datetime:
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return dt.datetime.now(tz=_IST).replace(tzinfo=None)
 from typing import Optional
 from scalper_v7_core.config import (
     SLIPPAGE_POINTS, QUANTITY,
@@ -78,7 +85,7 @@ class PaperTrade:
         self.tp_pts   = tp_pts
 
         self.trail_stage: int   = 0
-        self.timestamp:   str   = dt.datetime.now().isoformat()
+        self.timestamp:   str   = _now_ist().isoformat()  # FIX: was UTC on GitHub Actions
         self.signal_meta: dict  = signal_meta
         self.exit_pending: bool = False
         self.last_exit_ts: float = 0.0
@@ -245,7 +252,7 @@ class PaperEngine:
         self._daily_pnl_rs  += pnl_rs
 
         result = {
-            "timestamp":      dt.datetime.now().isoformat(),
+            "timestamp":      _now_ist().isoformat(),  # FIX: was UTC on GitHub Actions
             "symbol":         trade.symbol,
             "option_type":    trade.option_type,
             "qty":            trade.qty,
@@ -289,7 +296,7 @@ class PaperEngine:
             self._blocked_log[blocked] = self._blocked_log.get(blocked, 0) + 1
 
         row = {
-            "timestamp":      dt.datetime.now().isoformat(),
+            "timestamp":      _now_ist().isoformat(),  # FIX: was UTC on GitHub Actions
             "spot":           snapshot.get("spot", ""),
             "action":         signal.get("action", "HOLD"),
             "trend_bias":     signal.get("trend_bias", ""),
