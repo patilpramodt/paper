@@ -14,6 +14,14 @@ import time
 import datetime as dt
 from collections import deque
 from typing import Optional, Tuple
+
+# IST FIX: GitHub Actions runners are UTC — bare datetime.now() returns UTC
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+def _now_ist() -> dt.datetime:
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return dt.datetime.now(tz=_IST).replace(tzinfo=None)
+
 from scalper_v7_core.config import (
     MAX_DAILY_LOSS, MAX_TRADES_DAY, MAX_TRADES_PER_HOUR,
     POST_SL_COOLDOWN, 
@@ -209,7 +217,7 @@ class RiskManager:
         if self.trades_today >= MAX_TRADES_DAY:
             return False, f"Max trades/day ({MAX_TRADES_DAY}) reached"
 
-        now      = dt.datetime.now()
+        now      = _now_ist()  # FIX: was dt.datetime.now() — UTC on GitHub Actions
         now_time = now.time()
 
         # Session window
@@ -265,7 +273,7 @@ class RiskManager:
     # 
 
     def should_squareoff(self) -> bool:
-        now = dt.datetime.now().time()
+        now = _now_ist().time()  # FIX: was dt.datetime.now() — UTC on GitHub Actions
         return now >= dt.time(*AUTO_SQUAREOFF)
 
     # 
