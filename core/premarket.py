@@ -10,7 +10,14 @@ Fixes applied:
 
 import logging
 import threading
-from datetime import datetime, timedelta, date, time as dtime
+from datetime import datetime, timedelta, date, time as dtime, timezone
+
+# IST FIX: GitHub Actions runners are UTC — use IST-aware now() everywhere
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return datetime.now(tz=_IST).replace(tzinfo=None)
 
 import numpy as np
 import pandas as pd
@@ -65,7 +72,7 @@ class PreMarketData:
 
             while not stop_event.is_set():
                 try:
-                    now_t = datetime.now().time()
+                    now_t = _now_ist().time()  # FIX: was datetime.now() — UTC on GitHub
 
                     if not (MARKET_OPEN <= now_t <= MARKET_CLOSE):
                         stop_event.wait(timeout=30)
@@ -139,7 +146,7 @@ class PreMarketData:
         for attempt in range(1, 4):
             try:
                 import time as _t
-                today = datetime.now().date()
+                today = _now_ist().date()  # FIX: was datetime.now() — UTC on GitHub
                 raw = kite.historical_data(
                     instrument_token=index_token,
                     from_date=datetime.combine(today - timedelta(days=7), dtime(9, 15)),
@@ -163,7 +170,7 @@ class PreMarketData:
         for attempt in range(1, 4):
             try:
                 import time as _t
-                today = datetime.now().date()
+                today = _now_ist().date()  # FIX: was datetime.now() — UTC on GitHub
                 raw5m = kite.historical_data(
                     instrument_token=index_token,
                     from_date=datetime.combine(today - timedelta(days=7), dtime(15, 20)),
@@ -191,8 +198,8 @@ class PreMarketData:
         try:
             raw = kite.historical_data(
                 instrument_token=index_token,
-                from_date=datetime.now() - timedelta(days=300),
-                to_date=datetime.now(),
+                from_date=_now_ist() - timedelta(days=300),  # FIX: was datetime.now()
+                to_date=_now_ist(),                           # FIX: was datetime.now()
                 interval="day",
             )
             if len(raw) >= 50:
@@ -288,3 +295,4 @@ class PreMarketData:
             _time.sleep(2)
         log.error("  PCR fetch failed after 3 attempts -- running without PCR filter")
         return None
+
