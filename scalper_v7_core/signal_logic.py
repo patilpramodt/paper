@@ -16,6 +16,13 @@
 # ==============================================================================
 
 import datetime as dt
+
+# IST FIX: GitHub Actions runners are UTC — bare datetime.now() returns UTC
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+def _now_ist() -> dt.datetime:
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return dt.datetime.now(tz=_IST).replace(tzinfo=None)
 from typing import Dict, Any
 
 from scalper_v7_core.config import (
@@ -54,7 +61,7 @@ BEAR_VOL = ("bearish",)
 # ==============================================================================
 
 def _in_lunch() -> bool:
-    now = dt.datetime.now().time()
+    now = _now_ist().time()  # FIX: was dt.datetime.now() — UTC on GitHub Actions
     return dt.time(*LUNCH_START) <= now < dt.time(*LUNCH_END)
 
 
