@@ -1,7 +1,7 @@
 """
 core/market_hub.py
 
-MarketHub  the single connection layer.
+MarketHub — the single connection layer.
 
 Owns:
    ONE KiteConnect session
@@ -20,6 +20,14 @@ Responsibilities:
 
 Strategies NEVER touch Kite or WebSocket directly.
 They call market_hub.subscribe(token) and receive events via callbacks.
+
+IST FIX (applied throughout):
+   All datetime.now() calls replaced with _now_ist() which returns
+   current wall-clock time in IST (UTC+5:30).
+   GitHub Actions runners are UTC — bare datetime.now() returned UTC,
+   causing the EOD check (MARKET_CLOSE=15:31) to never trigger until
+   10:01 UTC, which is after GitHub's timeout kills the job at ~15:00 IST.
+   With _now_ist(), the bot self-exits cleanly at 15:31 IST every day.
 """
 
 import json
@@ -28,7 +36,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone, timedelta
 from typing import TYPE_CHECKING
 
 from core.candle import CandleBuilder
@@ -39,6 +47,14 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("core.hub")
 
+# ── IST timezone ──────────────────────────────────────────────────────────────
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return datetime.now(tz=_IST).replace(tzinfo=None)
+
+# ── Market hours (all times are IST) ─────────────────────────────────────────
 MARKET_OPEN  = dtime(9, 14)
 MARKET_CLOSE = dtime(15, 31)
 
@@ -57,7 +73,7 @@ class MarketHub:
         self._ws           = None
 
         # Shared market state
-        self._index_token  = 260105      # BankNifty  fixed Zerodha token
+        self._index_token  = 260105      # BankNifty — fixed Zerodha token
         self._last_price   : dict[int, float] = {}
         self._subscribed   : set[int]   = set()
         self._lock         = threading.Lock()
@@ -75,7 +91,7 @@ class MarketHub:
 
         log.info("MarketHub created")
 
-    #  Kite login 
+    # ── Kite login ────────────────────────────────────────────────────────────
 
     def load_kite(self):
         tf = self._token_file
@@ -92,19 +108,19 @@ class MarketHub:
         log.info(" Kite session loaded (shared by all strategies)")
         return self.kite
 
-    #  Strategy registration 
+    # ── Strategy registration ─────────────────────────────────────────────────
 
     def register(self, strategy: "BaseStrategy"):
         """Register a strategy to receive tick and candle events."""
         self._strategies.append(strategy)
         log.info(f" Strategy registered: {strategy.name}")
 
-    #  Token subscription 
+    # ── Token subscription ────────────────────────────────────────────────────
 
     def subscribe(self, token: int):
         """
         Subscribe token to WebSocket (called by strategies for their options).
-        Thread-safe. Deduplicates  no double subscriptions.
+        Thread-safe. Deduplicates — no double subscriptions.
         """
         with self._lock:
             if token in self._subscribed:
@@ -112,7 +128,6 @@ class MarketHub:
             self._subscribed.add(token)
         if self._ws:
             try:
-                from kiteconnect import KiteTicker
                 self._ws.subscribe([token])
                 self._ws.set_mode(self._ws.MODE_FULL, [token])
                 log.info(f"  Subscribed token {token}")
@@ -133,10 +148,11 @@ class MarketHub:
         """Get last known price for any subscribed token."""
         return self._last_price.get(token)
 
-    #  WebSocket callbacks 
+    # ── WebSocket callbacks ───────────────────────────────────────────────────
 
     def _on_ticks(self, ws, ticks):
-        now = datetime.now()
+        # FIX: was datetime.now() — returned UTC on GitHub Actions
+        now = _now_ist()
         t   = now.time()
 
         # Ignore outside market hours
@@ -152,8 +168,8 @@ class MarketHub:
             token   = tick.get("instrument_token")
             price   = tick.get("last_price", 0)
             qty     = tick.get("last_traded_quantity", 0)
-            # Exchange timestamp  use this for candle time alignment
-            # Falls back to wall-clock now if not present
+            # Exchange timestamp — use this for candle time alignment
+            # Falls back to IST wall-clock if not present
             raw_ts  = tick.get("timestamp")
             tick_ts = raw_ts.replace(tzinfo=None) if hasattr(raw_ts, "tzinfo") and raw_ts else now
             if not price:
@@ -166,7 +182,7 @@ class MarketHub:
             if token == self._index_token:
                 self._handle_index_tick(price, qty, now, tick_ts)
             else:
-                # Option tick  broadcast to all strategies
+                # Option tick — broadcast to all strategies
                 for strat in self._strategies:
                     try:
                         strat.on_option_tick(token, price, now, tick_ts)
@@ -185,7 +201,7 @@ class MarketHub:
             except Exception as e:
                 log.error(f"[{strat.name}] on_tick error: {e}")
 
-        # Build 5-min candle using wall-clock time
+        # Build 5-min candle using IST wall-clock time
         closed = self.index_candles.feed_tick(price, qty, now)
         if closed is not None:
             # Broadcast closed candle to all strategies
@@ -218,7 +234,7 @@ class MarketHub:
         log.error(" WebSocket could not reconnect. Stopping.")
         self._done.set()
 
-    #  Historical backfill 
+    # ── Historical backfill ───────────────────────────────────────────────────
 
     def backfill(self, kite, index_token: int = 260105):
         """
@@ -246,7 +262,8 @@ class MarketHub:
         """
         from datetime import date, timedelta, time as dtime
 
-        now = datetime.now()
+        # FIX: was datetime.now() — returned UTC on GitHub Actions
+        now = _now_ist()
         market_open = dtime(9, 15)
 
         if now.time() <= market_open:
@@ -264,7 +281,7 @@ class MarketHub:
             return
 
         log.info("=" * 60)
-        log.info("  HISTORICAL BACKFILL  warming up all strategies")
+        log.info("  HISTORICAL BACKFILL — warming up all strategies")
         log.info("=" * 60)
         log.info(f"  Fetching 5-min candles: 09:15 → {to_dt.strftime('%H:%M')}")
 
@@ -284,7 +301,7 @@ class MarketHub:
             log.info("  Backfill: Kite returned 0 candles -- nothing to replay")
             return
 
-        log.info(f"  {len(raw)} candles received  replaying now...")
+        log.info(f"  {len(raw)} candles received — replaying now...")
 
         # OR window: 9:15 to 9:30 -- candles in this range feed ORB's opening range
         or_start = dtime(9, 15)
@@ -308,6 +325,7 @@ class MarketHub:
 
         # Replay each candle into strategies
         n_replayed = 0
+        candle = None  # track last candle for OR-lock tick below
         for bar in raw:
             raw_ts    = bar["date"]
             candle_ts = raw_ts.replace(tzinfo=None) if hasattr(raw_ts, "tzinfo") else raw_ts
@@ -347,7 +365,7 @@ class MarketHub:
 
         # Check if OR window is completely in the past -- if so, tell ORB to lock now
         # (normally locked by on_tick when t >= 9:30, but backfill uses historical ts)
-        if now.time() >= or_end:
+        if now.time() >= or_end and candle is not None:
             for strat in self._strategies:
                 if strat.name == "ORB_v2":
                     try:
@@ -361,11 +379,11 @@ class MarketHub:
         log.info(f"  Strategies are now warmed up from 09:15 data")
         log.info("=" * 60 + "\n")
 
-    #  Main run loop 
+    # ── Main run loop ─────────────────────────────────────────────────────────
 
     def run(self):
         """
-        Start WebSocket and run until 3:30 PM.
+        Start WebSocket and run until 3:31 PM IST.
         Called from t.py after all strategies are registered.
         """
         from kiteconnect import KiteTicker
@@ -385,13 +403,16 @@ class MarketHub:
         log.info(" Starting WebSocket (shared for all strategies)...")
         ticker.connect(threaded=True)
 
-        log.info(" Market running... (9:15 AM  3:30 PM)")
+        log.info(" Market running... (9:15 AM – 3:30 PM)")
         try:
             while not self._done.is_set():
-                now = datetime.now()
-                # EOD: trigger summaries and stop
+                # FIX: was datetime.now() — returned UTC on GitHub Actions.
+                # The EOD check never fired on UTC time, causing the job to
+                # run until GitHub's timeout killed it (~15:00 IST).
+                # With _now_ist(), the bot self-exits cleanly at 15:31 IST.
+                now = _now_ist()
                 if now.time() > MARKET_CLOSE:
-                    log.info(" Market closed (3:30 PM)")
+                    log.info(" Market closed (3:30 PM) — running EOD summaries")
                     for strat in self._strategies:
                         try:
                             strat.eod_summary()
