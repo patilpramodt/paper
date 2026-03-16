@@ -50,7 +50,14 @@ import os
 import threading
 import time as time_module
 from collections import deque
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timezone, timedelta
+
+# IST FIX: GitHub Actions runners are UTC — timestamps must be IST
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
+    return datetime.now(tz=_IST).replace(tzinfo=None)
 from typing import Optional, Tuple
 
 import numpy as np
@@ -371,7 +378,7 @@ class BBTrade:
         self.trail_stage = 0
         self.spot     = spot
         self.atr      = atr
-        self.timestamp = datetime.now().isoformat()
+        self.timestamp = _now_ist().isoformat()  # FIX: was UTC on GitHub Actions
         self.exit_pending  = False
         self.last_exit_ts  = 0.0
 
@@ -744,7 +751,7 @@ class BBStochStrategy(BaseStrategy):
         )
 
         result = {
-            "timestamp"  : datetime.now().isoformat(),
+            "timestamp"  : _now_ist().isoformat(),  # FIX: was UTC on GitHub Actions
             "symbol"     : trade.symbol,
             "opt_type"   : trade.option_type,
             "qty"        : trade.qty,
