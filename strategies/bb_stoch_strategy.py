@@ -29,19 +29,32 @@ TRADE MANAGEMENT (on every option WebSocket tick):
   * Trail = moves SL to breakeven when profit >= TRAIL_ARM pts,
             then trails every TRAIL_STEP pts after that
 
-SHARED RESOURCES (from MarketHub -- no extra API calls):
---------------------------------------------------------------
-  * 5-min index candles    -> received via on_candle()
-  * Session VWAP           -> hub.session_vwap.value
-  * WebSocket / Kite login -> MarketHub owns both
-  * NFO instruments        -> InstrumentStore (shared singleton)
+FIXES APPLIED:
+  Bug 1 — time.sleep(0.4) was called inside _enter_trade(), which is
+           invoked from _evaluate_entry() → on_candle() → MarketHub's
+           WebSocket callback thread. Sleeping here blocked ALL tick
+           processing for every strategy for 400ms on every entry attempt.
+           During that sleep, no WebSocket ticks could arrive, so the
+           option we just subscribed had no price — get_price() returned
+           None → all entries silently skipped. This is why all 4 valid
+           signals today (07:40, 07:55, 08:45, 08:50 UTC) had 0 execution.
+           Fix: removed time.sleep(). At entry time, read LTP immediately.
+           If unavailable, log a warning and return — the next candle will
+           re-evaluate. The option stays subscribed so the next call gets
+           the price instantly.
 
-PRIVATE (per-strategy, not shared):
---------------------------------------------------------------
-  * 5-min candle buffer (deque of dicts -> DataFrame for indicators)
-  * RiskManager state (trade count, PnL, cooldowns)
-  * PaperEngine (CSV logging: bb_stoch_entry.csv, bb_stoch_exit.csv)
-  * Active option token subscription
+  Bug 4 — ATM options not pre-subscribed in pre_market(). Even without the
+           sleep bug, subscribing at the moment of signal and immediately
+           reading LTP is a race — first tick may take 200–800ms. Fix:
+           pre_market() now subscribes ATM CE + PE at 9:08 AM (same as
+           SPIKE). At entry time the token has live ticks → price available.
+           When the actual entry strike differs, we subscribe that token and
+           rely on the already-flowing WebSocket to deliver its price quickly.
+
+  Bug 10 — on_tick() called _force_close() on EVERY index tick after 15:15
+            (potentially dozens per second). Second call was harmless but
+            wasteful. Fix: added _squareoff_done flag — force-close fires
+            once only.
 """
 
 import csv
@@ -155,11 +168,6 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
     """
     Bollinger Bands on 'close'.
     Returns: mid, upper, lower, bw_pct (bandwidth as % of mid), squeeze (bool)
-
-    FIX: was returning squeeze=True unconditionally when len(df) < period.
-    This blocked BBStoch until bar 20 even when min_bars was lowered.
-    Now uses min_periods=period//3 so BB computes from partial history
-    and squeeze reflects actual bandwidth, not just data-unavailability.
     """
     if len(df) < 2:
         return {"mid": 0, "upper": 0, "lower": 0, "bw_pct": 0, "squeeze": True}
@@ -278,14 +286,14 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     base = {"bb": bb, "stoch": stoch, "vol_ratio": vol_ratio, "atr": atr,
             "close": close}
 
-    # ---- Filter 1: BB squeeze  skip (no trend) ----
+    # ---- Filter 1: BB squeeze → skip (no trend) ----
     if bb["squeeze"]:
         return {"action": "HOLD", "blocked_by": "bb_squeeze", **base}
 
     # ---- Filter 2: Volume ----
     # vol_ratio == -1.0 is the sentinel meaning "no volume data available".
     # In that case we bypass the filter (don't block) and log a warning.
-    # When real volume data is flowing, vol_ratio must exceed vol_mult (1.2x avg).
+    # When real volume data is flowing, vol_ratio must exceed vol_mult (1.0x avg).
     if vol_ratio == -1.0:
         vol_ok = True   # data unavailable -- bypass, do not block
         log.debug("[BB_STOCH] Volume data unavailable -- vol filter bypassed")
@@ -446,6 +454,13 @@ class BBStochStrategy(BaseStrategy):
         self._dte           = 0
         self._session_date  = None
 
+        # FIX (Bug 10): guard flag so _force_close is called at most once per day
+        self._squareoff_done: bool = False
+
+        # FIX (Bug 4): pre-subscribed tokens (populated in pre_market)
+        self._pre_ce_token: Optional[int] = None
+        self._pre_pe_token: Optional[int] = None
+
         log.info("[BB_STOCH] Strategy initialized")
 
     # ----------------------------------------------------------
@@ -465,6 +480,33 @@ class BBStochStrategy(BaseStrategy):
         if premarket_data.pcr is None:
             log.warning("[BB_STOCH] PCR is None -- VWAP bias will be unrestricted. "
                         "Check if PCR fetch failed in core.premarket")
+
+        # FIX (Bug 4): pre-subscribe ATM CE + PE at 9:08 AM.
+        # This mirrors SPIKE's approach. Options receive live ticks for ~7 minutes
+        # before market open, so when a signal fires at e.g. 10:25 AM, the LTP
+        # is immediately available from get_price() without any sleep.
+        # On expiry day we use 1-strike ITM for better liquidity (same as _enter_trade).
+        ref_price = premarket_data.prev_close or premarket_data.prev_last5m_close
+        if ref_price and self._expiry_date:
+            atm = get_atm_strike(ref_price)
+            for opt_type in ("CE", "PE"):
+                adj = atm
+                if self._dte == 0:
+                    adj = atm - 100 if opt_type == "CE" else atm + 100
+                tok, sym = instruments.get_option_token(adj, opt_type, self._expiry_date)
+                if tok:
+                    self.subscribe_option(tok)
+                    if opt_type == "CE":
+                        self._pre_ce_token = tok
+                    else:
+                        self._pre_pe_token = tok
+                    log.info(f"[BB_STOCH] Pre-subscribed {sym} ({tok})")
+                else:
+                    log.warning(f"[BB_STOCH] Pre-subscribe failed for ATM {adj} {opt_type}")
+        else:
+            log.warning("[BB_STOCH] No ref price for pre-subscription — "
+                        "options will be subscribed on first signal (may cause LTP miss)")
+
         return True
 
     def _reset_day(self):
@@ -475,15 +517,22 @@ class BBStochStrategy(BaseStrategy):
         self._results.clear()
         self._blocked_log.clear()
         self._persist_buf.clear()
+        self._squareoff_done = False  # FIX (Bug 10): reset guard each day
 
     # ----------------------------------------------------------
     # TICK CALLBACKS
     # ----------------------------------------------------------
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
-        """Index tick -- not used directly (we work on 5-min candles)."""
-        # Auto square-off check
-        if ts.time() >= dtime(*CFG["auto_squareoff"]):
+        """Index tick -- not used directly (we work on 5-min candles).
+
+        FIX (Bug 10): _force_close() was called on every index tick after 15:15.
+        This could be dozens of calls per second. Added _squareoff_done guard
+        so it fires exactly once.
+        """
+        # FIX (Bug 10): guard with flag — auto square-off fires exactly once
+        if ts.time() >= dtime(*CFG["auto_squareoff"]) and not self._squareoff_done:
+            self._squareoff_done = True
             self._force_close("AUTO-SQUAREOFF")
 
     def on_candle(self, candle: dict, ts: datetime):
@@ -593,6 +642,23 @@ class BBStochStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def _enter_trade(self, action: str, sig: dict, ts: datetime):
+        """Open a new options position.
+
+        FIX (Bug 1): removed time.sleep(0.4). The sleep was inside the
+        WebSocket callback thread (on_candle → _evaluate_entry → here).
+        During the sleep, no WebSocket ticks could be processed, so the
+        option we had just subscribed received no price — get_price() always
+        returned None and all entries were silently skipped.
+
+        New flow:
+        1. If the signal strike matches a pre-subscribed token (from pre_market),
+           use it — it already has live prices.
+        2. If the strike is different (e.g. spot moved far from open ATM),
+           subscribe the new token and immediately read the cache.
+        3. If LTP is still None (token just subscribed this instant), log a
+           warning and return. The option stays subscribed; the next 5-min
+           candle will re-evaluate and get_price() will return the price.
+        """
         opt    = "CE" if action == "BUY_CE" else "PE"
         spot   = sig.get("close", 0)
         atr    = sig.get("atr", 0)
@@ -613,14 +679,22 @@ class BBStochStrategy(BaseStrategy):
             log.warning(f"[BB_STOCH] Option not found: ATM={atm} {opt} expiry={expiry}")
             return
 
-        # Subscribe and wait for first tick
+        # Subscribe the token (deduplicates — safe if already subscribed from pre_market)
         self.subscribe_option(token)
-        time_module.sleep(0.4)
+
+        # FIX (Bug 1): no sleep here. Read LTP directly from the WebSocket price cache.
+        # If the option was pre-subscribed (Bug 4 fix), this returns immediately.
+        # If this is a new strike (spot moved), the tick may not have arrived yet.
+        # In that case we bail and retry next candle — far better than blocking the
+        # entire WebSocket thread for 400ms which guaranteed LTP=None anyway.
         ltp = self.get_price(token)
 
         if not ltp or ltp < 5:
-            log.warning(f"[BB_STOCH] LTP unavailable or too low ({ltp}) for {tsym}")
-            self.unsubscribe_option(token)
+            log.warning(
+                f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) — "
+                f"option subscribed, will retry on next candle signal"
+            )
+            # Do NOT unsubscribe — keep it live so next bar gets price immediately
             return
 
         # Compute SL/TP
