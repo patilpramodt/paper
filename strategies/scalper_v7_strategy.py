@@ -1,19 +1,19 @@
 """
 strategies/scalper_v7_strategy.py
 
-ScalperV7Strategy  Ported ScalerV7 into the shared multi-strategy framework.
+ScalperV7Strategy — Ported ScalerV7 into the shared multi-strategy framework.
 
 HOW DATA FLOWS (vs original standalone scalper_v7):
 
-  ORIGINAL scalper_v7                    THIS STRATEGY              
-            
-  REST poll every 0.5s:                  WebSocket callbacks:       
-    kite.historical_data(1m)  on_tick()   1-min candle 
-    kite.historical_data(5m)  on_candle()  5-min candle
-    bus.get_ltp(option_token)  on_option_tick()  SL/TP  
-  Own KiteTicker (TickerBus)  Shared MarketHub WS       
-  Own login (load_clients())  Shared hub.kite           
-  Own NFO instruments  Shared InstrumentStore    
+  ORIGINAL scalper_v7                    THIS STRATEGY
+  ──────────────────────────────────────────────────────
+  REST poll every 0.5s:                  WebSocket callbacks:
+    kite.historical_data(1m)  → on_tick()  → 1-min candle
+    kite.historical_data(5m)  → on_candle() → 5-min candle
+    bus.get_ltp(option_token) → on_option_tick() → SL/TP
+  Own KiteTicker (TickerBus) → Shared MarketHub WS
+  Own login (load_clients())  → Shared hub.kite
+  Own NFO instruments         → Shared InstrumentStore
 
 
 WHAT IS NOT SHARED (intentionally per-strategy):
@@ -27,6 +27,25 @@ SIGNAL EVALUATION TIMING:
   Original: every 0.5s (polling)
   This port: every 1-min candle close (cleaner, same data, less CPU)
   Trade management (SL/TP/trail): on every option WebSocket tick via on_option_tick()
+
+FIXES APPLIED:
+  Bug 2 — time.sleep(0.3) was called inside _evaluate_signal(), which is
+           invoked from on_tick(), which runs on the KiteTicker WebSocket
+           callback thread. Sleeping here blocked ALL tick processing for all
+           strategies for 300ms on every entry attempt.
+           Additionally, during that sleep the option we just subscribed
+           could not receive any ticks, so get_price() always returned None.
+           Fix: removed time.sleep(). If LTP is unavailable immediately after
+           subscribe, we log a warning and return — the next 1-min bar will
+           re-evaluate. The option remains subscribed so subsequent ticks will
+           populate the price cache.
+
+  Bug 8 — option_type passed to risk.on_trade_exit() was always "" because
+           active_trade is set to None by manage_trade() before we read it.
+           This silently broke the directional consecutive-loss blocker
+           (CE/PE direction was never incremented, only "" was).
+           Fix: capture opt_type = active_trade.option_type BEFORE calling
+           manage_trade() so it's available for the risk callback.
 """
 
 import logging
@@ -51,7 +70,7 @@ from scalper_v7_core.config import (
 log = logging.getLogger("strategy.scalper_v7")
 
 
-#  Persistence Filter (same as original scalper_v7/main.py) 
+# ── Persistence Filter (same as original scalper_v7/main.py) ─────────────────
 
 class PersistenceFilter:
     """Signal must repeat N consecutive 1-min bars before entry fires."""
@@ -71,7 +90,7 @@ class PersistenceFilter:
         self._q.clear()
 
 
-#  Strategy 
+# ── Strategy ──────────────────────────────────────────────────────────────────
 
 class ScalperV7Strategy(BaseStrategy):
     """
@@ -86,35 +105,35 @@ class ScalperV7Strategy(BaseStrategy):
     def __init__(self, market_hub):
         super().__init__(market_hub)
 
-        #  Private 1-min candle builder 
+        # ── Private 1-min candle builder ─────────────────────────────────────
         # MarketHub broadcasts 5-min candles via on_candle().
         # For 1-min, we build our own from raw index ticks in on_tick().
         self._cb_1m = CandleBuilder(minutes=1)
 
-        # Rolling candle buffers  converted to DataFrame for indicators
+        # Rolling candle buffers — converted to DataFrame for indicators
         # Capacity matches scalper_v7 config (CANDLE_1M_USE=80, CANDLE_5M_USE=50)
         self._buf_1m: deque = deque(maxlen=CANDLE_1M_USE)   # last N closed 1-min candles
         self._buf_5m: deque = deque(maxlen=CANDLE_5M_USE)   # last N closed 5-min candles
 
-        #  Scalper v7 components 
+        # ── Scalper v7 components ─────────────────────────────────────────────
         self._engine      = PaperEngine()
         self._risk        = RiskManager()
         self._persistence = PersistenceFilter(window=2)
 
-        #  Active option tracking 
+        # ── Active option tracking ────────────────────────────────────────────
         self._active_token: Optional[int] = None   # currently subscribed option
         self._active_sym:   Optional[str] = None
 
-        #  Pre-market data (set in pre_market()) 
+        # ── Pre-market data (set in pre_market()) ─────────────────────────────
         self._instruments = None   # InstrumentStore from t.py (shared)
         self._expiry_date = None   # nearest expiry date (from PreMarketData)
 
-        #  Thread safety 
+        # ── Thread safety ─────────────────────────────────────────────────────
         self._lock = threading.Lock()
 
         log.info("[ScalperV7] Strategy initialized")
 
-    #  Pre-market: called once by t.py at 9:009:14 
+    # ── Pre-market: called once by t.py at 9:00–9:14 ─────────────────────────
 
     def pre_market(self, premarket_data, instruments) -> bool:
         """
@@ -125,7 +144,7 @@ class ScalperV7Strategy(BaseStrategy):
         self._expiry_date = premarket_data.expiry_date
         self._risk.reset_day()
 
-        # Crash recovery  restore any trade open from previous run
+        # Crash recovery — restore any trade open from previous run
         recovered = load_state()
         if recovered:
             log.warning(f"[ScalperV7] Recovering open trade: {recovered.get('symbol')}")
@@ -160,7 +179,7 @@ class ScalperV7Strategy(BaseStrategy):
         )
         return True
 
-    #  on_tick: raw index tick  build 1-min candles 
+    # ── on_tick: raw index tick → build 1-min candles ─────────────────────────
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         """
@@ -178,7 +197,7 @@ class ScalperV7Strategy(BaseStrategy):
         if closed is None:
             return  # bar still open, nothing to do
 
-        # A 1-min candle just closed  store and evaluate signal
+        # A 1-min candle just closed — store and evaluate signal
         with self._lock:
             self._buf_1m.append(closed)
 
@@ -188,7 +207,7 @@ class ScalperV7Strategy(BaseStrategy):
 
         self._evaluate_signal(current_spot=price)
 
-    #  on_candle: 5-min index candle from MarketHub 
+    # ── on_candle: 5-min index candle from MarketHub ──────────────────────────
 
     def on_candle(self, candle: dict, ts: datetime):
         """
@@ -198,28 +217,35 @@ class ScalperV7Strategy(BaseStrategy):
         with self._lock:
             self._buf_5m.append(candle)
 
-    #  on_option_tick: option LTP for trade management 
+    # ── on_option_tick: option LTP for trade management ───────────────────────
 
     def on_option_tick(self, token: int, price: float, ts: datetime, tick_ts: datetime = None):
         """
         Called when a subscribed option has a new WebSocket tick.
-        This is the SL/TP management loop  replaces the 0.5s polling in original.
+        This is the SL/TP management loop — replaces the 0.5s polling in original.
+
+        FIX (Bug 8): capture opt_type BEFORE calling manage_trade().
+        manage_trade() sets active_trade=None internally when it closes.
+        Reading active_trade.option_type AFTER the call always returned None,
+        making the directional loss counter receive "" every time.
         """
         if token != self._active_token:
             return
         if not self._engine.active_trade:
             return
 
+        # FIX (Bug 8): read option_type NOW, before manage_trade() clears active_trade
+        opt_type = self._engine.active_trade.option_type
+
         reason = self._engine.manage_trade(price)
         if reason:
-            trade = self._engine.active_trade  # still set until _close() sets to None
             # _close() already set active_trade = None inside PaperEngine
-            # We read the last trade from _results
             if self._engine._results:
                 last = self._engine._results[-1]
                 pnl_pts = last["pnl_pts"]
                 pnl_rs  = last["pnl_rs"]
-                opt_type = last["option_type"]
+                # FIX (Bug 8): pass opt_type captured above (not active_trade.option_type
+                # which is now None — that caused the risk counter to receive "" always)
                 self._risk.on_trade_exit(pnl_pts, pnl_rs, reason, opt_type)
 
             clear_state()
@@ -227,7 +253,7 @@ class ScalperV7Strategy(BaseStrategy):
             self._unsubscribe_active_option()
             log.info(f"[ScalperV7] Trade closed: {reason} | Token={token}")
 
-    #  Signal evaluation (called on every 1-min close) 
+    # ── Signal evaluation (called on every 1-min close) ──────────────────────
 
     def _evaluate_signal(self, current_spot: float):
         """
@@ -299,7 +325,7 @@ class ScalperV7Strategy(BaseStrategy):
                 self._persistence.reset()
             return
 
-        #  Entry flow 
+        # ── Entry flow ────────────────────────────────────────────────────────
         opt = "CE" if action == "BUY_CE" else "PE"
 
         can_enter, block_reason = self._risk.can_enter(option_type=opt)
@@ -315,15 +341,28 @@ class ScalperV7Strategy(BaseStrategy):
             log.error(f"[ScalperV7] Option not found: ATM={atm_strike} {opt} offset={strike_offset}")
             return
 
-        # Get option LTP from MarketHub's last_price cache (WebSocket)
-        # Subscribe first so the hub starts receiving ticks for this token
+        # Subscribe the option token and read LTP from MarketHub's cache.
+        # FIX (Bug 2): removed time.sleep(0.3) here. Sleeping inside the
+        # WebSocket callback thread (on_tick → _evaluate_signal) blocked ALL
+        # tick processing for all strategies. The option also couldn't receive
+        # its first tick during the sleep, so get_price() always returned None.
+        #
+        # New behaviour: subscribe and immediately read the cache.
+        # - If the option was pre-subscribed (from a prior bar's first signal),
+        #   get_price() will return a valid LTP immediately.
+        # - If this is the first time we see this token (fresh signal), LTP may
+        #   be None. We log a warning and return without entering — the next
+        #   1-min bar will re-evaluate with the option now subscribed and priced.
         self.subscribe_option(token)
-        import time; time.sleep(0.3)   # brief wait for first tick
         ltp = self.get_price(token)
 
         if not ltp:
-            log.error(f"[ScalperV7] LTP unavailable for {tsym} (token={token})")
-            self.unsubscribe_option(token)
+            log.warning(
+                f"[ScalperV7] LTP unavailable for {tsym} (token={token}) — "
+                f"option subscribed, will retry next 1-min bar"
+            )
+            # Keep the token subscribed so the next bar can read it immediately.
+            # Do NOT reset persistence — let the next bar confirm and re-attempt.
             return
 
         # Compute ATR-scaled SL/TP
@@ -377,7 +416,7 @@ class ScalperV7Strategy(BaseStrategy):
 
         log.info(f"[ScalperV7]  Entered {opt} | {tsym} | LTP={ltp:.2f} | SL={sl_price:.2f} TP={tp_price:.2f}")
 
-    #  EOD 
+    # ── EOD ───────────────────────────────────────────────────────────────────
 
     def eod_summary(self):
         """Called at 3:30 PM by MarketHub."""
@@ -402,7 +441,7 @@ class ScalperV7Strategy(BaseStrategy):
             f"1m bars={len(self._buf_1m)} 5m bars={len(self._buf_5m)}"
         )
 
-    #  Helpers 
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _handle_squareoff(self):
         """Force close any open trade at EOD."""
@@ -455,7 +494,7 @@ class ScalperV7Strategy(BaseStrategy):
         have the helper (maintains backward compatibility).
         """
         if self._instruments is None:
-            log.error("[ScalperV7] InstrumentStore not set  call pre_market first")
+            log.error("[ScalperV7] InstrumentStore not set — call pre_market first")
             return None, None
 
         try:
@@ -464,7 +503,7 @@ class ScalperV7Strategy(BaseStrategy):
             adj_strike = strike
             if strike_offset > 0:
                 adj_strike = strike - strike_offset if opt_type == "CE" else strike + strike_offset
-                log.info(f"[ScalperV7] Expiry ITM offset: strike {strike}  {adj_strike}")
+                log.info(f"[ScalperV7] Expiry ITM offset: strike {strike} → {adj_strike}")
 
             token, sym = self._instruments.get_option_token(
                 strike      = adj_strike,
@@ -527,4 +566,3 @@ class ScalperV7Strategy(BaseStrategy):
         except Exception as e:
             log.error(f"[ScalperV7] Raw instrument scan failed: {e}")
             return None, None
-
