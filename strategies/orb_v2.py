@@ -2,29 +2,49 @@
 strategies/orb_v2.py
 
 ORB (Opening Range Breakout) Strategy v2
-Entry window: 9:4010:15 AM
+Entry window: 9:40–10:15 AM
 Filters: ADX(2), EMA(2), VWAP(1.5), RSI(1), Volume(1), ST(1), BB(0.5)
-Exit: Target 1.5OR, Trailing SL after 1R, Premium SL, Time stop
+Exit: Target 1.5×OR, Trailing SL after 1R, Premium SL, Time stop
 Multi-trade: up to 2 per day if first hits SL
+
+FIXES APPLIED:
+  Bug 5 — CandleBuilder fed only close → H=L=O=C on every indicator bar.
+           ATR, Supertrend, ADX all computed on flat data → wrong values.
+           Fix: removed _cb (CandleBuilder). Replaced with _candle_buf (deque)
+           that stores full OHLCV candle dicts directly from on_candle().
+           Indicators now see real H/L/C as published by MarketHub.
+
+  Bug 6 — One-bar indicator lag. on_candle() fed close into _cb BEFORE
+           calling _check_entry(), so the breakout bar itself was never
+           in _cb.get_closed(). Indicators were computed on data excluding
+           the bar that triggered the signal.
+           Fix: because _candle_buf appends the full candle in on_candle()
+           before _check_entry() runs, the breakout bar is always included.
+
+  Bug 9 — Gap filter used 9:30 price instead of 9:15 open price.
+           _lock_or(price) is called when t >= 9:30; that price could be
+           far from the actual open if the market moved during 9:15–9:30.
+           Fix: store the first tick at 9:15 as _open_price. Use that as
+           the gap reference in _lock_or().
 """
 
 import csv
 import logging
 import os
 import threading
+from collections import deque
 from datetime import datetime, date, time as dtime, timedelta
 
 import numpy as np
 import pandas as pd
 
 from core.base_strategy import BaseStrategy
-from core.candle import CandleBuilder
 from core.instruments import get_atm_strike
 from core.pricer import option_premium, pick_iv
 
 log = logging.getLogger("strategy.orb")
 
-#  Strategy-specific config 
+# ── Strategy-specific config ──────────────────────────────────────────────────
 CFG = {
     "lot_size"          : 15,
     "or_start"          : dtime(9, 15),
@@ -64,6 +84,8 @@ CFG = {
     "slippage_pts"      : 2.0,
     "brokerage"         : 50,
     "csv_file"          : "orb_trades.csv",
+    # FIX (Bug 5): max candle history for indicator buffer
+    "candle_buf_size"   : 50,
 }
 
 
@@ -76,8 +98,10 @@ class ORBStrategy(BaseStrategy):
     def __init__(self, market_hub):
         super().__init__(market_hub)
 
-        # Own candle builder (strategy-specific, not shared)
-        self._cb = CandleBuilder(minutes=5)
+        # FIX (Bug 5+6): replaced CandleBuilder with a plain deque of full candle dicts.
+        # CandleBuilder was fed only close values → H=L=O=C → wrong ATR/Supertrend/ADX.
+        # Now we store each full OHLCV candle dict from on_candle() directly.
+        self._candle_buf: deque = deque(maxlen=CFG["candle_buf_size"])
 
         # Per-day state
         self._or_high       = None
@@ -89,6 +113,11 @@ class ORBStrategy(BaseStrategy):
         self._consec_losses = 0
         self._today_pnl     = 0.0
         self._completed     = []     # list of closed trade dicts
+
+        # FIX (Bug 9): store the first tick price at 9:15 for gap calculation.
+        # Gap should be measured from the actual open price, not from whatever
+        # price happens to be at 9:30 when OR locks.
+        self._open_price    = None
 
         # Pre-market data (set in pre_market())
         self._vix       = None
@@ -103,7 +132,7 @@ class ORBStrategy(BaseStrategy):
         self._trade     = None
         self._lock      = threading.Lock()
 
-    #  Pre-market 
+    # ── Pre-market ────────────────────────────────────────────────────────────
 
     def pre_market(self, pm, instruments) -> bool:
         self._instruments = instruments
@@ -124,12 +153,18 @@ class ORBStrategy(BaseStrategy):
 
         return True
 
-    #  Tick handler 
+    # ── Tick handler ──────────────────────────────────────────────────────────
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
-        # Build opening range 9:159:30
+        # FIX (Bug 9): capture the first tick at market open as the true gap reference.
+        # Gap must be computed vs. 9:15 open, not 9:30 price.
+        if self._open_price is None and t >= CFG["or_start"]:
+            self._open_price = price
+            log.info(f"[{self.name}] Open price captured: {price:.2f}")
+
+        # Build opening range 9:15–9:30
         if CFG["or_start"] <= t < CFG["or_end"] and not self._or_locked:
             if self._or_high is None or price > self._or_high: self._or_high = price
             if self._or_low  is None or price < self._or_low:  self._or_low  = price
@@ -147,9 +182,16 @@ class ORBStrategy(BaseStrategy):
             self._close("TIME_STOP", price, ts)
 
     def on_candle(self, candle: dict, ts: datetime):
-        """Called when 5-min index candle closes. Check for entry."""
-        # Feed into own candle buffer for indicator computation
-        self._cb.feed_tick(candle["close"], candle.get("volume", 0), candle["ts"])
+        """Called when 5-min index candle closes. Check for entry.
+
+        FIX (Bug 5+6): store the full OHLCV candle dict in _candle_buf.
+        Old code fed only close into a CandleBuilder — all H=L=O=C.
+        Now indicators receive real high/low for ATR, Supertrend, ADX.
+        Appending BEFORE _check_entry() also fixes the one-bar lag (Bug 6):
+        the breakout bar itself is now included in indicator computation.
+        """
+        # FIX: append full candle dict (not just close) — preserves real OHLCV
+        self._candle_buf.append(candle)
 
         if (not self._day_paused and
                 self._or_locked and self._or_width and
@@ -175,7 +217,7 @@ class ORBStrategy(BaseStrategy):
             log.warning(f"[{self.name}]  PREMIUM SL | opt={price:.2f}")
             self._close("PREMIUM_SL", spot, ts, exit_prem=price)
 
-    #  OR locking 
+    # ── OR locking ────────────────────────────────────────────────────────────
 
     def _lock_or(self, price: float, ts: datetime):
         if not self._or_high or not self._or_low:
@@ -186,11 +228,15 @@ class ORBStrategy(BaseStrategy):
         log.info(f"[{self.name}]  OR locked: H={self._or_high:.0f} "
                  f"L={self._or_low:.0f} W={self._or_width:.0f}pts")
 
-        # Gap filter
+        # FIX (Bug 9): use _open_price (9:15 first tick) for gap calculation.
+        # Original code used 'price' which is whatever the index is at 9:30 —
+        # this could be far from the real open if the first 15 min were volatile.
         if self._prev_close:
-            gap_pct = abs(price - self._prev_close) / self._prev_close
+            gap_ref = self._open_price if self._open_price is not None else price
+            gap_pct = abs(gap_ref - self._prev_close) / self._prev_close
             if gap_pct > CFG["gap_max_pct"]:
-                log.info(f"[{self.name}]  Gap={gap_pct:.2%} > {CFG['gap_max_pct']:.1%}  skip")
+                log.info(f"[{self.name}]  Gap={gap_pct:.2%} > {CFG['gap_max_pct']:.1%} "
+                         f"(ref={gap_ref:.2f} vs prev_close={self._prev_close:.2f})  skip")
                 self._day_paused = True
                 return
 
@@ -201,7 +247,7 @@ class ORBStrategy(BaseStrategy):
             log.info(f"[{self.name}]  OR too wide: {self._or_width:.0f}pts")
             self._day_paused = True
 
-    #  Entry 
+    # ── Entry ─────────────────────────────────────────────────────────────────
 
     def _check_entry(self, candle: dict, price: float, ts: datetime):
         if self._consec_losses >= CFG["max_consec_losses"]:
@@ -241,19 +287,21 @@ class ORBStrategy(BaseStrategy):
         else:
             log.debug(f"[{self.name}]  PCR unavailable  skipping PCR filter")
 
-        # Indicators + score
-        # NOTE: was 22, but entry window 9:40-10:30 = max 15 candles → 22 was unreachable.
-        # All indicators use min_periods=1 so 5 bars is sufficient for valid computation.
-        candles = self._cb.get_closed()
-        if len(candles) < 5: return
+        # FIX (Bug 5+6): use _candle_buf (full OHLCV dicts) instead of _cb.get_closed().
+        # _candle_buf already has the current candle appended (done in on_candle before here),
+        # so the breakout bar itself is included in indicator computation (fixes Bug 6).
+        candles = list(self._candle_buf)
+        if len(candles) < 5:
+            return
         ind = self._compute_indicators(candles)
-        if not ind: return
+        if not ind:
+            return
 
         vwap  = self._hub.session_vwap.value
         score, details = self._score(ind, direction, vwap)
         min_s = CFG["min_score_0dte"] if self._dte_days == 0 else CFG["min_score_normal"]
 
-        log.info(f"\n[{self.name}] {''*50}")
+        log.info(f"\n[{self.name}] {'─'*50}")
         log.info(f"[{self.name}]  {direction} breakout {ts.strftime('%H:%M')} "
                  f"score={score}/{min_s}")
         for v in details.values():
@@ -325,7 +373,7 @@ class ORBStrategy(BaseStrategy):
         log.info(f"[{self.name}]   Prem {ep:.0f}+slip{ep_eff:.0f} | "
                  f"Tgt={target_s:.0f} | SL={sl_s:.0f} | PremSL={psl_pct*100:.0f}%")
 
-    #  Exit 
+    # ── Exit ──────────────────────────────────────────────────────────────────
 
     def _check_exit(self, price: float, ts: datetime):
         t = self._trade
@@ -337,7 +385,7 @@ class ORBStrategy(BaseStrategy):
             if profit >= rng * CFG["trail_after_r"]:
                 t["trail_active"] = True
                 t["trailing_sl"]  = t["entry_spot"]  # move to breakeven
-                log.info(f"[{self.name}]  Trail active: SLBE={t['entry_spot']:.0f}")
+                log.info(f"[{self.name}]  Trail active: SL→BE={t['entry_spot']:.0f}")
 
         if t["trail_active"]:
             gap  = rng * CFG["trail_sl_mult"]
@@ -413,14 +461,25 @@ class ORBStrategy(BaseStrategy):
                 self._trades_taken < CFG["max_trades_per_day"] and
                 ts.time() < CFG["entry_cutoff"]):
             log.info(f"[{self.name}]  2nd trade opportunity available")
-            self._trade = None   # reset  on_candle will check next candle
+            self._trade = None   # reset — on_candle will check next candle
         else:
             self._day_paused = True
 
-    #  Indicators (Wilder ADX, session VWAP fed from hub) 
+    # ── Indicators (Wilder ADX, session VWAP fed from hub) ────────────────────
 
     def _compute_indicators(self, candles: list) -> dict:
+        """
+        FIX (Bug 5): candles are now full OHLCV dicts with real high/low/volume.
+        Previously, CandleBuilder was fed only close → H=L=O=C → ATR/ADX/ST wrong.
+        """
         df    = pd.DataFrame(candles)
+
+        # Ensure required columns exist and are numeric
+        for col in ("open", "high", "low", "close", "volume"):
+            if col not in df.columns:
+                df[col] = df.get("close", 0)
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
         close = df["close"]
         high  = df["high"]
         low   = df["low"]
@@ -435,7 +494,7 @@ class ORBStrategy(BaseStrategy):
         ema9  = float(close.ewm(span=9,  adjust=False).mean().iloc[-1])
         ema21 = float(close.ewm(span=21, adjust=False).mean().iloc[-1])
 
-        # ATR + Supertrend
+        # ATR + Supertrend (now uses real H/L — not flat candles)
         prev_c = close.shift(1)
         tr     = pd.concat([high-low, (high-prev_c).abs(), (low-prev_c).abs()], axis=1).max(1)
         atr7   = tr.rolling(7, min_periods=1).mean()
@@ -451,7 +510,7 @@ class ORBStrategy(BaseStrategy):
             else:                                                     st_arr.iloc[i]=st_arr.iloc[i-1]
         st_bull = bool(st_arr.iloc[-1])
 
-        # Wilder ADX
+        # Wilder ADX (now uses real high.diff() / low.diff() — not flat)
         a  = 1.0/14
         dp = pd.Series(np.where((high.diff()>0)&(high.diff()>-low.diff()), high.diff(), 0.0), index=df.index)
         dm = pd.Series(np.where((-low.diff()>0)&(-low.diff()>high.diff()), -low.diff(), 0.0), index=df.index)
@@ -467,7 +526,7 @@ class ORBStrategy(BaseStrategy):
         bw   = (sma+2*std - (sma-2*std)) / sma.replace(0,np.nan)
         bb_e = bool(bw.iloc[-1]>bw.iloc[-2]) if len(df)>1 else False
 
-        # Volume
+        # Volume (now uses real bar volumes, not zeros — Bug 7 fix in market_hub.py)
         va  = float(vol.rolling(10, min_periods=1).mean().iloc[-1])
         vl  = float(vol.iloc[-1])
         v3  = float(vol.iloc[-4:-1].sum()) if len(vol)>=4 else va*3
@@ -528,7 +587,7 @@ class ORBStrategy(BaseStrategy):
 
         return round(score,1), det
 
-    #  CSV logger 
+    # ── CSV logger ────────────────────────────────────────────────────────────
 
     def _log_csv(self, t: dict):
         fname  = CFG["csv_file"]
@@ -547,11 +606,11 @@ class ORBStrategy(BaseStrategy):
             w.writerow(row)
 
     def eod_summary(self):
-        log.info(f"\n[{self.name}] {''*50}")
+        log.info(f"\n[{self.name}] {'─'*50}")
         log.info(f"[{self.name}] END OF DAY")
         log.info(f"[{self.name}] Trades: {self._trades_taken}  "
                  f"Today PnL: {self._today_pnl:,.0f}")
         for i, t in enumerate(self._completed, 1):
             log.info(f"[{self.name}]   #{i} {t['direction']} {t['exit_reason']} "
                      f"{t['pnl_total']:,.0f}")
-        log.info(f"[{self.name}] {''*50}\n")
+        log.info(f"[{self.name}] {'─'*50}\n")
