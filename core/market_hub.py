@@ -28,6 +28,19 @@ IST FIX (applied throughout):
    causing the EOD check (MARKET_CLOSE=15:31) to never trigger until
    10:01 UTC, which is after GitHub's timeout kills the job at ~15:00 IST.
    With _now_ist(), the bot self-exits cleanly at 15:31 IST every day.
+
+FIX (Bug 3 + Bug 7):
+   BankNifty INDEX token (260105) has last_traded_quantity=0 on every tick
+   because it is a computed index — there are no actual trades.
+   Original code: session_vwap.update(price, price, price, qty=0)
+                  index_candles.feed_tick(price, qty=0, now)
+   → VWAP accumulated nothing → _value stayed None all session.
+   → All 5-min candles had volume=0 → BB_STOCH/ORB/ScalperV7 volume
+     filters permanently bypassed after backfill bars rolled off.
+
+   Fix: pass proxy_weight=1 to SessionVWAP when qty==0 (index token).
+        pass volume=1 to CandleBuilder when qty==0 so candles have
+        non-zero volume and the rolling volume average is meaningful.
 """
 
 import json
@@ -190,9 +203,22 @@ class MarketHub:
                         log.error(f"[{strat.name}] on_option_tick error: {e}")
 
     def _handle_index_tick(self, price: float, qty: int, now: datetime, tick_ts: datetime):
-        """Process index tick: update VWAP, build candles, broadcast."""
-        # Update session VWAP
-        self.session_vwap.update(price, price, price, qty)
+        """Process index tick: update VWAP, build candles, broadcast.
+
+        FIX (Bug 3 + Bug 7):
+        BankNifty INDEX token always has qty=0 (it's a computed index, not a
+        traded instrument). We pass qty to vwap.update() with proxy_weight=1
+        so VWAP accumulates tick-weighted prices rather than staying None.
+        Same fix for candles: use max(qty, 1) so candle volume is never zero.
+        Volume filters in BB_STOCH, ORB, and ScalperV7 all depend on non-zero
+        candle volumes — without this fix they permanently bypass volume checks.
+        """
+        # FIX: use tick count (1) as proxy when qty==0 (index token)
+        # This ensures VWAP is computed and candle volumes are non-zero.
+        proxy_vol = qty if qty > 0 else 1
+
+        # Update session VWAP (tick-weighted with proxy_weight)
+        self.session_vwap.update(price, price, price, volume=qty, proxy_weight=1)
 
         # Broadcast raw tick to all strategies (both wall-clock ts and exchange tick_ts)
         for strat in self._strategies:
@@ -201,8 +227,8 @@ class MarketHub:
             except Exception as e:
                 log.error(f"[{strat.name}] on_tick error: {e}")
 
-        # Build 5-min candle using IST wall-clock time
-        closed = self.index_candles.feed_tick(price, qty, now)
+        # Build 5-min candle using IST wall-clock time and proxy volume
+        closed = self.index_candles.feed_tick(price, proxy_vol, now)
         if closed is not None:
             # Broadcast closed candle to all strategies
             for strat in self._strategies:
