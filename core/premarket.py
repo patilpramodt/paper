@@ -6,6 +6,9 @@ Fixes applied:
   2. PCR fetch: SKIPPED in fetch_all() — NSE OI data is never ready at 9:08 AM.
                First PCR fetch now delayed to 9:16 AM in live refresh thread.
   3. Live refresh: PCR skipped until 9:16 AM on first run to avoid empty OI data.
+  4. _fetch_pcr session reuse: NSE session created ONCE before retry loop instead
+     of being recreated on every attempt (was triggering NSE bot-detection returning
+     empty JSON — caused PCR=None all day despite correct parsing logic).
 """
 
 import logging
@@ -260,13 +263,39 @@ class PreMarketData:
         return None
 
     def _fetch_pcr(self) -> float | None:
+        """Fetch Put/Call Ratio from NSE option chain.
+
+        FIX (Bug 6 / session reuse): previous code called _nse_session() inside
+        the retry loop — creating a brand-new requests.Session and hitting the
+        NSE homepage on every attempt. Three rapid homepage→API sequences in
+        ~6 seconds look exactly like a scraper bot to NSE's WAF, which returns
+        HTTP 200 with an empty JSON body (records keys: []) as a soft block.
+        This is why PCR failed all day today despite correct JSON parsing logic.
+
+        Fix: create the session ONCE before the retry loop and reuse its cookies
+        across all attempts. Each retry reuses the same authenticated session,
+        so NSE sees one session with multiple API calls — normal browser behaviour.
+
+        Note: the JSON parsing logic (records → data → CE/PE openInterest) was
+        already correct. ChatGPT's suggestion to change it was wrong — the real
+        problem was the session being recreated on every attempt.
+        """
         import time as _time
         url = "https://www.nseindia.com/api/option-chain-indices?symbol=BANKNIFTY"
+
+        # FIX: create session ONCE — reuse cookies across retries.
+        # Recreating the session on every attempt hits the NSE homepage 3 times
+        # in 6 seconds, triggering soft bot-detection → empty JSON response.
+        try:
+            s, h = self._nse_session()
+        except Exception as e:
+            log.warning(f"  PCR session init failed: {e}")
+            return None
+
         for attempt in range(1, 4):
             try:
-                s, h = self._nse_session()
                 _time.sleep(1.5)
-                r = s.get(url, headers=h, timeout=8)
+                r = s.get(url, headers=h, timeout=8)   # reuse same session
                 if r.status_code != 200:
                     log.warning(f"  PCR fetch attempt {attempt}: HTTP {r.status_code}")
                     _time.sleep(2)
