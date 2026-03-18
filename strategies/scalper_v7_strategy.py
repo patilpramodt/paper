@@ -46,6 +46,9 @@ FIXES APPLIED:
            (CE/PE direction was never incremented, only "" was).
            Fix: capture opt_type = active_trade.option_type BEFORE calling
            manage_trade() so it's available for the risk callback.
+           Applied in BOTH on_option_tick() AND eod_summary() — the same
+           pattern existed in both places but was previously only fixed in
+           on_option_tick.
 """
 
 import logging
@@ -421,15 +424,21 @@ class ScalperV7Strategy(BaseStrategy):
     def eod_summary(self):
         """Called at 3:30 PM by MarketHub."""
         if self._engine.active_trade:
-            # Force close at whatever price we have
-            token = self._engine.active_trade.token
-            ltp   = self.get_price(token) or self._engine.active_trade.entry
-            reason = self._engine.close_trade_forced(ltp, "EOD-SQUAREOFF")
+            # Force close at whatever price we have.
+            token    = self._engine.active_trade.token
+            ltp      = self.get_price(token) or self._engine.active_trade.entry
+            # FIX (Bug 8 — eod_summary): capture opt_type BEFORE close_trade_forced().
+            # close_trade_forced() calls _close() internally which sets active_trade=None.
+            # Reading active_trade.option_type AFTER the call always evaluates the ternary
+            # to "" — the directional loss counter silently received "" on every EOD close.
+            # This is the same bug that was fixed in on_option_tick but was missed here.
+            opt_type = self._engine.active_trade.option_type
+            reason   = self._engine.close_trade_forced(ltp, "EOD-SQUAREOFF")
             if self._engine._results:
                 last = self._engine._results[-1]
                 self._risk.on_trade_exit(
                     last["pnl_pts"], last["pnl_rs"], reason,
-                    self._engine.active_trade.option_type if self._engine.active_trade else "",
+                    opt_type,   # ← captured before close; active_trade is None here
                 )
             clear_state()
             self._unsubscribe_active_option()
