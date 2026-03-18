@@ -21,6 +21,12 @@ FIXES APPLIED:
            Fix: because _candle_buf appends the full candle in on_candle()
            before _check_entry() runs, the breakout bar is always included.
 
+  Bug 4 (NEW) — on_candle entry gate used <= entry_cutoff (inclusive) but
+           _close() 2nd-trade re-arm used < entry_cutoff (exclusive). A breakout
+           candle at exactly 10:30 could enter a trade that could never get a 2nd
+           attempt — the re-arm guard would immediately block it. Standardised
+           to < everywhere so entry_cutoff is a hard exclusive boundary.
+
   Bug 9 — Gap filter used 9:30 price instead of 9:15 open price.
            _lock_or(price) is called when t >= 9:30; that price could be
            far from the actual open if the market moved during 9:15–9:30.
@@ -198,7 +204,7 @@ class ORBStrategy(BaseStrategy):
                 CFG["min_range"] <= self._or_width <= CFG["max_range"] and
                 (self._trade is None or self._trade["state"] == "CLOSED") and
                 self._trades_taken < CFG["max_trades_per_day"] and
-                CFG["entry_start"] <= ts.time() <= CFG["entry_cutoff"]):
+                CFG["entry_start"] <= ts.time() < CFG["entry_cutoff"]):
             self._check_entry(candle, candle["close"], ts)
 
     def on_option_tick(self, token: int, price: float, ts: datetime, tick_ts: datetime = None):
