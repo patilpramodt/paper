@@ -41,14 +41,14 @@ FIXES APPLIED:
            populate the price cache.
 
   Bug 8 — option_type passed to risk.on_trade_exit() was always "" because
-           active_trade is set to None by manage_trade() before we read it.
-           This silently broke the directional consecutive-loss blocker
-           (CE/PE direction was never incremented, only "" was).
-           Fix: capture opt_type = active_trade.option_type BEFORE calling
-           manage_trade() so it's available for the risk callback.
-           Applied in BOTH on_option_tick() AND eod_summary() — the same
-           pattern existed in both places but was previously only fixed in
-           on_option_tick.
+           active_trade is set to None by manage_trade() / close_trade_forced()
+           before we read it. This silently broke the directional consecutive-loss
+           blocker (CE/PE direction was never incremented, only "" was).
+           Fix: capture opt_type = active_trade.option_type BEFORE the close call
+           in ALL THREE exit paths:
+             - on_option_tick()    (was already fixed)
+             - eod_summary()       (fixed in previous pass)
+             - _handle_squareoff() (fixed in this pass — was the last remaining gap)
 """
 
 import logging
@@ -244,7 +244,7 @@ class ScalperV7Strategy(BaseStrategy):
         if reason:
             # _close() already set active_trade = None inside PaperEngine
             if self._engine._results:
-                last = self._engine._results[-1]
+                last    = self._engine._results[-1]
                 pnl_pts = last["pnl_pts"]
                 pnl_rs  = last["pnl_rs"]
                 # FIX (Bug 8): pass opt_type captured above (not active_trade.option_type
@@ -431,7 +431,6 @@ class ScalperV7Strategy(BaseStrategy):
             # close_trade_forced() calls _close() internally which sets active_trade=None.
             # Reading active_trade.option_type AFTER the call always evaluates the ternary
             # to "" — the directional loss counter silently received "" on every EOD close.
-            # This is the same bug that was fixed in on_option_tick but was missed here.
             opt_type = self._engine.active_trade.option_type
             reason   = self._engine.close_trade_forced(ltp, "EOD-SQUAREOFF")
             if self._engine._results:
@@ -453,12 +452,31 @@ class ScalperV7Strategy(BaseStrategy):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _handle_squareoff(self):
-        """Force close any open trade at EOD."""
+        """Force close any open trade when risk manager triggers auto square-off.
+
+        FIX (Bug 8 — _handle_squareoff): this was the last remaining place where
+        active_trade.option_type was read AFTER close_trade_forced() nulled it.
+        close_trade_forced() calls _close() internally which sets active_trade=None,
+        so the RiskManager's directional consecutive-loss counter received "" on
+        every intraday squareoff — corrupting CE/PE tracking for the rest of the
+        session and for next-day crash recovery state.
+
+        Same fix as on_option_tick() and eod_summary(): capture opt_type on its
+        own line BEFORE the close call.
+        """
         if not self._engine.active_trade:
             return
-        token = self._engine.active_trade.token
-        ltp   = self.get_price(token) or self._engine.active_trade.entry
-        self._engine.close_trade_forced(ltp, "AUTO-SQUAREOFF")
+        token    = self._engine.active_trade.token
+        ltp      = self.get_price(token) or self._engine.active_trade.entry
+        # FIX (Bug 8): capture opt_type BEFORE close_trade_forced() nulls active_trade
+        opt_type = self._engine.active_trade.option_type
+        reason   = self._engine.close_trade_forced(ltp, "AUTO-SQUAREOFF")
+        if self._engine._results:
+            last = self._engine._results[-1]
+            self._risk.on_trade_exit(
+                last["pnl_pts"], last["pnl_rs"], reason,
+                opt_type,   # ← captured before close; active_trade is None here
+            )
         clear_state()
         self._persistence.reset()
         self._unsubscribe_active_option()
