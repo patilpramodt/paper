@@ -31,7 +31,7 @@ def _now_ist() -> datetime:
     return datetime.now(tz=_IST).replace(tzinfo=None)
 
 CFG = {
-    "quantity"               : 15,
+    "quantity"               : 30,
     "start_time"             : dtime(9, 15),
     "spike_exit_time"        : dtime(9, 30),
     "close_time"             : dtime(15, 15),
