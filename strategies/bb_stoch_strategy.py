@@ -38,44 +38,59 @@ FIXES APPLIED:
            option we just subscribed had no price — get_price() returned
            None → all entries silently skipped.
            Fix: removed time.sleep(). At entry time, read LTP immediately.
-           If unavailable, log a warning and return — the next candle will
-           re-evaluate. The option stays subscribed so the next call gets
-           the price instantly.
+           If unavailable, log a warning and store a pending entry (see Bug 7).
 
-  Bug 2 (NEW) — _persist_buf cleared in _evaluate_entry() BEFORE calling
+  Bug 2 — _persist_buf cleared in _evaluate_entry() BEFORE calling
            _enter_trade(). When _enter_trade() returned early (LTP unavailable),
-           the persistence context was already wiped — the next candle had to
-           re-confirm from scratch instead of retrying immediately. This is
-           exactly why the 11:30 BUY_CE signal today was permanently lost
-           (55200CE had no LTP; buffer was cleared; signal never re-fired
-           despite BankNifty rallying 384 pts).
-           Fix: removed the clear from _evaluate_entry. _persist_buf is now
-           cleared inside _enter_trade() only after a genuine fill is made.
+           the persistence context was already wiped.
+           Fix: _persist_buf is now cleared inside _enter_trade() only after
+           a genuine fill is made. NOTE: with persistence=1 this has limited
+           effect — Bug 7 fix is the correct solution for LTP misses.
 
-  Bug 3 (NEW) — _close_trade() read self._trade outside the lock, creating a
+  Bug 3 — _close_trade() read self._trade outside the lock, creating a
            race window between the WS thread (auto-squareoff at 15:15 via
            on_tick) and the main thread (eod_summary at 15:31). Both could
            pass the `if not trade` guard simultaneously → double P&L, double
            CSV row, double unsubscribe.
            Fix: _close_trade() now atomically reads AND clears self._trade
-           inside a single lock acquisition at the very top. The second caller
-           sees None and returns immediately — only one thread ever closes.
+           inside a single lock acquisition at the very top.
 
   Bug 4 — ATM options not pre-subscribed in pre_market(). Even without the
            sleep bug, subscribing at the moment of signal and immediately
-           reading LTP is a race — first tick may take 200–800ms. Fix:
-           pre_market() now subscribes ATM CE + PE at 9:08 AM (same as
-           SPIKE). At entry time the token has live ticks → price available.
-           When the actual entry strike differs, we subscribe that token and
-           rely on the already-flowing WebSocket to deliver its price quickly.
+           reading LTP is a race — first tick may take 200–800ms.
+           Fix: pre_market() subscribes ATM CE + PE at 9:08 AM based on
+           prev_close reference price.
 
-  Bug 5 (NEW) — pre_market() only subscribed the opening ATM strike. When
-           BankNifty moves 300+ pts intraday (common), the signal fires at
-           a strike that was never pre-warmed → LTP miss on first attempt.
-           Fix: pre_market() now subscribes ATM ±200pt strikes (6 tokens
-           total) to cover the typical intraday range. Combined with Bug 2
-           fix (persist buf retained on LTP miss), even a cold strike will
-           be priced on the retry candle.
+  Bug 5 — pre_market() only subscribed the opening ATM strike. When
+           BankNifty moves 300+ pts intraday, the signal fires at a strike
+           that was never pre-warmed → LTP miss on first attempt.
+           Fix: pre_market() now subscribes ATM±200pt strikes (6 tokens
+           total) to cover the typical intraday range.
+
+  Bug 6 (NEW) — pre_market() pre-subscribes strikes based on prev_close.
+           On large gap days (BankNifty gapped 1850pts down on 19-Mar-2026),
+           the actual intraday ATM was 1100–2000pts away from all pre-subscribed
+           strikes — every pre-warmed token was deep OTM and never used.
+           Both BB_STOCH signals (12:15 BUY_CE and 14:10 BUY_PE) fired on
+           completely cold tokens → LTP unavailable → trades permanently missed.
+           Fix: on_candle() checks if this is the first candle of the session
+           and if so calls _subscribe_spot_atm(spot) to subscribe ATM±400
+           based on the ACTUAL live market price. This fires ~9:20 AM —
+           75+ minutes before the earliest possible BB_STOCH signal (min_bars=14
+           candles = 70min from 9:15). Token warms up long before any signal.
+
+  Bug 7 (NEW) — When get_price() returns None (token subscribed but first
+           tick hasn't arrived yet), _enter_trade() bails early with a warning.
+           With persistence=1 the next 5-min candle overwrites _persist_buf
+           with HOLD (BB crossover already happened, no fresh setup), so the
+           signal never re-fires. Bug 2 fix (retain persist_buf) helps when
+           persistence≥2 but is irrelevant for persistence=1.
+           Fix: when LTP unavailable, store self._pending_entry with the full
+           signal context. In on_option_tick(), when that token's FIRST live
+           tick arrives (200–800ms, same 5-min window as original signal),
+           execute the fill immediately via _fill_pending(). No blocking,
+           no sleeping, no waiting for the next candle — the position opens
+           within seconds of the signal, exactly as intended.
 
   Bug 10 — on_tick() called _force_close() on EVERY index tick after 15:15
             (potentially dozens per second). Second call was harmless but
@@ -163,6 +178,11 @@ CFG = {
     # BB now uses min_periods=bb_period//3 so it computes validly before 20 bars.
     # Was 20 (100min from 9:15 → 10:55 AM, left only 3.5hrs trading window).
     "min_bars"          : 14,       # was 20
+
+    # FIX (Bug 6): strike offsets to pre-subscribe based on actual open price
+    # ±400 covers intraday moves of up to 400pts in either direction from open
+    # (typical BankNifty daily range is 300–600pts; ±400 covers ~80% of days)
+    "spot_atm_offsets"  : [0, 200, -200, 400, -400],
 
     # CSV output
     "entry_csv"         : "logs/bb_stoch_entry.csv",
@@ -487,6 +507,19 @@ class BBStochStrategy(BaseStrategy):
         self._pre_ce_token: Optional[int] = None
         self._pre_pe_token: Optional[int] = None
 
+        # FIX (Bug 6): flag to trigger dynamic spot-based subscription on first candle
+        # pre_market() subscribes based on prev_close which fails on large gap days.
+        # on_candle() will subscribe ATM±400 based on actual live spot on first bar.
+        self._open_atm_subscribed: bool = False
+
+        # FIX (Bug 7): pending entry storage.
+        # When _enter_trade() bails because LTP is unavailable (token subscribed
+        # but first WebSocket tick hasn't arrived yet), we store the full signal
+        # context here. on_option_tick() watches for this token and fills the
+        # trade the moment the first live price arrives — typically 200–800ms later,
+        # well within the same 5-minute window. No sleeping, no blocking.
+        self._pending_entry: Optional[dict] = None
+
         log.info("[BB_STOCH] Strategy initialized")
 
     # ----------------------------------------------------------
@@ -507,13 +540,12 @@ class BBStochStrategy(BaseStrategy):
             log.warning("[BB_STOCH] PCR is None -- VWAP bias will be unrestricted. "
                         "Check if PCR fetch failed in core.premarket")
 
-        # FIX (Bug 4): pre-subscribe ATM CE + PE at 9:08 AM.
-        # FIX (Bug 5): also subscribe ATM±200pt strikes to cover intraday range.
-        # BankNifty routinely moves 300-400pt intraday; if the signal fires at
-        # a strike ±200pt from the opening ATM, the option is already warm and
-        # get_price() returns immediately instead of needing a retry candle.
-        # Combined with Bug 2 fix (persist buf retained on LTP miss), even a
-        # cold strike will be priced on the retry candle at worst.
+        # FIX (Bug 4 + 5): pre-subscribe ATM CE + PE + ATM±200 at 9:08 AM based
+        # on prev_close. This warms up the typical daily range for normal sessions.
+        #
+        # FIX (Bug 6): this is NOT sufficient for large gap days (e.g. 1850pt gap).
+        # _subscribe_spot_atm() is called on the first 5-min candle with the actual
+        # live spot to cover the real intraday range regardless of gap size.
         ref_price = premarket_data.prev_close or premarket_data.prev_last5m_close
         if ref_price and self._expiry_date:
             atm = get_atm_strike(ref_price)
@@ -546,7 +578,7 @@ class BBStochStrategy(BaseStrategy):
                                       f"(token not found — likely near expiry)")
         else:
             log.warning("[BB_STOCH] No ref price for pre-subscription — "
-                        "options will be subscribed on first signal (may cause LTP miss)")
+                        "spot-based subscription will fire on first candle only")
 
         return True
 
@@ -558,7 +590,60 @@ class BBStochStrategy(BaseStrategy):
         self._results.clear()
         self._blocked_log.clear()
         self._persist_buf.clear()
-        self._squareoff_done = False  # FIX (Bug 10): reset guard each day
+        self._squareoff_done     = False   # FIX (Bug 10): reset guard each day
+        self._open_atm_subscribed = False  # FIX (Bug 6): reset so first candle re-subscribes
+        self._pending_entry       = None   # FIX (Bug 7): discard any stale pending entry
+
+    # ----------------------------------------------------------
+    # FIX (Bug 6): Dynamic spot-based subscription on first candle
+    # ----------------------------------------------------------
+
+    def _subscribe_spot_atm(self, spot: float):
+        """
+        FIX (Bug 6): Subscribe ATM±400 strikes based on actual live spot price.
+
+        Called on the first 5-min candle of the session (~9:20 AM).
+        This covers large gap days where pre_market()'s prev_close-based
+        subscriptions land on completely wrong strikes.
+
+        On 19-Mar-2026 BankNifty gapped 1850pts down:
+          prev_close = 55326 → pre-subscribed 55100/55300/55500
+          actual open = 53474 → real ATM range = 53200–54200
+          → all pre-subscribed tokens were deep OTM, LTP unavailable on both signals
+
+        With ±400 offsets from actual spot this method subscribes 10 tokens
+        covering 53000–54800 on that day — every strike that could realistically
+        get a signal during the session.
+        """
+        if not spot or spot <= 0:
+            return
+        if not self._expiry_date or not self._instruments:
+            return
+
+        atm = get_atm_strike(spot)
+        subscribed = 0
+
+        for offset in CFG["spot_atm_offsets"]:
+            for opt_type in ("CE", "PE"):
+                strike = atm + offset
+                tok, sym = self._instruments.get_option_token(strike, opt_type, self._expiry_date)
+                if tok:
+                    self.subscribe_option(tok)
+                    subscribed += 1
+                    log.info(
+                        f"[BB_STOCH] Spot-subscribe {sym} ({tok}) "
+                        f"[spot-ATM{offset:+d}]"
+                    )
+                else:
+                    log.debug(
+                        f"[BB_STOCH] Spot-subscribe skipped {strike}{opt_type} "
+                        f"(token not found)"
+                    )
+
+        log.info(
+            f"[BB_STOCH] Spot-based subscription complete: "
+            f"{subscribed} tokens around ATM={atm} (spot={spot:.0f})"
+        )
 
     # ----------------------------------------------------------
     # TICK CALLBACKS
@@ -580,9 +665,23 @@ class BBStochStrategy(BaseStrategy):
         """
         Called by MarketHub when a 5-min index candle closes.
         This is the main signal evaluation trigger.
+
+        FIX (Bug 6): on the first candle of the session, subscribe ATM±400
+        based on the actual spot price. This happens ~9:20 AM — 65+ minutes
+        before the earliest possible BB_STOCH signal (min_bars=14 × 5min =
+        70min from 9:15). All tokens are warm before any signal can fire.
         """
         with self._lock:
             self._buf_5m.append(candle)
+
+        # FIX (Bug 6): subscribe around actual open spot on first candle.
+        # pre_market() uses prev_close which fails on large gap days.
+        # This fires once per session, covers the true intraday ATM range.
+        if not self._open_atm_subscribed:
+            spot = candle.get("close", 0)
+            if spot and spot > 0:
+                self._subscribe_spot_atm(spot)
+                self._open_atm_subscribed = True
 
         # Don't look for entries if a trade is already open
         if self._trade:
@@ -592,7 +691,54 @@ class BBStochStrategy(BaseStrategy):
 
     def on_option_tick(self, token: int, price: float, ts: datetime,
                        tick_ts: datetime = None):
-        """Live option price -- drives SL/TP/trail management."""
+        """
+        Live option price -- drives two things:
+          1. SL/TP/trail management for open trades (existing behaviour)
+          2. FIX (Bug 7): pending entry fill on first live tick
+
+        FIX (Bug 7) explanation:
+          When _enter_trade() bails because get_price() returns None
+          (token subscribed but first WS tick hasn't arrived yet), it stores
+          self._pending_entry with the full signal context.
+
+          This method is called by MarketHub for EVERY tick on EVERY subscribed
+          option token. The first tick on the newly subscribed token lands here
+          200–800ms after subscription — still within the same 5-minute window
+          as the original signal.
+
+          We check: if this tick's token matches _pending_entry["token"], and
+          no trade is open, and risk gates pass → fill immediately via
+          _fill_pending(). The position opens within seconds of the signal
+          as originally intended.
+
+          This does NOT block or sleep — it runs in the WebSocket tick thread
+          identically to _manage_trade() which is already called here.
+        """
+        # FIX (Bug 7): check for pending entry on first tick of subscribed token
+        pending = self._pending_entry
+        if pending is not None and token == pending["token"] and not self._trade:
+            # Validate the pending entry is still actionable
+            now_time = ts.time()
+            if now_time >= dtime(*CFG["session_cutoff"]):
+                log.info(
+                    f"[BB_STOCH] Pending entry expired (past cutoff) for "
+                    f"{pending['symbol']} — discarding"
+                )
+                self._pending_entry = None
+            elif self._is_halted or self._trades_today >= CFG["max_trades_day"]:
+                log.info(
+                    f"[BB_STOCH] Pending entry cancelled (risk gate) for "
+                    f"{pending['symbol']}"
+                )
+                self._pending_entry = None
+            elif price and price >= 5:
+                # Valid LTP arrived — fill the trade now
+                self._fill_pending(pending, price, ts)
+                return
+            # else price still invalid — keep pending, wait for next tick
+            return
+
+        # Normal trade management for open position
         if token != self._active_token:
             return
         if not self._trade:
@@ -680,6 +826,9 @@ class BBStochStrategy(BaseStrategy):
         # If _enter_trade() bails early (LTP unavailable, sanity check fail, etc.),
         # the buffer retains the current signal so the next candle is immediately
         # re-confirmed without needing to rebuild from scratch.
+        # NOTE: with persistence=1 this has limited effect since the next candle's
+        # HOLD signal overwrites the deque(maxlen=1) anyway. Bug 7's _pending_entry
+        # mechanism is the correct solution for the LTP miss case.
         self._enter_trade(action, sig, ts)
 
     # ----------------------------------------------------------
@@ -687,15 +836,12 @@ class BBStochStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def _enter_trade(self, action: str, sig: dict, ts: datetime):
-        """Open a new options position.
+        """
+        Open a new options position.
 
-        FIX (Bug 1): removed time.sleep(0.4). [already applied previously]
-
-        FIX (Bug 2): _persist_buf is now cleared HERE, only on a genuine fill.
-        Previously it was cleared in _evaluate_entry before this call, so an
-        LTP miss permanently lost the signal — the next candle had to re-confirm
-        from scratch and by then conditions had usually changed. Now the buffer
-        is only cleared when a real BBTrade object is constructed and registered.
+        FIX (Bug 1): removed time.sleep(0.4).
+        FIX (Bug 2): _persist_buf cleared only on genuine fill (not on LTP miss).
+        FIX (Bug 7): on LTP miss, store _pending_entry for fill on first tick.
         """
         opt    = "CE" if action == "BUY_CE" else "PE"
         spot   = sig.get("close", 0)
@@ -717,25 +863,50 @@ class BBStochStrategy(BaseStrategy):
             log.warning(f"[BB_STOCH] Option not found: ATM={atm} {opt} expiry={expiry}")
             return
 
-        # Subscribe the token (deduplicates — safe if already subscribed from pre_market)
+        # Subscribe the token (deduplicates — safe if already subscribed from pre_market
+        # or _subscribe_spot_atm). With Bug 6 fix, most entry strikes will already be
+        # subscribed and warm. If spot has moved beyond ±400 from open (rare), this
+        # is a fresh subscribe and LTP may not be available yet — Bug 7 handles that.
         self.subscribe_option(token)
 
         # FIX (Bug 1): no sleep here. Read LTP directly from the WebSocket price cache.
-        # If the option was pre-subscribed (Bug 4/5 fix), this returns immediately.
-        # If this is a new strike (spot moved beyond ±200), the tick may not have
-        # arrived yet. In that case we bail and retry next candle — the persist_buf
-        # is NOT cleared (Bug 2 fix) so the next bar is immediately confirmed and
-        # retries with live LTP.
         ltp = self.get_price(token)
 
         if not ltp or ltp < 5:
+            # FIX (Bug 7): store pending entry instead of silently dropping the trade.
+            # on_option_tick() will fill this the moment the first tick arrives on
+            # this token — typically 200–800ms, within the same 5-minute window.
+            # Do NOT unsubscribe — keep token live so the tick arrives promptly.
+            # Do NOT clear _persist_buf — keep persistence context (Bug 2 fix).
             log.warning(
                 f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) — "
-                f"option subscribed, will retry on next candle signal"
+                f"option subscribed, pending entry stored, will fill on first tick"
             )
-            # Do NOT unsubscribe — keep it live so next bar gets price immediately.
-            # Do NOT clear _persist_buf — next candle will be immediately confirmed.
+            self._pending_entry = {
+                "action"    : action,
+                "opt"       : opt,
+                "sig"       : sig,
+                "token"     : token,
+                "symbol"    : tsym,
+                "ts"        : ts,           # signal timestamp (for delay logging)
+                "atm"       : atm,
+            }
             return
+
+        # LTP is available — proceed with immediate fill
+        self._execute_fill(opt, sig, token, tsym, ltp, ts)
+
+    def _execute_fill(self, opt: str, sig: dict, token: int,
+                      tsym: str, ltp: float, ts: datetime,
+                      pending_delay_ms: Optional[float] = None):
+        """
+        Shared fill logic used by both _enter_trade() (immediate) and
+        _fill_pending() (deferred on first tick).
+
+        Constructs the BBTrade, registers it, logs, and writes entry CSV.
+        """
+        atr  = sig.get("atr", 0)
+        spot = sig.get("close", 0)
 
         # Compute SL/TP
         sl_pts, tp_pts, sl_price, tp_price = self._compute_sl_tp(ltp, atr)
@@ -768,15 +939,14 @@ class BBStochStrategy(BaseStrategy):
         self._trades_today += 1
 
         # FIX (Bug 2): clear persistence buffer only here, after a confirmed fill.
-        # Clearing earlier (in _evaluate_entry) caused LTP misses to permanently
-        # lose the signal — the buffer had to rebuild from scratch on the next candle.
         self._persist_buf.clear()
 
         rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
 
+        delay_str = f" [pending_delay={pending_delay_ms:.0f}ms]" if pending_delay_ms is not None else ""
         log.info(
             f"[BB_STOCH] ENTRY {opt} | {tsym} | "
-            f"Fill={trade.entry:.2f} LTP={ltp:.2f} | "
+            f"Fill={trade.entry:.2f} LTP={ltp:.2f}{delay_str} | "
             f"SL={trade.sl:.2f}(-{sl_pts:.1f}) TP={trade.target:.2f}(+{tp_pts:.1f}) | "
             f"RR=1:{rr} ATR={atr:.1f} | "
             f"Mode={sig.get('mode', '?')} BB-BW={sig['bb'].get('bw_pct', 0)*100:.2f}%"
@@ -798,7 +968,7 @@ class BBStochStrategy(BaseStrategy):
             "rr"         : rr,
             "spot"       : spot,
             "atr"        : atr,
-            "mode"       : sig.get("mode", ""),
+            "mode"       : sig.get("mode", "pending" if pending_delay_ms else ""),
             "bb_upper"   : bb.get("upper", ""),
             "bb_lower"   : bb.get("lower", ""),
             "bb_bw_pct"  : bb.get("bw_pct", ""),
@@ -806,7 +976,72 @@ class BBStochStrategy(BaseStrategy):
             "stoch_d"    : st.get("d", ""),
             "vol_ratio"  : sig.get("vol_ratio", ""),
             "vwap"       : self._hub.session_vwap.value if self._hub.session_vwap.value is not None else "N/A",
+            "pending_delay_ms": round(pending_delay_ms, 0) if pending_delay_ms is not None else "",
         })
+
+    # ----------------------------------------------------------
+    # FIX (Bug 7): Pending entry fill on first WebSocket tick
+    # ----------------------------------------------------------
+
+    def _fill_pending(self, pending: dict, ltp: float, ts: datetime):
+        """
+        FIX (Bug 7): Execute fill for a pending entry on its first live tick.
+
+        Called from on_option_tick() when the pending token's FIRST price arrives.
+        This runs in the WebSocket tick thread — no blocking, no sleeping.
+
+        Timeline example (today's missed 14:10 BUY_PE):
+          14:10:00.177 — BUY_PE confirmed, _enter_trade() called
+          14:10:00.178 — subscribe BANKNIFTY26MAR53700PE (token 13419266)
+          14:10:00.178 — get_price() returns None (no tick yet)
+          14:10:00.178 — _pending_entry stored (OLD BEHAVIOUR: trade missed forever)
+          14:10:00.4   — First WS tick arrives: price=~190 → _fill_pending() executes
+          14:10:00.4   — Trade OPEN, delay ~220ms (same 5-min candle)
+        """
+        # Clear pending atomically — only the first valid tick fills the trade
+        self._pending_entry = None
+
+        if ltp < 5:
+            log.warning(f"[BB_STOCH] Pending fill: LTP {ltp:.2f} too low for {pending['symbol']} — discarding")
+            return
+
+        # Re-check all risk gates (time elapsed since signal)
+        now_time = ts.time()
+        if now_time >= dtime(*CFG["session_cutoff"]):
+            log.info(f"[BB_STOCH] Pending fill aborted — past session cutoff ({pending['symbol']})")
+            return
+        if self._is_halted:
+            log.info(f"[BB_STOCH] Pending fill aborted — strategy halted ({pending['symbol']})")
+            return
+        if self._trades_today >= CFG["max_trades_day"]:
+            log.info(f"[BB_STOCH] Pending fill aborted — max trades reached ({pending['symbol']})")
+            return
+        if self._trade:
+            log.info(f"[BB_STOCH] Pending fill aborted — trade already open ({pending['symbol']})")
+            return
+
+        # Compute delay from signal to fill for logging/analysis
+        try:
+            delay_ms = (ts - pending["ts"]).total_seconds() * 1000
+        except Exception:
+            delay_ms = None
+
+        log.info(
+            f"[BB_STOCH] PENDING FILL triggered for {pending['symbol']} "
+            f"token={pending['token']} LTP={ltp:.2f} "
+            f"delay={delay_ms:.0f}ms" if delay_ms is not None else
+            f"[BB_STOCH] PENDING FILL triggered for {pending['symbol']}"
+        )
+
+        self._execute_fill(
+            opt              = pending["opt"],
+            sig              = pending["sig"],
+            token            = pending["token"],
+            tsym             = pending["symbol"],
+            ltp              = ltp,
+            ts               = ts,
+            pending_delay_ms = delay_ms,
+        )
 
     # ----------------------------------------------------------
     # TRADE MANAGEMENT (called on every option WebSocket tick)
@@ -845,7 +1080,8 @@ class BBStochStrategy(BaseStrategy):
                 log.info(f"[BB_STOCH] Trail stage {new_stage} | SL={trade.sl:.2f}")
 
     def _close_trade(self, ltp: float, reason: str):
-        """FIX (Bug 3): atomically claim ownership of self._trade at the top.
+        """
+        FIX (Bug 3): atomically claim ownership of self._trade at the top.
 
         Previous code read self._trade outside the lock — two threads could
         both pass the `if not trade` guard simultaneously:
@@ -917,6 +1153,14 @@ class BBStochStrategy(BaseStrategy):
 
     def _force_close(self, reason: str):
         """Force-close any open trade (EOD / auto square-off)."""
+        # FIX (Bug 7): also discard any pending entry on force-close
+        if self._pending_entry:
+            log.info(
+                f"[BB_STOCH] Discarding pending entry for "
+                f"{self._pending_entry.get('symbol', '?')} on {reason}"
+            )
+            self._pending_entry = None
+
         with self._lock:
             trade = self._trade
         if not trade:
