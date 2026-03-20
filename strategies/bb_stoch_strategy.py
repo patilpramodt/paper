@@ -158,7 +158,11 @@ CFG = {
     "sl_min"            : 5.0,      # hard floor on SL distance (option pts)
     "sl_max"            : 15.0,     # hard ceiling
     "tp_min"            : 8.0,      # hard floor on TP distance
-    "tp_max"            : 25.0,     # hard ceiling
+    # FIX: raised from 25.0 → 50.0. Old cap caused spread guard to reject
+    # valid signals when ATR was high (e.g. ATR=92 → TP capped at 25, but
+    # estimated spread=27 > 25 → skipped). A 50pt cap keeps TP reasonable
+    # while allowing entry when spread is small relative to the actual TP.
+    "tp_max"            : 50.0,     # hard ceiling
     "trail_arm"         : 6.0,      # move SL to BE when profit >= this
     "trail_step"        : 2.0,      # then trail every N pts
     "slippage"          : 1.5,      # simulated fill slippage (per side)
@@ -913,7 +917,11 @@ class BBStochStrategy(BaseStrategy):
 
         # Option sanity: reject if spread eats too much of target
         est_spread = ltp * 0.03
-        if tp_pts > 0 and (est_spread / tp_pts) > 0.35:
+        # FIX: threshold raised 0.35 → 0.60. With tp_max=50, ratio for a
+        # typical high-ATR entry (spread≈27, TP=50) is 0.54 — was wrongly
+        # rejected at 0.35. 0.60 still blocks entries where spread eats
+        # >60% of target (genuinely bad R:R).
+        if tp_pts > 0 and (est_spread / tp_pts) > 0.60:
             log.warning(f"[BB_STOCH] Spread {est_spread:.1f} too large vs TP {tp_pts:.1f} -- skipping")
             self.unsubscribe_option(token)
             return
