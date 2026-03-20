@@ -3,7 +3,7 @@ name: Trading Bot - Auto Run
 on:
   schedule:
     - cron: '35 3 * * 1-5'   # 9:05 AM IST (Mon–Fri), 10 min before market open
-  workflow_dispatch:           # Manual trigger button in GitHub UI
+  workflow_dispatch:           # Manual trigger button in GitHub UI:           # Manual trigger button in GitHub UI
 
 jobs:
   run-bot:
@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 355       # 7 hrs covers full trading day
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v5
         with:
@@ -32,7 +32,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: logs-${{ github.run_id }}
           path: |
