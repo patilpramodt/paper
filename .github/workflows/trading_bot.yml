@@ -1,6 +1,8 @@
 name: Trading Bot - Auto Run
 
 on:
+  schedule:
+    - cron: '35 3 * * 1-5'   # 9:05 AM IST (Mon–Fri), 10 min before market open
   workflow_dispatch:           # Manual trigger button in GitHub UI
 
 jobs:
