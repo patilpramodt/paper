@@ -87,7 +87,8 @@ class MarketHub:
 
         # Shared market state
         self._index_token  = 260105      # BankNifty — fixed Zerodha token
-        self._last_price   : dict[int, float] = {}
+        self._last_price   : dict[int, float]    = {}
+        self._last_price_ts: dict[int, datetime] = {}   # FIX: track when price arrived
         self._subscribed   : set[int]   = set()
         self._lock         = threading.Lock()
 
@@ -161,6 +162,10 @@ class MarketHub:
         """Get last known price for any subscribed token."""
         return self._last_price.get(token)
 
+    def last_price_ts(self, token: int) -> "datetime | None":
+        """Get timestamp of when the last price tick arrived (IST)."""
+        return self._last_price_ts.get(token)
+
     # ── WebSocket callbacks ───────────────────────────────────────────────────
 
     def _on_ticks(self, ws, ticks):
@@ -188,9 +193,10 @@ class MarketHub:
             if not price:
                 continue
 
-            # Store last price (used by strategies via last_price())
+            # Store last price + timestamp (used by strategies via last_price())
             with self._lock:
-                self._last_price[token] = price
+                self._last_price[token]    = price
+                self._last_price_ts[token] = now   # FIX: record when this tick arrived
 
             if token == self._index_token:
                 self._handle_index_tick(price, qty, now, tick_ts)
