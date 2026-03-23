@@ -98,3 +98,7 @@ class BaseStrategy(ABC):
     def get_price(self, token: int) -> float | None:
         """Get last known price for any token."""
         return self._hub.last_price(token)
+
+    def get_price_ts(self, token: int):
+        """Get timestamp of when the last price tick arrived (IST)."""
+        return self._hub.last_price_ts(token)
