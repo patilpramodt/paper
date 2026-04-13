@@ -347,7 +347,11 @@ class SpikeStrategy(BaseStrategy):
     def _build_entry(self, sym: str, token: int, signal: str, ts: datetime, reason: str):
         opt_price = self.get_price(token)
         if not opt_price or opt_price <= 0:
-            log.warning(f"[{self.name}] No live price for {sym} — cannot enter")
+            log.warning(f"[{self.name}] No live price for {sym} — retrying in 2s...")
+            import time; time.sleep(2)
+            opt_price = self.get_price(token)
+        if not opt_price or opt_price <= 0:
+            log.warning(f"[{self.name}] No live price for {sym} after retry — cannot enter")
             return
 
         # FIX: reject stale pre-open prices
