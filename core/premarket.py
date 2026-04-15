@@ -218,7 +218,7 @@ class PreMarketData:
         from core.instruments import get_nearest_expiry
         if instruments is not None:
             try:
-                self.expiry_date = get_nearest_expiry(instruments._df, date.today())
+                self.expiry_date = get_nearest_expiry(instruments._df, _now_ist().date())
                 log.info(f"  Expiry      : {self.expiry_date}  (from live NFO instruments)")
             except Exception as e:
                 log.error(f"  Expiry resolution FAILED: {e}")
@@ -229,7 +229,7 @@ class PreMarketData:
             self.fetch_ok = False
             return False
 
-        self.dte_days = (self.expiry_date - date.today()).days
+        self.dte_days = (self.expiry_date - _now_ist().date()).days
         log.info(f"  DTE         : {self.dte_days}")
         if self.dte_days == 0:
             log.warning("    0DTE — strategies will apply stricter filters")

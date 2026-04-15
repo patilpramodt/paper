@@ -348,7 +348,7 @@ class PaperEngine:
         worst = min((r["pnl_pts"] for r in results), default=0)
 
         row = {
-            "date":          dt.date.today().isoformat(),
+            "date":          _now_ist().date().isoformat(),
             "trades":        total,
             "wins":          len(wins),
             "losses":        len(losses),

@@ -11,7 +11,10 @@ Provides:
 """
 
 import logging
-from datetime import date
+from datetime import date, timezone, timedelta
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+def _today_ist(): return __import__('datetime').datetime.now(tz=_IST).date()
 
 import pandas as pd
 
@@ -117,7 +120,7 @@ class InstrumentStore:
             return None, None
 
         strike     = get_atm_strike(spot)
-        today      = date.today()
+        today      = _today_ist()
         future_exp = self._df[self._df["expiry"].dt.date >= today]["expiry"].unique()
         if len(future_exp) == 0:
             return None, None

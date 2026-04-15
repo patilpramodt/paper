@@ -534,7 +534,7 @@ class BBStochStrategy(BaseStrategy):
         self._instruments  = instruments
         self._expiry_date  = premarket_data.expiry_date
         self._dte          = premarket_data.dte_days
-        self._session_date = date.today()
+        self._session_date = _now_ist().date()
         self._reset_day()
         log.info(
             f"[BB_STOCH] Pre-market | VIX={premarket_data.vix} "
