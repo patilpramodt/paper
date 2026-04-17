@@ -219,6 +219,7 @@ class PreMarketData:
         if instruments is not None:
             try:
                 self.expiry_date = get_nearest_expiry(instruments._df, _now_ist().date())
+                self._expiry_date_hint = self.expiry_date.strftime("%d-%m-%Y")
                 log.info(f"  Expiry      : {self.expiry_date}  (from live NFO instruments)")
             except Exception as e:
                 log.error(f"  Expiry resolution FAILED: {e}")
