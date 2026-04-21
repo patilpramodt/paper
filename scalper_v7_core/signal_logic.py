@@ -35,6 +35,7 @@ from scalper_v7_core.config import (
     EMA_GAP_5M_FIXED, LUNCH_EMA_ATR_RATIO_5M,
     # RSI Z-score
     RSI_ZSCORE_BULL, RSI_ZSCORE_BEAR, RSI_ZSCORE_EXTREME,
+    RSI_ZSCORE_BULL_TREND, RSI_ZSCORE_BEAR_TREND,
     RSI_BULL_RAW, RSI_BEAR_RAW, RSI_OVERBOUGHT, RSI_OVERSOLD,
     LUNCH_RSI_ZSCORE_BULL, LUNCH_RSI_ZSCORE_BEAR,
     # RSI slope + acceleration (V7)
@@ -227,8 +228,19 @@ def _build_signal(ind1m: dict, ind5m: dict, lunch: bool) -> tuple[str, str]:
     rsi_z        = float(ind1m.get("rsi_z", 0.0))
 
     if zscore_ready:
-        bull_rsi_ok        = rsi_z >= (LUNCH_RSI_ZSCORE_BULL if lunch else RSI_ZSCORE_BULL)
-        bear_rsi_ok        = rsi_z <= (LUNCH_RSI_ZSCORE_BEAR if lunch else RSI_ZSCORE_BEAR)
+        # On sustained trend days, the Z-score rolling mean drifts up alongside RSI,
+        # compressing Rz back toward 0 even though price is genuinely trending.
+        # When 5-min regime is confirmed BULL/BEAR AND is_trending=True (not lunch),
+        # use the relaxed threshold so real trend entries aren't over-blocked.
+        is_trending = ind5m.get("is_trending", False)
+        if not lunch and is_trending:
+            bull_thresh = RSI_ZSCORE_BULL_TREND   # 0.4 (was 0.8 → 155 rsi_z_bull blocks)
+            bear_thresh = RSI_ZSCORE_BEAR_TREND   # -0.4
+        else:
+            bull_thresh = LUNCH_RSI_ZSCORE_BULL if lunch else RSI_ZSCORE_BULL
+            bear_thresh = LUNCH_RSI_ZSCORE_BEAR if lunch else RSI_ZSCORE_BEAR
+        bull_rsi_ok        = rsi_z >= bull_thresh
+        bear_rsi_ok        = rsi_z <= bear_thresh
         rsi_exhausted_bull = rsi_z >= RSI_ZSCORE_EXTREME
         rsi_exhausted_bear = rsi_z <= -RSI_ZSCORE_EXTREME
     else:
