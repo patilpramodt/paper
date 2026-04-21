@@ -136,6 +136,11 @@ REGIME_EMA_ATR_RATIO_1M = 0.15  # ema_gap / atr14 on 1-min (lowered: was 0.25)
 RSI_ZSCORE_WINDOW   = 20        # Rolling window for mean/std
 RSI_ZSCORE_BULL     = 0.8       # Z > +0.8 for bullish (RSI above its own avg)
 RSI_ZSCORE_BEAR     = -0.8      # Z < -0.8 for bearish
+# On sustained trend days the Z-score rolling mean drifts up with RSI,
+# compressing Rz back toward 0 even though price is genuinely trending.
+# Use a relaxed threshold when 5-min regime is confirmed TRENDING (not lunch).
+RSI_ZSCORE_BULL_TREND = 0.4     # relaxed Rz for bull trend (was causing 155 rsi_z_bull blocks)
+RSI_ZSCORE_BEAR_TREND = -0.4    # relaxed Rz for bear trend
 RSI_ZSCORE_EXTREME  = 2.0       # Z > +2.0 = exhaustion (block entry)
 
 # Fallback raw RSI thresholds (used when Z-score window not full)
@@ -257,3 +262,4 @@ SIGNAL_LOG      = "logs/signal_log.csv"
 DAILY_SUMMARY   = "logs/daily_summary.csv"
 STATE_FILE      = "logs/state.json"
 APP_LOG         = "logs/app.log"
+
