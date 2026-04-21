@@ -345,28 +345,27 @@ class SpikeStrategy(BaseStrategy):
     # ── Entry / Exit ──────────────────────────────────────────────────────────
 
     def _build_entry(self, sym: str, token: int, signal: str, ts: datetime, reason: str):
+        # FIX: unified pre-open / no-price guard.
+        #
+        # Two failure modes existed at 9:15:00:
+        #   1. Option has ZERO ticks (get_price → None).  Old code slept 2s on the
+        #      WebSocket thread (blocking ALL tick delivery), then silently returned
+        #      without storing a pending entry → trade permanently missed.
+        #   2. Option has a STALE pre-open indicative tick (price_ts < 9:15).
+        #      Old code stored a pending entry correctly — this path worked.
+        #
+        # Fix: remove the sleep entirely.  Check price AND price_ts together.
+        # If either is absent / stale, store a pending entry and return.
+        # on_option_tick() will resolve it the moment the first valid tick arrives.
         opt_price = self.get_price(token)
-        if not opt_price or opt_price <= 0:
-            log.warning(f"[{self.name}] No live price for {sym} — retrying in 2s...")
-            import time; time.sleep(2)
-            opt_price = self.get_price(token)
-        if not opt_price or opt_price <= 0:
-            log.warning(f"[{self.name}] No live price for {sym} after retry — cannot enter")
-            return
-
-        # FIX: reject stale pre-open prices
-        # Options receive indicative ticks during 9:00-9:15 pre-open at theoretical
-        # (prev-close-based) prices. If the index gaps, these prices are completely
-        # wrong. Only use a price that arrived AT or AFTER market open (9:15:00).
-        price_ts = self.get_price_ts(token)
+        price_ts  = self.get_price_ts(token)
         market_open_today = ts.replace(hour=9, minute=15, second=0, microsecond=0)
-        if price_ts is None or price_ts < market_open_today:
+
+        if (not opt_price or opt_price <= 0) or (price_ts is None or price_ts < market_open_today):
             log.warning(
-                f"[{self.name}] Stale pre-open price for {sym} "
-                f"(price={opt_price:.2f} priced_at={price_ts}) — "
-                f"waiting for first post-9:15 tick"
+                f"[{self.name}] No valid post-9:15 price for {sym} "
+                f"(price={opt_price} priced_at={price_ts}) — storing pending entry"
             )
-            # Store pending entry; will be triggered by next on_option_tick
             self._pending_entry = {
                 "sym": sym, "token": token, "signal": signal, "ts": ts, "reason": reason
             }
