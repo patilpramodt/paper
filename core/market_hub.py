@@ -9,6 +9,7 @@ Owns:
    ONE CandleBuilder for the index (5-min)
    ONE SessionVWAP
    ONE dict of last prices for all subscribed tokens
+   ONE dict of last OI for all subscribed tokens  ← NEW (for WsPCR)
 
 Responsibilities:
    Receives raw ticks from WebSocket
@@ -41,6 +42,13 @@ FIX (Bug 3 + Bug 7):
    Fix: pass proxy_weight=1 to SessionVWAP when qty==0 (index token).
         pass volume=1 to CandleBuilder when qty==0 so candles have
         non-zero volume and the rolling volume average is meaningful.
+
+OI FIX (WsPCR support):
+   Added _last_oi dict and last_oi(token) method.
+   Zerodha sends oi field in every MODE_FULL tick for options/futures.
+   _on_ticks() now stores tick["oi"] for each token so WsPCR can read
+   it without any extra API calls or subscriptions.
+   3 lines of change: dict init in __init__, store in _on_ticks, getter method.
 """
 
 import json
@@ -91,6 +99,11 @@ class MarketHub:
         self._last_price_ts: dict[int, datetime] = {}   # FIX: track when price arrived
         self._subscribed   : set[int]   = set()
         self._lock         = threading.Lock()
+
+        # OI cache — populated from MODE_FULL ticks (for WsPCR)
+        # Zerodha sends oi field for every option/futures tick in MODE_FULL.
+        # WsPCR reads this to compute PCR without any external HTTP calls.
+        self._last_oi      : dict[int, int]      = {}
 
         # Shared infrastructure
         self.index_candles = CandleBuilder(minutes=5)
@@ -166,6 +179,17 @@ class MarketHub:
         """Get timestamp of when the last price tick arrived (IST)."""
         return self._last_price_ts.get(token)
 
+    def last_oi(self, token: int) -> int:
+        """
+        Get last known Open Interest for any subscribed option/futures token.
+
+        Zerodha sends oi in every MODE_FULL tick. This is populated by
+        _on_ticks() for all non-index tokens. Returns 0 if no tick received yet.
+
+        Used by WsPCR to compute PCR from WebSocket OI data without HTTP calls.
+        """
+        return self._last_oi.get(token, 0)
+
     # ── WebSocket callbacks ───────────────────────────────────────────────────
 
     def _on_ticks(self, ws, ticks):
@@ -197,6 +221,15 @@ class MarketHub:
             with self._lock:
                 self._last_price[token]    = price
                 self._last_price_ts[token] = now   # FIX: record when this tick arrived
+
+                # OI FIX: store open interest from MODE_FULL tick.
+                # Zerodha sends oi for options/futures in every full-mode tick.
+                # Index token has no OI (it's a computed index) — skip it.
+                # WsPCR reads this to compute PCR without any HTTP calls.
+                if token != self._index_token:
+                    oi = tick.get("oi", 0)
+                    if oi:
+                        self._last_oi[token] = oi
 
             if token == self._index_token:
                 self._handle_index_tick(price, qty, now, tick_ts)
@@ -373,8 +406,6 @@ class MarketHub:
 
             # For the opening range window: feed candle H and L into ORB's on_tick
             # so it reconstructs its opening range exactly as if it had seen every tick.
-            # Only ORB gets these synthetic ticks -- other strategies don't use on_tick
-            # for indicator warmup, and SPIKE's gap detection must not be triggered.
             if or_start <= bar_time < or_end:
                 for strat in self._strategies:
                     if strat.name != "ORB_v2":
@@ -386,7 +417,6 @@ class MarketHub:
                         log.error(f"[{strat.name}] backfill on_tick error: {e}")
 
             # Replay candle into ALL strategies.
-            # SPIKE.on_candle is a no-op so it's harmless.
             for strat in self._strategies:
                 try:
                     strat.on_candle(candle, candle_ts)
@@ -396,12 +426,10 @@ class MarketHub:
             n_replayed += 1
 
         # Check if OR window is completely in the past -- if so, tell ORB to lock now
-        # (normally locked by on_tick when t >= 9:30, but backfill uses historical ts)
         if now.time() >= or_end and candle is not None:
             for strat in self._strategies:
                 if strat.name == "ORB_v2":
                     try:
-                        # Trigger OR lock by sending a synthetic tick at 9:30 exactly
                         lock_ts = datetime.combine(today, or_end)
                         strat.on_tick(candle["close"], lock_ts, lock_ts)
                     except Exception as e:
@@ -462,3 +490,4 @@ class MarketHub:
 
         ticker.close()
         log.info("MarketHub shutdown complete")
+
