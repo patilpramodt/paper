@@ -9,6 +9,10 @@ Fixes applied:
   4. _fetch_pcr session reuse: NSE session created ONCE before retry loop instead
      of being recreated on every attempt (was triggering NSE bot-detection returning
      empty JSON — caused PCR=None all day despite correct parsing logic).
+  5. WsPCR integration: start_live_refresh() now accepts ws_pcr= kwarg.
+     When ws_pcr is supplied, PCR is read from WebSocket OI data (hub._last_oi)
+     via ws_pcr.compute_pcr() — no NSE HTTP at all.
+     NSE HTTP _fetch_pcr() is kept as fallback when ws_pcr=None.
 """
 
 import logging
@@ -55,22 +59,56 @@ class PreMarketData:
         stop_event: threading.Event,
         vix_interval: int = 300,
         pcr_interval: int = 600,
+        ws_pcr=None,
     ):
+        """
+        Start background thread that refreshes VIX and PCR during market hours.
+
+        Parameters
+        ──────────
+        stop_event    : threading.Event — set by MarketHub at EOD to stop the thread
+        vix_interval  : seconds between VIX refreshes (default 5 min)
+        pcr_interval  : seconds between PCR refreshes (default 10 min)
+        ws_pcr        : WsPCR instance (optional).
+                        When provided, PCR is read from Zerodha WebSocket OI data
+                        via ws_pcr.compute_pcr() — fast, reliable, no NSE HTTP.
+                        When None, falls back to _fetch_pcr() (NSE option chain HTTP).
+
+        WsPCR path (preferred when ws_pcr is not None):
+          - No NSE session management
+          - No bot-detection risk
+          - PCR is always current (reflects every MODE_FULL OI tick)
+          - Works on GitHub Actions (no outbound NSE HTTP needed)
+          - compute_pcr() returns None if < min_active tokens have OI > 0,
+            which happens during the first ~60s after WebSocket connects.
+            In that case we keep the last known PCR value.
+
+        NSE HTTP path (fallback when ws_pcr is None):
+          - Session created once before retry loop (Bug 6 fix)
+          - Delayed until 9:16 AM to avoid empty OI at market open
+          - Retries 3 times with 2s delay between attempts
+        """
         import time as time_mod
+
+        # Capture ws_pcr in closure — used in the refresh loop
+        _ws_pcr = ws_pcr
+        _pcr_source = "WebSocket OI" if _ws_pcr is not None else "NSE HTTP"
 
         def _refresh_loop():
             MARKET_OPEN  = dtime(9, 15)
             MARKET_CLOSE = dtime(15, 30)
             # FIX: delay first PCR fetch until 9:16 AM — NSE OI data not
-            # populated before that on most days.
+            # populated before that on most days. Same delay applies to WsPCR
+            # since OI ticks need ~30-60s to arrive after WS connects.
             PCR_START    = dtime(9, 16)
 
             last_vix_refresh = 0.0
             last_pcr_refresh = 0.0
 
             log.info(
-                f"[LiveRefresh] Started — VIX every {vix_interval//60}min, "
-                f"PCR every {pcr_interval//60}min (first PCR after 9:16 AM)"
+                f"[LiveRefresh] Started — VIX every {vix_interval//60}min | "
+                f"PCR every {pcr_interval//60}min via {_pcr_source} "
+                f"(first PCR after 9:16 AM)"
             )
 
             while not stop_event.is_set():
@@ -83,7 +121,7 @@ class PreMarketData:
 
                     mono = time_mod.monotonic()
 
-                    # ── VIX refresh ──────────────────────────────────────
+                    # ── VIX refresh ──────────────────────────────────────────
                     if mono - last_vix_refresh >= vix_interval:
                         new_vix = self._fetch_vix()
                         if new_vix is not None:
@@ -98,26 +136,67 @@ class PreMarketData:
                             log.warning(f"[LiveRefresh] VIX fetch failed — keeping last: {self.vix}")
                         last_vix_refresh = mono
 
-                    # ── PCR refresh (only after 9:16 AM) ─────────────────
-                    # FIX: skip PCR entirely before 9:16 to avoid always-failing
-                    # empty OI data at market open
+                    # ── PCR refresh (only after 9:16 AM) ─────────────────────
                     if now_t >= PCR_START and mono - last_pcr_refresh >= pcr_interval:
-                        new_pcr = self._fetch_pcr()
-                        if new_pcr is not None:
-                            with self._lock:
-                                old = self.pcr
-                                self.pcr = new_pcr
-                            if old is None or abs(new_pcr - old) >= 0.01:
-                                log.info(f"[LiveRefresh] PCR updated: {old} → {new_pcr:.3f}")
+
+                        if _ws_pcr is not None:
+                            # ── WsPCR path: read OI from WebSocket cache ─────
+                            # Fast, no HTTP — returns None if OI data not yet ready
+                            new_pcr = _ws_pcr.compute_pcr()
+                            if new_pcr is not None:
+                                with self._lock:
+                                    old = self.pcr
+                                    self.pcr = new_pcr
+                                if old is None or abs(new_pcr - old) >= 0.01:
+                                    log.info(
+                                        f"[LiveRefresh] PCR updated (WS-OI): "
+                                        f"{old} → {new_pcr:.3f}"
+                                    )
+                                else:
+                                    log.debug(
+                                        f"[LiveRefresh] PCR unchanged (WS-OI): {new_pcr:.3f}"
+                                    )
+                                # Log WsPCR diagnostics every refresh
+                                _ws_pcr.log_summary()
                             else:
-                                log.debug(f"[LiveRefresh] PCR unchanged: {new_pcr:.3f}")
+                                log.warning(
+                                    f"[LiveRefresh] WsPCR returned None — "
+                                    f"keeping last PCR: {self.pcr} "
+                                    f"(OI ticks still warming up)"
+                                )
+
                         else:
-                            log.warning(f"[LiveRefresh] PCR fetch failed — keeping last: {self.pcr}")
+                            # ── NSE HTTP fallback path ───────────────────────
+                            # FIX: skip PCR entirely before 9:16 to avoid always-failing
+                            # empty OI data at market open
+                            new_pcr = self._fetch_pcr()
+                            if new_pcr is not None:
+                                with self._lock:
+                                    old = self.pcr
+                                    self.pcr = new_pcr
+                                if old is None or abs(new_pcr - old) >= 0.01:
+                                    log.info(
+                                        f"[LiveRefresh] PCR updated (NSE): "
+                                        f"{old} → {new_pcr:.3f}"
+                                    )
+                                else:
+                                    log.debug(
+                                        f"[LiveRefresh] PCR unchanged (NSE): {new_pcr:.3f}"
+                                    )
+                            else:
+                                log.warning(
+                                    f"[LiveRefresh] PCR fetch failed (NSE) — "
+                                    f"keeping last: {self.pcr}"
+                                )
+
                         last_pcr_refresh = mono
 
                 except Exception as e:
                     # FIX: catch ALL exceptions so live refresh thread never dies silently
-                    log.error(f"[LiveRefresh] Unexpected error in refresh loop: {e}", exc_info=True)
+                    log.error(
+                        f"[LiveRefresh] Unexpected error in refresh loop: {e}",
+                        exc_info=True
+                    )
 
                 stop_event.wait(timeout=60)
 
@@ -141,6 +220,8 @@ class PreMarketData:
         # ── PCR: SKIPPED at 9:08 AM — NSE OI data is empty at open ───────────
         # FIX: PCR is now fetched by live refresh thread starting at 9:16 AM.
         #      Running without PCR at open is safe — strategies handle PCR=None.
+        #      With WsPCR, PCR will be available ~60s after WebSocket connects
+        #      (once enough OI ticks have arrived to pass the quality gate).
         self.pcr = None
         log.info("  PCR         : None (will be fetched at 9:16 AM by live refresh)")
 
@@ -264,7 +345,8 @@ class PreMarketData:
         return None
 
     def _fetch_pcr(self) -> float | None:
-        """Fetch Put/Call Ratio from NSE option chain.
+        """
+        Fetch Put/Call Ratio from NSE option chain.
 
         FIX (Bug 6 / session reuse): previous code called _nse_session() inside
         the retry loop — creating a brand-new requests.Session and hitting the
@@ -277,16 +359,15 @@ class PreMarketData:
         across all attempts. Each retry reuses the same authenticated session,
         so NSE sees one session with multiple API calls — normal browser behaviour.
 
-        Note: the JSON parsing logic (records → data → CE/PE openInterest) was
-        already correct. ChatGPT's suggestion to change it was wrong — the real
-        problem was the session being recreated on every attempt.
+        Note: this method is the FALLBACK path. When WsPCR is wired in t.py,
+        start_live_refresh(ws_pcr=ws_pcr) uses compute_pcr() instead and this
+        method is never called. It is kept for backward compatibility when running
+        without WsPCR (ws_pcr=None in start_live_refresh).
         """
         import time as _time
         url = "https://www.nseindia.com/api/option-chain-indices?symbol=BANKNIFTY"
 
         # FIX: create session ONCE — reuse cookies across retries.
-        # Recreating the session on every attempt hits the NSE homepage 3 times
-        # in 6 seconds, triggering soft bot-detection → empty JSON response.
         try:
             s, h = self._nse_session()
         except Exception as e:
