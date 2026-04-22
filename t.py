@@ -106,7 +106,7 @@ ACTIVE_STRATEGIES = [
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 TOKEN_FILE     = "token.json"
-LOG_FILE       = "trader.log"
+LOG_DIR        = "logs"
 PID_FILE       = "trader.pid"
 PREMARKET_TIME = dtime(9,  8)    # Start pre-market setup at 9:08 AM IST
 MARKET_START   = dtime(9, 14)    # Start WebSocket at 9:14 AM IST
@@ -119,18 +119,60 @@ PCR_SPOT_RANGE = 1000   # points either side of ATM
 PCR_STRIKE_STEP = 100   # BankNifty strike interval
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LOGGING — Console + file, all strategies use same logger
+#  LOGGING — Separate log file per strategy + core.log for everything else
+#
+#  Files written to logs/ :
+#    core.log        ← t.py, core/market_hub, core/auto_login, core/premarket,
+#                       core/pcr_kite, scalper_v7_core/*
+#    spike.log       ← strategies/spike.py          (logger "strategy.spike")
+#    orb_v2.log      ← strategies/orb_v2.py         (logger "strategy.orb")
+#    scalper_v7.log  ← strategies/scalper_v7_strategy.py (logger "strategy.scalper_v7")
+#    bb_stoch.log    ← strategies/bb_stoch_strategy.py  (logger "strategy.bb_stoch")
 # ─────────────────────────────────────────────────────────────────────────────
 def setup_logging():
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(LOG_FILE, mode="a"),
-        ],
-    )
+    import logging.handlers
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    fmt       = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    datefmt   = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(fmt, datefmt=datefmt)
+
+    def _file(filename):
+        h = logging.handlers.RotatingFileHandler(
+            os.path.join(LOG_DIR, filename),
+            maxBytes=10 * 1024 * 1024,   # 10 MB
+            backupCount=5,
+            encoding="utf-8",
+            mode="a",
+        )
+        h.setFormatter(formatter)
+        return h
+
+    def _console():
+        h = logging.StreamHandler(sys.stdout)
+        h.setFormatter(formatter)
+        return h
+
+    # ── Root logger → core.log (catches t, core.*, scalper_v7_core.*) ─────────
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.addHandler(_file("core.log"))
+    root.addHandler(_console())
+
+    # ── Per-strategy loggers → own file, propagate=False (skip core.log) ──────
+    _STRAT = {
+        "strategy.spike":      "spike.log",
+        "strategy.orb":        "orb_v2.log",
+        "strategy.scalper_v7": "scalper_v7.log",
+        "strategy.bb_stoch":   "bb_stoch.log",
+    }
+    for name, fname in _STRAT.items():
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = False          # ← stays OUT of core.log
+        lg.addHandler(_file(fname))
+        lg.addHandler(_console())
+
 
 setup_logging()
 log = logging.getLogger("t")
