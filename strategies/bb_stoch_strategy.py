@@ -24,8 +24,8 @@ SIGNAL LOGIC (all three must agree before entry):
 
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
-  * SL    = entry_price - ATR_SL_MULT * atr
-  * TP    = entry_price + ATR_TP_MULT * atr
+  * SL    = entry_price - ATR_SL_MULT * atr   (anchored to fill price)
+  * TP    = entry_price + ATR_TP_MULT * atr   (anchored to fill price)
   * Trail = moves SL to breakeven when profit >= TRAIL_ARM pts,
             then trails every TRAIL_STEP pts after that
 
@@ -92,6 +92,22 @@ FIXES APPLIED:
            no sleeping, no waiting for the next candle — the position opens
            within seconds of the signal, exactly as intended.
 
+  Bug 8 (SL ANCHOR FIX) — BBTrade.__init__() anchored SL and TP to the
+           pre-slippage LTP then shifted by `off = slippage`, resulting in
+           SL distance from fill = sl_pts + 2*slippage (e.g. 15 + 3 = 18pts).
+           The sl_max ceiling of 15 was being silently violated on every trade.
+           Fix: anchor SL and TP directly to self.entry (the actual fill price):
+               self.sl     = entry - sl_pts    (exactly sl_pts below fill)
+               self.target = entry + tp_pts    (exactly tp_pts above fill)
+           This ensures the SL trigger and max risk are precisely as configured.
+
+  Bug 9 (TRAIL BREAKEVEN FIX) — _update_trail() set trail SL to trade.entry
+           (fill price). When the option price exactly touched entry and the
+           position was closed, exit_px = entry - slippage → net P&L = -slippage
+           (-1.5 pts). The "breakeven" trail was booking a small guaranteed loss.
+           Fix: trail SL to entry + slippage so exit_px = entry + slippage - slippage
+                = entry → true net P&L = 0.
+
   Bug 10 — on_tick() called _force_close() on EVERY index tick after 15:15
             (potentially dozens per second). Second call was harmless but
             wasteful. Fix: added _squareoff_done flag — force-close fires
@@ -156,13 +172,13 @@ CFG = {
     "atr_sl_mult"       : 0.9,      # SL = entry - atr * mult
     "atr_tp_mult"       : 1.6,      # TP = entry + atr * mult
     "sl_min"            : 5.0,      # hard floor on SL distance (option pts)
-    "sl_max"            : 15.0,     # hard ceiling
+    "sl_max"            : 15.0,     # hard ceiling on SL distance
     "tp_min"            : 8.0,      # hard floor on TP distance
     # FIX: raised from 25.0 → 50.0. Old cap caused spread guard to reject
     # valid signals when ATR was high (e.g. ATR=92 → TP capped at 25, but
     # estimated spread=27 > 25 → skipped). A 50pt cap keeps TP reasonable
     # while allowing entry when spread is small relative to the actual TP.
-    "tp_max"            : 50.0,     # hard ceiling
+    "tp_max"            : 50.0,     # hard ceiling on TP distance
     "trail_arm"         : 6.0,      # move SL to BE when profit >= this
     "trail_step"        : 2.0,      # then trail every N pts
     "slippage"          : 1.5,      # simulated fill slippage (per side)
@@ -420,23 +436,38 @@ class BBTrade:
     )
 
     def __init__(self, symbol, token, opt_type, ltp, qty,
-                 spot, sl_price, tp_price, sl_pts, tp_pts, atr):
-        slip          = CFG["slippage"]
-        self.symbol   = symbol
-        self.token    = token
+                 spot, sl_pts, tp_pts, atr):
+        """
+        FIX (Bug 8 — SL ANCHOR):
+          Old code computed sl/target by shifting from pre-slippage ltp:
+              off          = entry - ltp  (= slippage)
+              self.sl      = sl_price - off   → ltp - sl_pts - 2*slip
+              self.target  = tp_price + off   → ltp + tp_pts + 0 (wrong direction)
+          This meant actual SL distance from fill = sl_pts + 2*slippage,
+          violating the sl_max ceiling (15 + 3 = 18 pts risked, not 15).
+
+          Fix: anchor SL and target directly to self.entry (the actual fill):
+              self.sl     = entry - sl_pts   (exactly sl_pts below fill)
+              self.target = entry + tp_pts   (exactly tp_pts above fill)
+        """
+        slip            = CFG["slippage"]
+        self.symbol     = symbol
+        self.token      = token
         self.option_type = opt_type
-        self.qty      = qty
-        self.entry    = round(ltp + slip, 2)        # simulated fill
-        # Anchor SL/TP to actual fill (not pre-slippage LTP)
-        off           = self.entry - ltp
-        self.sl       = round(sl_price - off, 2)
-        self.target   = round(tp_price + off, 2)
-        self.sl_pts   = sl_pts
-        self.tp_pts   = tp_pts
+        self.qty        = qty
+        self.entry      = round(ltp + slip, 2)          # simulated fill with slippage
+
+        # FIX (Bug 8): anchor SL/TP to actual fill price, not pre-slippage LTP.
+        # This ensures sl_pts and tp_pts are exact distances from the fill.
+        self.sl         = round(self.entry - sl_pts, 2)  # sl_max ceiling respected
+        self.target     = round(self.entry + tp_pts, 2)  # tp_max ceiling respected
+
+        self.sl_pts     = sl_pts
+        self.tp_pts     = tp_pts
         self.trail_stage = 0
-        self.spot     = spot
-        self.atr      = atr
-        self.timestamp = _now_ist().isoformat()  # FIX: was UTC on GitHub Actions
+        self.spot       = spot
+        self.atr        = atr
+        self.timestamp  = _now_ist().isoformat()         # FIX: was UTC on GitHub Actions
         self.exit_pending  = False
         self.last_exit_ts  = 0.0
 
@@ -609,15 +640,6 @@ class BBStochStrategy(BaseStrategy):
         Called on the first 5-min candle of the session (~9:20 AM).
         This covers large gap days where pre_market()'s prev_close-based
         subscriptions land on completely wrong strikes.
-
-        On 19-Mar-2026 BankNifty gapped 1850pts down:
-          prev_close = 55326 → pre-subscribed 55100/55300/55500
-          actual open = 53474 → real ATM range = 53200–54200
-          → all pre-subscribed tokens were deep OTM, LTP unavailable on both signals
-
-        With ±400 offsets from actual spot this method subscribes 10 tokens
-        covering 53000–54800 on that day — every strike that could realistically
-        get a signal during the session.
         """
         if not spot or spot <= 0:
             return
@@ -699,24 +721,6 @@ class BBStochStrategy(BaseStrategy):
         Live option price -- drives two things:
           1. SL/TP/trail management for open trades (existing behaviour)
           2. FIX (Bug 7): pending entry fill on first live tick
-
-        FIX (Bug 7) explanation:
-          When _enter_trade() bails because get_price() returns None
-          (token subscribed but first WS tick hasn't arrived yet), it stores
-          self._pending_entry with the full signal context.
-
-          This method is called by MarketHub for EVERY tick on EVERY subscribed
-          option token. The first tick on the newly subscribed token lands here
-          200–800ms after subscription — still within the same 5-minute window
-          as the original signal.
-
-          We check: if this tick's token matches _pending_entry["token"], and
-          no trade is open, and risk gates pass → fill immediately via
-          _fill_pending(). The position opens within seconds of the signal
-          as originally intended.
-
-          This does NOT block or sleep — it runs in the WebSocket tick thread
-          identically to _manage_trade() which is already called here.
         """
         # FIX (Bug 7): check for pending entry on first tick of subscribed token
         pending = self._pending_entry
@@ -827,12 +831,6 @@ class BBStochStrategy(BaseStrategy):
 
         # FIX (Bug 2): _persist_buf is NOT cleared here.
         # It is cleared inside _enter_trade() only after a genuine fill.
-        # If _enter_trade() bails early (LTP unavailable, sanity check fail, etc.),
-        # the buffer retains the current signal so the next candle is immediately
-        # re-confirmed without needing to rebuild from scratch.
-        # NOTE: with persistence=1 this has limited effect since the next candle's
-        # HOLD signal overwrites the deque(maxlen=1) anyway. Bug 7's _pending_entry
-        # mechanism is the correct solution for the LTP miss case.
         self._enter_trade(action, sig, ts)
 
     # ----------------------------------------------------------
@@ -846,6 +844,7 @@ class BBStochStrategy(BaseStrategy):
         FIX (Bug 1): removed time.sleep(0.4).
         FIX (Bug 2): _persist_buf cleared only on genuine fill (not on LTP miss).
         FIX (Bug 7): on LTP miss, store _pending_entry for fill on first tick.
+        FIX (Bug 8): SL/TP anchored to fill price inside BBTrade (not ltp-off).
         """
         opt    = "CE" if action == "BUY_CE" else "PE"
         spot   = sig.get("close", 0)
@@ -867,10 +866,7 @@ class BBStochStrategy(BaseStrategy):
             log.warning(f"[BB_STOCH] Option not found: ATM={atm} {opt} expiry={expiry}")
             return
 
-        # Subscribe the token (deduplicates — safe if already subscribed from pre_market
-        # or _subscribe_spot_atm). With Bug 6 fix, most entry strikes will already be
-        # subscribed and warm. If spot has moved beyond ±400 from open (rare), this
-        # is a fresh subscribe and LTP may not be available yet — Bug 7 handles that.
+        # Subscribe the token (deduplicates — safe if already subscribed)
         self.subscribe_option(token)
 
         # FIX (Bug 1): no sleep here. Read LTP directly from the WebSocket price cache.
@@ -878,10 +874,6 @@ class BBStochStrategy(BaseStrategy):
 
         if not ltp or ltp < 5:
             # FIX (Bug 7): store pending entry instead of silently dropping the trade.
-            # on_option_tick() will fill this the moment the first tick arrives on
-            # this token — typically 200–800ms, within the same 5-minute window.
-            # Do NOT unsubscribe — keep token live so the tick arrives promptly.
-            # Do NOT clear _persist_buf — keep persistence context (Bug 2 fix).
             log.warning(
                 f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) — "
                 f"option subscribed, pending entry stored, will fill on first tick"
@@ -912,20 +904,19 @@ class BBStochStrategy(BaseStrategy):
         atr  = sig.get("atr", 0)
         spot = sig.get("close", 0)
 
-        # Compute SL/TP
-        sl_pts, tp_pts, sl_price, tp_price = self._compute_sl_tp(ltp, atr)
+        # Compute SL/TP distances
+        sl_pts, tp_pts = self._compute_sl_tp(ltp, atr)
 
         # Option sanity: reject if spread eats too much of target
         est_spread = ltp * 0.03
-        # FIX: threshold raised 0.35 → 0.60. With tp_max=50, ratio for a
-        # typical high-ATR entry (spread≈27, TP=50) is 0.54 — was wrongly
-        # rejected at 0.35. 0.60 still blocks entries where spread eats
-        # >60% of target (genuinely bad R:R).
+        # FIX: threshold raised 0.35 → 0.60.
         if tp_pts > 0 and (est_spread / tp_pts) > 0.60:
             log.warning(f"[BB_STOCH] Spread {est_spread:.1f} too large vs TP {tp_pts:.1f} -- skipping")
             self.unsubscribe_option(token)
             return
 
+        # FIX (Bug 8): BBTrade now anchors sl/target to fill price internally.
+        # No sl_price / tp_price passed — sl_pts and tp_pts are the distances.
         trade = BBTrade(
             symbol   = tsym,
             token    = token,
@@ -933,8 +924,6 @@ class BBStochStrategy(BaseStrategy):
             ltp      = ltp,
             qty      = CFG["quantity"],
             spot     = spot,
-            sl_price = sl_price,
-            tp_price = tp_price,
             sl_pts   = sl_pts,
             tp_pts   = tp_pts,
             atr      = atr,
@@ -997,14 +986,6 @@ class BBStochStrategy(BaseStrategy):
 
         Called from on_option_tick() when the pending token's FIRST price arrives.
         This runs in the WebSocket tick thread — no blocking, no sleeping.
-
-        Timeline example (today's missed 14:10 BUY_PE):
-          14:10:00.177 — BUY_PE confirmed, _enter_trade() called
-          14:10:00.178 — subscribe BANKNIFTY26MAR53700PE (token 13419266)
-          14:10:00.178 — get_price() returns None (no tick yet)
-          14:10:00.178 — _pending_entry stored (OLD BEHAVIOUR: trade missed forever)
-          14:10:00.4   — First WS tick arrives: price=~190 → _fill_pending() executes
-          14:10:00.4   — Trade OPEN, delay ~220ms (same 5-min candle)
         """
         # Clear pending atomically — only the first valid tick fills the trade
         self._pending_entry = None
@@ -1073,12 +1054,25 @@ class BBStochStrategy(BaseStrategy):
             self._close_trade(ltp, "SL")
 
     def _update_trail(self, trade: BBTrade, ltp: float, pnl_pts: float):
+        """
+        Trail stop-loss management.
+
+        FIX (Bug 9 — TRAIL BREAKEVEN):
+          Old code: new_sl = round(trade.entry, 2)
+          When price touched entry exactly, exit_px = entry - slippage → net P&L = -slippage.
+          The "breakeven" trail was booking a guaranteed small loss.
+
+          Fix: new_sl = entry + slippage so exit at new_sl yields:
+               exit_px = new_sl - slippage = entry + slippage - slippage = entry
+               net pnl  = entry - entry = 0  → true breakeven.
+        """
         if pnl_pts >= CFG["trail_arm"] and trade.trail_stage == 0:
-            new_sl = round(trade.entry, 2)
+            # FIX (Bug 9): add exit slippage so net P&L at trail exit = 0
+            new_sl = round(trade.entry + CFG["slippage"], 2)
             if new_sl > trade.sl:
                 trade.sl          = new_sl
                 trade.trail_stage = 1
-                log.info(f"[BB_STOCH] Trail -> BE | SL={trade.sl:.2f}")
+                log.info(f"[BB_STOCH] Trail -> BE | SL={trade.sl:.2f} (entry+slip={new_sl:.2f})")
         elif pnl_pts > CFG["trail_arm"] and trade.trail_stage >= 1:
             new_stage = int((pnl_pts - CFG["trail_arm"]) / CFG["trail_step"]) + 1
             if new_stage > trade.trail_stage:
@@ -1090,20 +1084,7 @@ class BBStochStrategy(BaseStrategy):
     def _close_trade(self, ltp: float, reason: str):
         """
         FIX (Bug 3): atomically claim ownership of self._trade at the top.
-
-        Previous code read self._trade outside the lock — two threads could
-        both pass the `if not trade` guard simultaneously:
-          - WS thread: _force_close("AUTO-SQUAREOFF") at 15:15 via on_tick
-          - Main thread: eod_summary → _force_close("EOD-SQUAREOFF") at 15:31
-
-        Both would write to _daily_pnl, append to _results CSV, and call
-        unsubscribe — double P&L, duplicate CSV row, double unsubscribe.
-
-        Fix: read AND clear self._trade inside a single lock acquisition at
-        the very top. The second caller sees None and returns immediately.
         """
-        # FIX (Bug 3): atomically take ownership of the trade under the lock.
-        # Only the first caller gets the trade object; the second sees None.
         with self._lock:
             trade = self._trade
             if not trade:
@@ -1154,8 +1135,6 @@ class BBStochStrategy(BaseStrategy):
             self._is_halted = True
             log.warning(f"[BB_STOCH] HALTED -- max daily loss breached ({self._daily_pnl:.0f}Rs)")
 
-        # self._trade is already None (cleared at the top of this method).
-        # Only need to unsubscribe the option token now.
         with self._lock:
             self._unsubscribe_active()
 
@@ -1187,9 +1166,14 @@ class BBStochStrategy(BaseStrategy):
     # HELPERS
     # ----------------------------------------------------------
 
-    def _compute_sl_tp(self, ltp: float, atr: float
-                       ) -> Tuple[float, float, float, float]:
-        """Returns (sl_pts, tp_pts, sl_price, tp_price)."""
+    def _compute_sl_tp(self, ltp: float, atr: float) -> Tuple[float, float]:
+        """
+        Returns (sl_pts, tp_pts) — distances from fill price.
+
+        FIX (Bug 8): removed sl_price / tp_price returns. BBTrade now
+        anchors directly to entry using these distances. Caller no longer
+        needs pre-computed absolute prices.
+        """
         sl_pts = float(atr * CFG["atr_sl_mult"]) if atr > 0 else CFG["sl_min"]
         tp_pts = float(atr * CFG["atr_tp_mult"]) if atr > 0 else CFG["tp_min"]
         sl_pts = max(CFG["sl_min"], min(sl_pts, CFG["sl_max"]))
@@ -1197,13 +1181,12 @@ class BBStochStrategy(BaseStrategy):
         # On expiry day tighten TP (theta erodes options fast)
         if self._dte == 0:
             tp_pts = max(CFG["tp_min"], tp_pts * 0.75)
-        sl_price = round(ltp - sl_pts, 2)
-        tp_price = round(ltp + tp_pts, 2)
         log.info(
-            f"[BB_STOCH] SL/TP | ATR={atr:.1f} | "
-            f"SL={sl_price:.2f}(-{sl_pts:.1f}) TP={tp_price:.2f}(+{tp_pts:.1f})"
+            f"[BB_STOCH] SL/TP computed | ATR={atr:.1f} | "
+            f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} "
+            f"(will anchor to fill after slippage)"
         )
-        return sl_pts, tp_pts, sl_price, tp_price
+        return sl_pts, tp_pts
 
     @staticmethod
     def _to_df(candles: list) -> pd.DataFrame:
@@ -1262,3 +1245,4 @@ class BBStochStrategy(BaseStrategy):
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
             log.info(f"[BB_STOCH] Top blocks: {top}")
+
