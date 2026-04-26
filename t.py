@@ -30,8 +30,8 @@
     Zerodha sends oi in every MODE_FULL tick. MarketHub stores it per
     token. WsPCR reads it and returns PCR = PE_OI / CE_OI.
     Zero external dependencies. Works on GitHub Actions.
-    Fallback: if WsPCR returns None, NSE HTTP _fetch_pcr() is kept in
-    premarket.py but is not called when ws_pcr= is wired.
+    If WsPCR returns None (OI not yet warm), PCR stays None for that cycle.
+    NSE HTTP _fetch_pcr() has been removed — WsPCR is the only PCR source.
 
   LOGIN MODES:
     Local run   set env vars in config_secrets.env or export in terminal

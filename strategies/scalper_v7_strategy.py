@@ -67,7 +67,7 @@ from scalper_v7_core.risk_manager import RiskManager
 from scalper_v7_core.paper_engine import PaperEngine, PaperTrade
 from scalper_v7_core.state_manager import save_state, load_state, clear_state
 from scalper_v7_core.config import (
-    CANDLE_1M_USE, CANDLE_5M_USE,
+    CANDLE_1M_USE, CANDLE_5M_USE, QUANTITY,
 )
 
 log = logging.getLogger("strategy.scalper_v7")
