@@ -62,7 +62,7 @@ LIVE_MODE = False
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = {
-    "quantity"               : 30,
+    "quantity"               : 35,   # BankNifty lot size as of Nov 2024
     "start_time"             : dtime(9, 15),
     "spike_exit_time"        : dtime(9, 30),
     "close_time"             : dtime(15, 15),

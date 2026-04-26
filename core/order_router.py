@@ -45,6 +45,39 @@ Central order execution layer — single point for all live order placement.
 
    Default: ALL strategies are paper.  Change only the one you want to go live.
 
+4. Order status confirmation (FIX — was missing)
+
+   After kite.place_order() returns an order_id, we poll kite.order_history()
+   until the order reaches a terminal state (COMPLETE / REJECTED / CANCELLED)
+   or a timeout expires.
+
+   Without this, NSE could silently reject an option MARKET order (circuit
+   filter, no quotes at that ms) and the bot would manage a phantom SL and
+   eventually fire a SELL against a position that never existed.
+
+   _confirm_order() returns one of:
+     "COMPLETE"      → fill confirmed, caller may treat trade as open
+     "REJECTED"      → exchange rejected; caller must abort entry / alert on sell
+     "CANCELLED"     → order was cancelled (should not happen for MARKET)
+     "TIMEOUT"       → did not reach terminal state in time; caller treats as failed
+     "TOKEN_EXPIRED" → access token invalid mid-session; caller must abort + alert
+
+5. Token / session expiry mid-session (FIX — was only checked at startup)
+
+   If the Zerodha access token expires while the bot is running (rare but
+   possible after midnight refresh), any Kite REST call raises
+   kiteconnect.exceptions.TokenException (HTTP 403).
+
+   Previously this surfaced only as a generic exception in the log, and
+   the bot continued thinking kite was fine — it would keep retrying
+   orders and managing phantom positions.
+
+   Fix: _is_token_exception() inspects the exception type name and message.
+   When detected:
+     • A loud, actionable error is logged with exact remediation steps.
+     • None is returned so the caller aborts the trade / releases the slot.
+     • No further Kite calls are attempted for that order.
+
 ═══════════════════════════════════════════════════════════════════
 """
 
@@ -163,6 +196,7 @@ class OrderRouter:
 
         live_mode=False → paper fill logged; returns "PAPER-{ms}"
         live_mode=True  → REGULAR MARKET MIS via Kite; returns order_id string
+                          ONLY when exchange confirms COMPLETE.
 
         Returns order_id / paper_id, or None on failure.
         """
@@ -187,6 +221,7 @@ class OrderRouter:
 
         live_mode=False → paper fill logged; returns "PAPER-{ms}"
         live_mode=True  → REGULAR MARKET MIS via Kite; returns order_id string
+                          ONLY when exchange confirms COMPLETE.
 
         Returns order_id / paper_id, or None on failure.
         """
@@ -210,7 +245,7 @@ class OrderRouter:
         transaction_type: str,   # "BUY" or "SELL"
     ) -> Optional[str]:
         """
-        Place a REGULAR MARKET MIS order on NFO.
+        Place a REGULAR MARKET MIS order on NFO and confirm it reached the exchange.
 
         Why MARKET (not IOC LIMIT, not SL-M, not BO):
           - BO/CO: blocked for FnO by exchange since 2021.
@@ -219,6 +254,13 @@ class OrderRouter:
                    rejection risk with zero benefit (MARKET fills in ms).
           - MARKET: fills immediately at best available price. Correct for
                    time-sensitive entries/exits on liquid ATM strikes.
+
+        Flow:
+          1. Validate kite session (None check).
+          2. place_order() → order_id.
+          3. _confirm_order() polls order_history() until COMPLETE / REJECTED /
+             CANCELLED / TIMEOUT / TOKEN_EXPIRED.
+          4. Return order_id only on COMPLETE; None on anything else.
         """
         kite = self._hub.kite
         if kite is None:
@@ -248,14 +290,210 @@ class OrderRouter:
                 f"{strategy_name} | {symbol} | qty={qty} | "
                 f"ref_ltp={ltp:.2f} | order_id={order_id}"
             )
-            return str(order_id)
 
         except Exception as exc:
+            # ── Token / session expiry ─────────────────────────────────────────
+            if self._is_token_exception(exc):
+                log.error(
+                    f"\n{'!'*60}\n"
+                    f"[Router][TOKEN EXPIRED] {transaction_type} FAILED — access token invalid!\n"
+                    f"  Strategy : {strategy_name}\n"
+                    f"  Symbol   : {symbol}\n"
+                    f"  Error    : {exc}\n"
+                    f"  → NO order was placed. Slot will be released by caller.\n"
+                    f"  → RESTART the bot with a fresh token (re-run t.py / auto_login).\n"
+                    f"  → If you were already in a live position, CHECK ZERODHA CONSOLE NOW.\n"
+                    f"{'!'*60}"
+                )
+            else:
+                log.error(
+                    f"[Router][LIVE] {transaction_type} FAILED | "
+                    f"{strategy_name} | {symbol}: {exc}"
+                )
+            return None
+
+        # ── Confirm the order actually reached the exchange ────────────────────
+        # place_order() returning an order_id does NOT mean the exchange accepted
+        # the order. NSE can reject MARKET option orders if:
+        #   • The strike has a circuit filter at that moment
+        #   • There are no quotes at that millisecond
+        #   • The order hits OI / position limits
+        # Without confirmation, the bot would manage a phantom SL and later
+        # fire a SELL against a position that never existed.
+        status = self._confirm_order(str(order_id))
+
+        if status == "COMPLETE":
+            log.info(
+                f"[Router][LIVE] {transaction_type} CONFIRMED ✓ | "
+                f"{strategy_name} | {symbol} | order_id={order_id}"
+            )
+            return str(order_id)
+
+        elif status == "TOKEN_EXPIRED":
+            # Detailed alert already logged inside _confirm_order.
+            # The order may have filled — tell caller to check console.
             log.error(
-                f"[Router][LIVE] {transaction_type} FAILED | "
-                f"{strategy_name} | {symbol}: {exc}"
+                f"[Router][LIVE] {transaction_type} order {order_id} placed but "
+                f"confirmation poll lost token. Check Zerodha console immediately."
             )
             return None
+
+        else:
+            # REJECTED, CANCELLED, or TIMEOUT
+            log.error(
+                f"\n{'!'*60}\n"
+                f"[Router][LIVE] {transaction_type} NOT COMPLETE — status={status}\n"
+                f"  Strategy  : {strategy_name}\n"
+                f"  Symbol    : {symbol}  qty={qty}\n"
+                f"  order_id  : {order_id}\n"
+                f"  → Treating as FAILED. Slot released by caller.\n"
+                f"  → No phantom SL will be tracked.\n"
+                + (
+                    f"  → *** SELL FAILED — CHECK ZERODHA CONSOLE AND "
+                    f"SQUARE OFF MANUALLY IF POSITION IS OPEN! ***\n"
+                    if transaction_type == "SELL" else ""
+                )
+                + f"{'!'*60}"
+            )
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Internal — order status confirmation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _confirm_order(
+        self,
+        order_id:      str,
+        timeout_sec:   float = 15.0,
+        poll_interval: float = 0.5,
+    ) -> str:
+        """
+        Poll kite.order_history(order_id) until the order reaches a terminal state
+        or the timeout expires.
+
+        Terminal states returned by NSE via Zerodha:
+          "COMPLETE"  → exchange filled the order (normal outcome for MARKET)
+          "REJECTED"  → exchange rejected the order (circuit, no quotes, limit breach)
+          "CANCELLED" → order was cancelled (unusual for MARKET)
+
+        Non-terminal states (keep polling):
+          "PUT ORDER REQ RECEIVED"  → order received by Zerodha OMS
+          "VALIDATION PENDING"      → validation in progress
+          "OPEN PENDING"            → awaiting exchange acknowledgement
+          "OPEN"                    → acknowledged, waiting for match
+          "TRIGGER PENDING"         → SL trigger not yet hit (not applicable here)
+          "MODIFY PENDING"          → modification in progress
+          "CANCEL PENDING"          → cancellation in progress
+
+        Returns one of:
+          "COMPLETE"      — normal success path
+          "REJECTED"      — exchange rejected; entry must be aborted
+          "CANCELLED"     — order was cancelled
+          "TIMEOUT"       — timed out; treat as failed, check console
+          "TOKEN_EXPIRED" — session ended mid-poll; check console immediately
+        """
+        TERMINAL = {"COMPLETE", "REJECTED", "CANCELLED"}
+        deadline = time.monotonic() + timeout_sec
+        attempt  = 0
+
+        while time.monotonic() < deadline:
+            attempt += 1
+            try:
+                history = self._hub.kite.order_history(order_id)
+                # Zerodha returns a list of status entries; the last entry is current
+                if not history:
+                    log.warning(
+                        f"[Router] order_history({order_id}) returned empty list "
+                        f"(attempt {attempt}) — retrying"
+                    )
+                    time.sleep(poll_interval)
+                    continue
+
+                status = history[-1].get("status", "").upper()
+                log.debug(
+                    f"[Router] order_history({order_id}) attempt={attempt} "
+                    f"status={status}"
+                )
+
+                if status in TERMINAL:
+                    log.info(
+                        f"[Router] order_history({order_id}) → {status} "
+                        f"after {attempt} poll(s)"
+                    )
+                    return status
+
+                # Non-terminal — log first attempt and every 5th to avoid spam
+                if attempt == 1 or attempt % 5 == 0:
+                    log.info(
+                        f"[Router] Waiting for order {order_id} | "
+                        f"status={status!r} | attempt={attempt}"
+                    )
+
+            except Exception as exc:
+                if self._is_token_exception(exc):
+                    log.error(
+                        f"\n{'!'*60}\n"
+                        f"[Router][TOKEN EXPIRED] Cannot confirm order {order_id}: {exc}\n"
+                        f"  → Access token expired mid-session during order confirmation.\n"
+                        f"  → The order may or may not have been filled.\n"
+                        f"  → CHECK ZERODHA CONSOLE IMMEDIATELY for open positions.\n"
+                        f"  → Restart the bot with a fresh token before next trade.\n"
+                        f"{'!'*60}"
+                    )
+                    return "TOKEN_EXPIRED"
+
+                log.warning(
+                    f"[Router] order_history({order_id}) poll error "
+                    f"(attempt {attempt}): {exc} — retrying"
+                )
+
+            time.sleep(poll_interval)
+
+        # Timeout reached — order status unknown
+        log.error(
+            f"\n{'!'*60}\n"
+            f"[Router][LIVE] Order {order_id} status poll TIMED OUT after {timeout_sec}s\n"
+            f"  Polled {attempt} time(s). Order did not reach COMPLETE/REJECTED.\n"
+            f"  → The order may be pending, partially filled, or stuck.\n"
+            f"  → CHECK ZERODHA CONSOLE for this order_id and act manually.\n"
+            f"  → Bot treats this as FAILED to prevent phantom position management.\n"
+            f"{'!'*60}"
+        )
+        return "TIMEOUT"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Internal — token / session expiry detection
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _is_token_exception(self, exc: Exception) -> bool:
+        """
+        Return True if the exception indicates an expired or invalid Zerodha
+        access token (HTTP 403 / TokenException).
+
+        kiteconnect raises kiteconnect.exceptions.TokenException for:
+          • Invalid access token
+          • Expired access token (tokens expire after Zerodha's daily midnight reset)
+          • Revoked access token
+
+        We inspect both the exception class name and the message string because:
+          • Some network libraries wrap the 403 in a generic requests.HTTPError
+          • The message text is consistent across kiteconnect library versions
+
+        Note: a fresh token check at startup (hub.load_kite) is not enough.
+        Tokens are valid until midnight IST. If the bot starts before midnight
+        and runs past it (unusual for intraday, but possible for overnight debug
+        runs), the token expires mid-session. This handler covers that edge case.
+        """
+        exc_class = type(exc).__name__.lower()
+        exc_msg   = str(exc).lower()
+
+        return (
+            "tokenexception"          in exc_class
+            or "403"                  in exc_msg
+            or "invalid access token" in exc_msg
+            or "token is invalid"     in exc_msg
+            or ("access token"        in exc_msg and "invalid" in exc_msg)
+        )
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Internal — paper simulation
