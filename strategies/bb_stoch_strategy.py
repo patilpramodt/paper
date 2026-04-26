@@ -181,18 +181,22 @@ CFG = {
 
     # Trade management
     "atr_period"        : 14,       # ATR lookback for SL/TP scaling
-    "atr_sl_mult"       : 0.9,      # SL = entry - atr * mult
-    "atr_tp_mult"       : 1.6,      # TP = entry + atr * mult
-    "sl_min"            : 5.0,      # hard floor on SL distance (option pts)
-    "sl_max"            : 15.0,     # hard ceiling on SL distance
-    "tp_min"            : 8.0,      # hard floor on TP distance
-    # FIX: raised from 25.0 → 50.0. Old cap caused spread guard to reject
-    # valid signals when ATR was high (e.g. ATR=92 → TP capped at 25, but
-    # estimated spread=27 > 25 → skipped). A 50pt cap keeps TP reasonable
-    # while allowing entry when spread is small relative to the actual TP.
-    "tp_max"            : 50.0,     # hard ceiling on TP distance
-    "trail_arm"         : 6.0,      # move SL to BE when profit >= this
-    "trail_step"        : 2.0,      # then trail every N pts
+    "atr_sl_mult"       : 0.8,      # SL = min(atr * mult, sl_max)  -- was 0.9
+    "atr_tp_mult"       : 2.0,      # TP = min(atr * mult, tp_max)  -- was 1.6
+    "sl_min"            : 20.0,     # hard floor on SL distance (option pts) -- was 5; 5pts = noise on BankNifty
+    "sl_max"            : 50.0,     # hard ceiling on SL distance            -- was 15
+    "tp_min"            : 30.0,     # hard floor on TP distance              -- was 8
+    # Raised from 50 → 120. BankNifty options can run 80–200pts on a genuine
+    # breakout. Old 50pt cap was cutting winners far too early.
+    # Logic: TP = min(atr * 2.0, 120). ATR ~60–120 → TP = 120 (cap) most days.
+    # On low-vol days ATR ~40 → TP = 80 (below cap), still far better than 50.
+    "tp_max"            : 120.0,    # hard ceiling on TP distance            -- was 50
+    # Trail: BankNifty options are volatile — trail too tight = stopped by noise.
+    # trail_arm = 25: only move SL to BE once sitting on 25pts profit.
+    # trail_step = 12: trail SL up every 12pts of additional profit after that.
+    # Example: entry=100, arm at 125 → SL to BE(101.5), profit 137 → SL=113.5, etc.
+    "trail_arm"         : 25.0,     # move SL to BE when profit >= this      -- was 6
+    "trail_step"        : 12.0,     # then trail SL up every N pts           -- was 2
     "slippage"          : 1.5,      # simulated fill slippage (per side)
     "exit_cooldown"     : 2.0,      # seconds between exit attempts
 
@@ -954,10 +958,11 @@ class BBStochStrategy(BaseStrategy):
         # Compute SL/TP distances
         sl_pts, tp_pts = self._compute_sl_tp(ltp, atr)
 
-        # Option sanity: reject if spread eats too much of target
+        # Option sanity: reject if spread eats too much of target.
+        # With tp_max=120 and typical BankNifty option spreads ~3%, the ratio
+        # est_spread/tp is much smaller now — 0.40 threshold is appropriate.
         est_spread = ltp * 0.03
-        # FIX: threshold raised 0.35 → 0.60.
-        if tp_pts > 0 and (est_spread / tp_pts) > 0.60:
+        if tp_pts > 0 and (est_spread / tp_pts) > 0.40:
             log.warning(f"[BB_STOCH] Spread {est_spread:.1f} too large vs TP {tp_pts:.1f} -- skipping")
             self.unsubscribe_option(token)
             return
@@ -1247,6 +1252,14 @@ class BBStochStrategy(BaseStrategy):
         """
         Returns (sl_pts, tp_pts) — distances from fill price.
 
+        Formula: sl_pts = min(atr * atr_sl_mult, sl_max), floored at sl_min
+                 tp_pts = min(atr * atr_tp_mult, tp_max), floored at tp_min
+
+        BankNifty 5m ATR is typically 60–120pts:
+          SL: min(ATR * 0.8, 50) → usually hits the 50pt cap
+          TP: min(ATR * 2.0, 120) → usually hits the 120pt cap
+          On low-vol days (ATR ~40): SL=32, TP=80 — still a 1:2.5 RR
+
         FIX (Bug 8): removed sl_price / tp_price returns. BBTrade now
         anchors directly to entry using these distances. Caller no longer
         needs pre-computed absolute prices.
@@ -1258,10 +1271,12 @@ class BBStochStrategy(BaseStrategy):
         # On expiry day tighten TP (theta erodes options fast)
         if self._dte == 0:
             tp_pts = max(CFG["tp_min"], tp_pts * 0.75)
+        rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
         log.info(
             f"[BB_STOCH] SL/TP computed | ATR={atr:.1f} | "
-            f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} "
-            f"(will anchor to fill after slippage)"
+            f"SL_pts={sl_pts:.1f} (cap={CFG['sl_max']}) "
+            f"TP_pts={tp_pts:.1f} (cap={CFG['tp_max']}) "
+            f"RR=1:{rr} (will anchor to fill after slippage)"
         )
         return sl_pts, tp_pts
 
