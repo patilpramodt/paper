@@ -12,15 +12,19 @@ SIGNAL LOGIC (all three must agree before entry):
     1. BB Breakout : last close breaks ABOVE upper BB band
        OR BB Bounce : last close crosses back above lower BB band
           from below (mean-reversion mode, Stoch oversold)
+       OR BB Middle : last close crosses ABOVE the BB middle band
+          (trend resumption, Stoch turning up from neutral)
     2. Stoch      : %K > %D (positive crossover in last 2 bars)
                     AND %K > 50  (momentum in bull territory)
                     OR  %K < 20  (oversold bounce)
+                    OR  %K > 35  (middle band — looser condition)
     3. Volume     : current bar volume >= VOL_MULT * rolling avg vol
     4. VWAP       : close above session VWAP (hub provides tick-accurate VWAP)
     5. Session    : only between SESSION_START and ENTRY_CUTOFF
 
   PE entry (buy put):
-    Mirror of the above -- BB break below lower band, Stoch bear cross, etc.
+    Mirror of the above -- BB break below lower band, Stoch bear cross,
+    BB middle band cross DOWN (with Stoch K < 65), etc.
 
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
@@ -244,7 +248,8 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
     Returns: mid, upper, lower, bw_pct (bandwidth as % of mid), squeeze (bool)
     """
     if len(df) < 2:
-        return {"mid": 0, "upper": 0, "lower": 0, "bw_pct": 0, "squeeze": True}
+        return {"mid": 0, "upper": 0, "lower": 0, "bw_pct": 0, "squeeze": True,
+                "prev_mid": 0, "prev_upper": 0, "prev_lower": 0, "prev_close": 0}
     close = df["close"].astype(float)
     min_p = max(2, period // 3)   # allow partial-history computation
     mid   = close.rolling(period, min_periods=min_p).mean()
@@ -262,6 +267,7 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
         "bw_pct"  : round(bw, 5),
         "squeeze" : bw < CFG["bb_squeeze_pct"],
         # Previous bar values (for crossover detection)
+        "prev_mid"  : round(float(mid.iloc[-2]),   2) if len(df) >= 2 else m,
         "prev_upper": round(float(upper.iloc[-2]), 2) if len(df) >= 2 else u,
         "prev_lower": round(float(lower.iloc[-2]), 2) if len(df) >= 2 else l,
         "prev_close": round(float(close.iloc[-2]), 2) if len(df) >= 2 else float(close.iloc[-1]),
@@ -390,39 +396,70 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         below_vwap = True
 
     # ================================================================
-    # CE CONDITIONS  (breakout above upper band OR oversold bounce)
+    # CE CONDITIONS
+    #   1. Breakout  : close crosses ABOVE upper band
+    #   2. Bounce    : close crosses back ABOVE lower band (oversold mean-reversion)
+    #   3. Middle    : close crosses ABOVE middle band (NEW — trend resumption)
     # ================================================================
-    bb_breakout_up = close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"]
-    bb_bounce_up   = (close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
-                      and stoch["k"] < CFG["stoch_os"])
+    bb_breakout_up  = close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"]
+    bb_bounce_up    = (close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
+                       and stoch["k"] < CFG["stoch_os"])
+    bb_mid_cross_up = (close > bb["mid"] and bb["prev_close"] <= bb["prev_mid"]
+                       and stoch["k"] > 40)   # mid-cross needs at least neutral momentum
 
-    stoch_bull     = (stoch["k"] > 50 or stoch["k"] < CFG["stoch_os"]) and (k_cross_up or stoch["k"] > stoch["d"])
+    stoch_bull      = (stoch["k"] > 50 or stoch["k"] < CFG["stoch_os"]) and (k_cross_up or stoch["k"] > stoch["d"])
+    # For middle-band cross, allow a slightly looser stoch condition (momentum
+    # turning up from near-neutral is valid here)
+    stoch_bull_mid  = (k_cross_up or stoch["k"] > stoch["d"]) and stoch["k"] > 35
 
-    if (bb_breakout_up or bb_bounce_up) and stoch_bull and above_vwap:
-        return {"action": "BUY_CE", "blocked_by": "", **base,
-                "mode": "breakout" if bb_breakout_up else "bounce"}
+    ce_bb_trigger = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
+    ce_stoch_ok   = (stoch_bull if (bb_breakout_up or bb_bounce_up) else stoch_bull_mid)
+
+    if ce_bb_trigger and ce_stoch_ok and above_vwap:
+        if bb_breakout_up:
+            mode = "breakout"
+        elif bb_bounce_up:
+            mode = "bounce"
+        else:
+            mode = "middle"
+        return {"action": "BUY_CE", "blocked_by": "", **base, "mode": mode}
 
     # ================================================================
-    # PE CONDITIONS  (breakdown below lower band OR overbought reversal)
+    # PE CONDITIONS
+    #   1. Breakout  : close crosses BELOW lower band
+    #   2. Bounce    : close crosses back BELOW upper band (overbought reversal)
+    #   3. Middle    : close crosses BELOW middle band (NEW — trend resumption)
     # ================================================================
-    bb_breakout_dn = close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"]
-    bb_bounce_dn   = (close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
-                      and stoch["k"] > CFG["stoch_ob"])
+    bb_breakout_dn  = close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"]
+    bb_bounce_dn    = (close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
+                       and stoch["k"] > CFG["stoch_ob"])
+    bb_mid_cross_dn = (close < bb["mid"] and bb["prev_close"] >= bb["prev_mid"]
+                       and stoch["k"] < 60)   # mid-cross needs at least neutral-bearish momentum
 
-    stoch_bear     = (stoch["k"] < 50 or stoch["k"] > CFG["stoch_ob"]) and (k_cross_down or stoch["k"] < stoch["d"])
+    stoch_bear      = (stoch["k"] < 50 or stoch["k"] > CFG["stoch_ob"]) and (k_cross_down or stoch["k"] < stoch["d"])
+    # For middle-band cross, allow a slightly looser stoch condition
+    stoch_bear_mid  = (k_cross_down or stoch["k"] < stoch["d"]) and stoch["k"] < 65
 
-    if (bb_breakout_dn or bb_bounce_dn) and stoch_bear and below_vwap:
-        return {"action": "BUY_PE", "blocked_by": "", **base,
-                "mode": "breakout" if bb_breakout_dn else "bounce"}
+    pe_bb_trigger = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
+    pe_stoch_ok   = (stoch_bear if (bb_breakout_dn or bb_bounce_dn) else stoch_bear_mid)
+
+    if pe_bb_trigger and pe_stoch_ok and below_vwap:
+        if bb_breakout_dn:
+            mode = "breakout"
+        elif bb_bounce_dn:
+            mode = "bounce"
+        else:
+            mode = "middle"
+        return {"action": "BUY_PE", "blocked_by": "", **base, "mode": mode}
 
     # ---- Granular block reasons for analysis ----
-    if bb_breakout_up or bb_bounce_up:
-        if not stoch_bull:
+    if bb_breakout_up or bb_bounce_up or bb_mid_cross_up:
+        if not ce_stoch_ok:
             return {"action": "HOLD", "blocked_by": "stoch_not_bull", **base}
         if not above_vwap:
             return {"action": "HOLD", "blocked_by": "below_vwap", **base}
-    if bb_breakout_dn or bb_bounce_dn:
-        if not stoch_bear:
+    if bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn:
+        if not pe_stoch_ok:
             return {"action": "HOLD", "blocked_by": "stoch_not_bear", **base}
         if not below_vwap:
             return {"action": "HOLD", "blocked_by": "above_vwap", **base}
@@ -994,6 +1031,7 @@ class BBStochStrategy(BaseStrategy):
             "order_id"   : buy_order_id,
             "mode"       : sig.get("mode", "pending" if pending_delay_ms else ""),
             "bb_upper"   : bb.get("upper", ""),
+            "bb_mid"     : bb.get("mid", ""),
             "bb_lower"   : bb.get("lower", ""),
             "bb_bw_pct"  : bb.get("bw_pct", ""),
             "stoch_k"    : st.get("k", ""),
@@ -1243,9 +1281,11 @@ class BBStochStrategy(BaseStrategy):
         _csv_append(CFG["signal_csv"], {
             "timestamp"  : ts.isoformat(),
             "action"     : sig.get("action", "HOLD"),
+            "mode"       : sig.get("mode", ""),
             "blocked_by" : sig.get("blocked_by", ""),
             "close"      : sig.get("close", ""),
             "bb_upper"   : bb.get("upper", ""),
+            "bb_mid"     : bb.get("mid", ""),
             "bb_lower"   : bb.get("lower", ""),
             "bb_bw_pct"  : bb.get("bw_pct", ""),
             "bb_squeeze" : bb.get("squeeze", ""),
@@ -1284,4 +1324,3 @@ class BBStochStrategy(BaseStrategy):
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
             log.info(f"[BB_STOCH] Top blocks: {top}")
-
