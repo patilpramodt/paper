@@ -138,6 +138,14 @@ from core.instruments import get_atm_strike
 
 log = logging.getLogger("strategy.bb_stoch")
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE MODE FLAG
+#  Change to True when you are ready to trade BB_STOCH with real money.
+#  BBTrade always runs for PnL accounting and CSV logging in both modes.
+#  When LIVE_MODE=True, real MARKET orders are placed via OrderRouter on top.
+# ─────────────────────────────────────────────────────────────────────────────
+LIVE_MODE = False
+
 # ============================================================
 # CONFIG  (all tunables in one place)
 # ============================================================
@@ -152,8 +160,8 @@ CFG = {
     "stoch_k"           : 9,        # %K lookback (lowered: was 14 → need=19 bars; 9 → need=14 bars matching min_bars)
     "stoch_d"           : 3,        # %D smoothing period (SMA of %K)
     "stoch_signal"      : 3,        # signal line smoothing
-    "stoch_ob"          : 75,       # overbought level for PE reversal
-    "stoch_os"          : 25,       # oversold level for CE reversal
+    "stoch_ob"          : 65,       # overbought level for PE reversal
+    "stoch_os"          : 35,       # oversold level for CE reversal
 
     # Volume filter
     "vol_avg_period"    : 10,       # bars to compute average volume
@@ -500,6 +508,8 @@ class BBStochStrategy(BaseStrategy):
       on_option_tick()  -- live option LTP for SL/TP management
       hub.session_vwap  -- tick-accurate intraday VWAP
     """
+
+    LIVE_MODE = LIVE_MODE   # expose module flag via class for BaseStrategy helpers
 
     @property
     def name(self) -> str:
@@ -915,8 +925,21 @@ class BBStochStrategy(BaseStrategy):
             self.unsubscribe_option(token)
             return
 
+        # Acquire global trade slot (live only — paper always succeeds)
+        if not self._acquire_slot():
+            log.warning("[BB_STOCH] Trade slot blocked — another live strategy has a position")
+            self.unsubscribe_option(token)
+            return
+
+        # Place BUY order (paper: simulated, live: REGULAR MARKET MIS)
+        buy_order_id = self._place_buy(tsym, token, CFG["quantity"], ltp)
+        if LIVE_MODE and buy_order_id is None:
+            self._release_slot()
+            log.error(f"[BB_STOCH] BUY order FAILED for {tsym} — entry aborted")
+            self.unsubscribe_option(token)
+            return
+
         # FIX (Bug 8): BBTrade now anchors sl/target to fill price internally.
-        # No sl_price / tp_price passed — sl_pts and tp_pts are the distances.
         trade = BBTrade(
             symbol   = tsym,
             token    = token,
@@ -928,6 +951,7 @@ class BBStochStrategy(BaseStrategy):
             tp_pts   = tp_pts,
             atr      = atr,
         )
+        trade.order_id = buy_order_id  # store for logging / audit
 
         with self._lock:
             self._trade        = trade
@@ -939,13 +963,14 @@ class BBStochStrategy(BaseStrategy):
         self._persist_buf.clear()
 
         rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
+        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
 
         delay_str = f" [pending_delay={pending_delay_ms:.0f}ms]" if pending_delay_ms is not None else ""
         log.info(
-            f"[BB_STOCH] ENTRY {opt} | {tsym} | "
+            f"[BB_STOCH] [{mode_tag}] ENTRY {opt} | {tsym} | "
             f"Fill={trade.entry:.2f} LTP={ltp:.2f}{delay_str} | "
             f"SL={trade.sl:.2f}(-{sl_pts:.1f}) TP={trade.target:.2f}(+{tp_pts:.1f}) | "
-            f"RR=1:{rr} ATR={atr:.1f} | "
+            f"RR=1:{rr} ATR={atr:.1f} | buy_order={buy_order_id} | "
             f"Mode={sig.get('mode', '?')} BB-BW={sig['bb'].get('bw_pct', 0)*100:.2f}%"
         )
 
@@ -965,6 +990,8 @@ class BBStochStrategy(BaseStrategy):
             "rr"         : rr,
             "spot"       : spot,
             "atr"        : atr,
+            "exec_mode"  : mode_tag,
+            "order_id"   : buy_order_id,
             "mode"       : sig.get("mode", "pending" if pending_delay_ms else ""),
             "bb_upper"   : bb.get("upper", ""),
             "bb_lower"   : bb.get("lower", ""),
@@ -1105,15 +1132,25 @@ class BBStochStrategy(BaseStrategy):
         if reason == "SL":
             self._last_sl_time = time_module.time()
 
+        # Place SELL order (paper: simulated, live: REGULAR MARKET MIS)
+        sell_order_id = self._place_sell(trade.symbol, trade.token, trade.qty, ltp)
+        if LIVE_MODE and sell_order_id is None:
+            log.error(f"[BB_STOCH] SELL order FAILED for {trade.symbol} on {reason} — "
+                      f"position may still be open in Zerodha! Check and square off manually.")
+
+        # Release global live trade slot
+        self._release_slot()
+
+        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         tag = "[TARGET]" if reason == "TARGET" else ("[SL]" if reason == "SL" else "[EXIT]")
         log.info(
-            f"[BB_STOCH] {tag} {trade.option_type} | {trade.symbol} | {reason} | "
+            f"[BB_STOCH] [{mode_tag}] {tag} {trade.option_type} | {trade.symbol} | {reason} | "
             f"Exit={exit_px:.2f} | PnL={pnl_pts:+.2f}pts ({pnl_rs:+.2f}Rs) | "
-            f"RR={rr_act:+.2f} | DayPnL={self._daily_pnl:+.2f}Rs"
+            f"RR={rr_act:+.2f} | DayPnL={self._daily_pnl:+.2f}Rs | sell_order={sell_order_id}"
         )
 
         result = {
-            "timestamp"  : _now_ist().isoformat(),  # FIX: was UTC on GitHub Actions
+            "timestamp"  : _now_ist().isoformat(),
             "symbol"     : trade.symbol,
             "opt_type"   : trade.option_type,
             "qty"        : trade.qty,
@@ -1127,6 +1164,8 @@ class BBStochStrategy(BaseStrategy):
             "reason"     : reason,
             "trail_stage": trade.trail_stage,
             "day_pnl_rs" : round(self._daily_pnl, 2),
+            "exec_mode"  : mode_tag,
+            "sell_order" : sell_order_id,
         }
         _csv_append(CFG["exit_csv"], result)
         self._results.append(result)

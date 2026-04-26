@@ -72,6 +72,14 @@ from scalper_v7_core.config import (
 
 log = logging.getLogger("strategy.scalper_v7")
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE MODE FLAG
+#  Change to True when you are ready to trade SCALPER_V7 with real money.
+#  Paper tracking (PaperEngine / PaperTrade) always runs for PnL accounting.
+#  When LIVE_MODE=True, real MARKET orders are placed via OrderRouter on top.
+# ─────────────────────────────────────────────────────────────────────────────
+LIVE_MODE = False
+
 
 # ── Persistence Filter (same as original scalper_v7/main.py) ─────────────────
 
@@ -100,6 +108,8 @@ class ScalperV7Strategy(BaseStrategy):
     Full ScalerV7 (all 11 filters active) running inside the shared framework.
     Receives ticks/candles via callbacks. Never touches Kite or WebSocket directly.
     """
+
+    LIVE_MODE = LIVE_MODE   # expose module flag via class for BaseStrategy helpers
 
     @property
     def name(self) -> str:
@@ -242,19 +252,26 @@ class ScalperV7Strategy(BaseStrategy):
 
         reason = self._engine.manage_trade(price)
         if reason:
+            # Place SELL order (paper: simulated, live: MARKET)
+            sym = self._active_sym or ""
+            sell_order_id = self._place_sell(sym, token, self._engine.active_trade.qty if self._engine.active_trade else 0, price)
+            if LIVE_MODE and sell_order_id is None:
+                log.error(f"[ScalperV7] SELL order FAILED for {sym} on {reason} — "
+                          f"position may still be open in Zerodha!")
+            self._release_slot()
+
             # _close() already set active_trade = None inside PaperEngine
             if self._engine._results:
                 last    = self._engine._results[-1]
                 pnl_pts = last["pnl_pts"]
                 pnl_rs  = last["pnl_rs"]
-                # FIX (Bug 8): pass opt_type captured above (not active_trade.option_type
-                # which is now None — that caused the risk counter to receive "" always)
                 self._risk.on_trade_exit(pnl_pts, pnl_rs, reason, opt_type)
 
             clear_state()
             self._persistence.reset()
             self._unsubscribe_active_option()
-            log.info(f"[ScalperV7] Trade closed: {reason} | Token={token}")
+            mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+            log.info(f"[ScalperV7] [{mode_tag}] Trade closed: {reason} | Token={token} | sell_order={sell_order_id}")
 
     # ── Signal evaluation (called on every 1-min close) ──────────────────────
 
@@ -396,7 +413,20 @@ class ScalperV7Strategy(BaseStrategy):
             "tp_pts":     tp_pts,
         }
 
-        # Open paper trade
+        # Acquire global trade slot (live only — paper always succeeds)
+        if not self._acquire_slot():
+            log.warning(f"[ScalperV7] Trade slot blocked — another live strategy is active")
+            self._persistence.reset()
+            return
+
+        # Place BUY order (paper: simulated fill via PaperEngine, live: MARKET order)
+        buy_order_id = self._place_buy(tsym, token, QUANTITY, ltp)
+        if LIVE_MODE and buy_order_id is None:
+            self._release_slot()
+            log.error(f"[ScalperV7] BUY order FAILED for {tsym} — entry aborted")
+            return
+
+        # Open paper trade (always runs — tracks PnL and state for both modes)
         self._engine.open_trade(
             symbol      = tsym,
             token       = token,
@@ -417,7 +447,8 @@ class ScalperV7Strategy(BaseStrategy):
         save_state(self._engine.active_trade.to_dict())
         self._persistence.reset()
 
-        log.info(f"[ScalperV7]  Entered {opt} | {tsym} | LTP={ltp:.2f} | SL={sl_price:.2f} TP={tp_price:.2f}")
+        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        log.info(f"[ScalperV7] [{mode_tag}] Entered {opt} | {tsym} | LTP={ltp:.2f} | SL={sl_price:.2f} TP={tp_price:.2f} | buy_order={buy_order_id}")
 
     # ── EOD ───────────────────────────────────────────────────────────────────
 
@@ -427,20 +458,29 @@ class ScalperV7Strategy(BaseStrategy):
             # Force close at whatever price we have.
             token    = self._engine.active_trade.token
             ltp      = self.get_price(token) or self._engine.active_trade.entry
-            # FIX (Bug 8 — eod_summary): capture opt_type BEFORE close_trade_forced().
-            # close_trade_forced() calls _close() internally which sets active_trade=None.
-            # Reading active_trade.option_type AFTER the call always evaluates the ternary
-            # to "" — the directional loss counter silently received "" on every EOD close.
+            # FIX (Bug 8 — eod_summary): capture opt_type BEFORE close_trade_forced()
             opt_type = self._engine.active_trade.option_type
+            sym      = self._active_sym or ""
+            qty      = self._engine.active_trade.qty
+
+            # Place SELL order before PaperEngine nulls active_trade
+            sell_order_id = self._place_sell(sym, token, qty, ltp)
+            if LIVE_MODE and sell_order_id is None:
+                log.error(f"[ScalperV7] EOD SELL FAILED for {sym} — "
+                          f"position may still be open in Zerodha! Square off manually.")
+            self._release_slot()
+
             reason   = self._engine.close_trade_forced(ltp, "EOD-SQUAREOFF")
             if self._engine._results:
                 last = self._engine._results[-1]
                 self._risk.on_trade_exit(
                     last["pnl_pts"], last["pnl_rs"], reason,
-                    opt_type,   # ← captured before close; active_trade is None here
+                    opt_type,
                 )
             clear_state()
             self._unsubscribe_active_option()
+            mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+            log.info(f"[ScalperV7] [{mode_tag}] EOD squareoff | sell_order={sell_order_id}")
 
         self._engine.write_daily_summary()
         log.info(
@@ -454,32 +494,36 @@ class ScalperV7Strategy(BaseStrategy):
     def _handle_squareoff(self):
         """Force close any open trade when risk manager triggers auto square-off.
 
-        FIX (Bug 8 — _handle_squareoff): this was the last remaining place where
-        active_trade.option_type was read AFTER close_trade_forced() nulled it.
-        close_trade_forced() calls _close() internally which sets active_trade=None,
-        so the RiskManager's directional consecutive-loss counter received "" on
-        every intraday squareoff — corrupting CE/PE tracking for the rest of the
-        session and for next-day crash recovery state.
-
-        Same fix as on_option_tick() and eod_summary(): capture opt_type on its
-        own line BEFORE the close call.
+        FIX (Bug 8 — _handle_squareoff): capture opt_type on its own line
+        BEFORE the close call (close_trade_forced nulls active_trade internally).
         """
         if not self._engine.active_trade:
             return
         token    = self._engine.active_trade.token
         ltp      = self.get_price(token) or self._engine.active_trade.entry
-        # FIX (Bug 8): capture opt_type BEFORE close_trade_forced() nulls active_trade
         opt_type = self._engine.active_trade.option_type
+        sym      = self._active_sym or ""
+        qty      = self._engine.active_trade.qty
+
+        # Place SELL order before PaperEngine nulls active_trade
+        sell_order_id = self._place_sell(sym, token, qty, ltp)
+        if LIVE_MODE and sell_order_id is None:
+            log.error(f"[ScalperV7] AUTO-SQUAREOFF SELL FAILED for {sym} — "
+                      f"position may still be open in Zerodha! Square off manually.")
+        self._release_slot()
+
         reason   = self._engine.close_trade_forced(ltp, "AUTO-SQUAREOFF")
         if self._engine._results:
             last = self._engine._results[-1]
             self._risk.on_trade_exit(
                 last["pnl_pts"], last["pnl_rs"], reason,
-                opt_type,   # ← captured before close; active_trade is None here
+                opt_type,
             )
         clear_state()
         self._persistence.reset()
         self._unsubscribe_active_option()
+        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        log.info(f"[ScalperV7] [{mode_tag}] Auto-squareoff complete | sell_order={sell_order_id}")
 
     def _unsubscribe_active_option(self):
         """Unsubscribe option token from WebSocket to save bandwidth."""

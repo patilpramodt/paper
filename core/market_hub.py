@@ -116,6 +116,9 @@ class MarketHub:
         self._done         = threading.Event()
         self._vwap_started = False
 
+        # Set by t.py after hub creation: hub.order_router = OrderRouter(hub)
+        self.order_router  = None
+
         log.info("MarketHub created")
 
     # ── Kite login ────────────────────────────────────────────────────────────

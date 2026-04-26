@@ -84,6 +84,7 @@ from core.market_hub  import MarketHub
 from core.instruments import InstrumentStore
 from core.premarket   import PreMarketData
 from core.pcr_kite    import WsPCR
+from core.order_router import OrderRouter
 
 # ── Strategies — ADD/REMOVE here to enable/disable ──────────────────────────
 from strategies.spike               import SpikeStrategy
@@ -225,6 +226,13 @@ def main():
     # ── Create MarketHub (single connection layer) ────────────────────────────
     hub = MarketHub(token_file=TOKEN_FILE)
     hub.load_kite()
+
+    # ── Create OrderRouter (single point for all order placement) ─────────────
+    # Attached to hub so every strategy can reach it via self._hub.order_router.
+    # All strategies start with LIVE_MODE=False (paper only).
+    # To go live for a specific strategy, set LIVE_MODE=True in that strategy file.
+    hub.order_router = OrderRouter(hub)
+    log.info("OrderRouter attached to hub (all strategies in PAPER mode by default)")
 
     # ── Load NFO instruments ONCE (shared by all strategies) ─────────────────
     instruments = InstrumentStore()

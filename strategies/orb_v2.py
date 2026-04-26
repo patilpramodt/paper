@@ -50,6 +50,16 @@ from core.pricer import option_premium, pick_iv
 
 log = logging.getLogger("strategy.orb")
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  LIVE MODE FLAG
+#  Change to True when you are ready to trade ORB with real money.
+#  Entry: REGULAR MARKET MIS (buy option at open)
+#  Exit:  REGULAR MARKET MIS (sell option — software SL monitored via WebSocket)
+#  NOTE: BO/CO blocked for FnO. SL-M not available for options.
+#        All SL management is in software (on_tick / on_option_tick).
+# ─────────────────────────────────────────────────────────────────────────────
+LIVE_MODE = False
+
 # ── Strategy-specific config ──────────────────────────────────────────────────
 CFG = {
     "lot_size"          : 15,
@@ -96,6 +106,8 @@ CFG = {
 
 
 class ORBStrategy(BaseStrategy):
+
+    LIVE_MODE = LIVE_MODE   # expose module flag via class for BaseStrategy helpers
 
     @property
     def name(self) -> str:
@@ -345,6 +357,23 @@ class ORBStrategy(BaseStrategy):
         ep = float(lp) if lp else option_premium(entry_s, strike, ts, expiry_dt, direction, iv)
         ep_eff = ep + CFG["slippage_pts"]
 
+        # Acquire global trade slot (live only — paper always succeeds)
+        if not self._acquire_slot():
+            log.warning(f"[{self.name}] Trade slot blocked — another live strategy is active")
+            return
+
+        # Place BUY order (paper: simulated, live: MARKET)
+        order_id = self._place_buy(
+            opt_sym or f"{strike}{direction}", opt_token or 0,
+            CFG["lot_size"], ep,
+        )
+        if LIVE_MODE and order_id is None:
+            self._release_slot()
+            log.error(f"[{self.name}] BUY order FAILED — entry aborted")
+            return
+
+        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+
         self._trade = {
             "state"          : "OPEN",
             "direction"      : direction,
@@ -368,16 +397,19 @@ class ORBStrategy(BaseStrategy):
             "orh"            : orh,
             "orl"            : orl,
             "range_width"    : rng,
+            "order_id"       : order_id,
+            "qty"            : CFG["lot_size"],
         }
         self._trades_taken += 1
 
         if opt_token:
             self.subscribe_option(opt_token)
 
-        log.info(f"[{self.name}]  TRADE #{self._trades_taken} ENTERED")
+        log.info(f"[{self.name}] [{mode_tag}] TRADE #{self._trades_taken} ENTERED")
         log.info(f"[{self.name}]   {direction} {strike} {expiry}  DTE={dte}")
         log.info(f"[{self.name}]   Prem {ep:.0f}+slip{ep_eff:.0f} | "
-                 f"Tgt={target_s:.0f} | SL={sl_s:.0f} | PremSL={psl_pct*100:.0f}%")
+                 f"Tgt={target_s:.0f} | SL={sl_s:.0f} | PremSL={psl_pct*100:.0f}% | "
+                 f"order_id={order_id}")
 
     # ── Exit ──────────────────────────────────────────────────────────────────
 
@@ -434,6 +466,21 @@ class ORBStrategy(BaseStrategy):
                                            t["expiry_dt"], t["direction"], t["iv"])
 
         ep_eff  = round(max(exit_prem - CFG["slippage_pts"], 0), 2)
+
+        # Place SELL order (paper: simulated, live: MARKET)
+        sell_order_id = self._place_sell(
+            t.get("opt_sym", ""),
+            t.get("opt_token", 0),
+            t.get("qty", CFG["lot_size"]),
+            exit_prem,
+        )
+        if LIVE_MODE and sell_order_id is None:
+            log.error(f"[{self.name}] SELL order FAILED for {t.get('opt_sym')} — "
+                      f"position may still be open in Zerodha! Check and square off manually.")
+
+        # Release global trade slot
+        self._release_slot()
+
         pnl_u   = round(ep_eff - t["entry_prem_eff"], 2)
         pnl_g   = round(pnl_u * CFG["lot_size"], 2)
         pnl_n   = round(pnl_g - CFG["brokerage"], 2)
@@ -442,6 +489,7 @@ class ORBStrategy(BaseStrategy):
         if pnl_n < 0: self._consec_losses += 1
         else:          self._consec_losses  = 0
 
+        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         result = {**t,
                   "exit_time"   : ts,
                   "exit_spot"   : round(spot, 2),
@@ -452,12 +500,14 @@ class ORBStrategy(BaseStrategy):
                   "trade_num"   : self._trades_taken,
                   "vix"         : self._vix,
                   "pcr"         : self._pcr,
+                  "mode"        : mode_tag,
+                  "sell_order_id": sell_order_id,
         }
         self._completed.append(result)
         self._log_csv(result)
 
-        log.info(f"[{self.name}]  CLOSED #{self._trades_taken}  {reason} "
-                 f"{pnl_n:,.0f}  |  Today: {self._today_pnl:,.0f}")
+        log.info(f"[{self.name}] [{mode_tag}] CLOSED #{self._trades_taken}  {reason} "
+                 f"{pnl_n:,.0f}  |  Today: {self._today_pnl:,.0f} | sell_order={sell_order_id}")
 
         if t["opt_token"]:
             self.unsubscribe_option(t["opt_token"])
