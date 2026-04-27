@@ -2,8 +2,8 @@
 strategies/orb_v2.py
 
 ORB (Opening Range Breakout) Strategy v2
-Entry window: 9:40–10:15 AM
-Filters: ADX(2), EMA(2), VWAP(1.5), RSI(1), Volume(1), ST(1), BB(0.5)
+Entry window: 9:40–10:30 AM
+Filters: Volume(gate), VWAP(gate), ADX(3), EMA(3), RSI(1.5), ST(1), BB(0.5)
 Exit: Target 1.5×OR, Trailing SL after 1R, Premium SL, Time stop
 Multi-trade: up to 2 per day if first hits SL
 
@@ -32,6 +32,25 @@ FIXES APPLIED:
            far from the actual open if the market moved during 9:15–9:30.
            Fix: store the first tick at 9:15 as _open_price. Use that as
            the gap reference in _lock_or().
+
+SCORING REDESIGN (v2.1):
+  Volume and VWAP promoted to hard gates — they are non-negotiable filters
+  for any ORB entry. A breakout on thin volume is a fake breakout by definition.
+  A breakout against VWAP means price is on the wrong side of fair value.
+  Neither should contribute partial credit; both must fully pass.
+
+  With Volume(1pt) + VWAP(1.5pt) removed from scoring, the freed 2.5 pts are
+  redistributed to the remaining indicators to keep max score at 9.0:
+    ADX  full   : +2 → +3    (most reliable trend-strength signal)
+    ADX  partial: +1 → +1.5
+    EMA  full   : +2 → +3    (structure confirmation)
+    EMA  partial: +1 → +1.5
+    RSI         : +1 → +1.5  (momentum confirmation)
+    ST          : +1 → +1    (unchanged)
+    BB          : +0.5 → +0.5 (unchanged)
+
+  min_score_normal = 4.0  (unchanged — but now means real conviction post gates)
+  min_score_0dte   = 6.0  (unchanged)
 """
 
 import csv
@@ -95,8 +114,8 @@ CFG = {
     "vix_max"           : 24.0,   # raised: was 20.0 (India VIX routinely 20-24)
     "pcr_max"           : 1.3,
     "pcr_min"           : 0.7,
-    "min_score_normal"  : 4.0,    # lowered: was 5.0 (score 5 rarely hit in calm markets)
-    "min_score_0dte"    : 6.0,    # lowered: was 7.0
+    "min_score_normal"  : 4.0,    # post hard-gates: 4.0 now means real ADX/EMA conviction
+    "min_score_0dte"    : 6.0,
     "slippage_pts"      : 2.0,
     "brokerage"         : 50,
     "csv_file"          : "orb_trades.csv",
@@ -315,13 +334,36 @@ class ORBStrategy(BaseStrategy):
         if not ind:
             return
 
-        vwap  = self._hub.session_vwap.value
-        score, details = self._score(ind, direction, vwap)
+        # ── Hard Gate 1: Volume ───────────────────────────────────────────────
+        # A breakout on thin volume is a fake breakout. Non-negotiable.
+        vol_ok = (ind["vol_l"] > ind["vol_3"] and
+                  ind["vol_l"] > CFG["vol_multiplier"] * ind["vol_avg"])
+        if not vol_ok:
+            log.info(f"[{self.name}]  HARD GATE: Volume weak "
+                     f"(vol_l={ind['vol_l']:.0f} vol_avg={ind['vol_avg']:.0f} "
+                     f"vol_3={ind['vol_3']:.0f}) — skip")
+            return
+
+        # ── Hard Gate 2: VWAP ────────────────────────────────────────────────
+        # Price on wrong side of fair value kills the trade thesis.
+        vwap = self._hub.session_vwap.value
+        if vwap:
+            vwap_ok = (direction == "CE" and ind["close"] > vwap) or \
+                      (direction == "PE" and ind["close"] < vwap)
+            if not vwap_ok:
+                log.info(f"[{self.name}]  HARD GATE: Wrong side of VWAP={vwap:.0f} "
+                         f"(close={ind['close']:.0f}) — skip")
+                return
+        else:
+            log.debug(f"[{self.name}]  VWAP unavailable — gate skipped")
+
+        # ── Scoring (max 9.0 — Volume and VWAP removed, weights redistributed) ──
+        score, details = self._score(ind, direction)
         min_s = CFG["min_score_0dte"] if self._dte_days == 0 else CFG["min_score_normal"]
 
         log.info(f"\n[{self.name}] {'─'*50}")
         log.info(f"[{self.name}]  {direction} breakout {ts.strftime('%H:%M')} "
-                 f"score={score}/{min_s}")
+                 f"score={score}/{min_s}  [Vol ✅  VWAP ✅]")
         for v in details.values():
             log.info(f"[{self.name}]   {v}")
 
@@ -596,52 +638,68 @@ class ORBStrategy(BaseStrategy):
             "bb_exp":bb_e, "vol_avg":va, "vol_l":vl, "vol_3":v3,
         }
 
-    def _score(self, ind: dict, direction: str, vwap: float | None) -> tuple:
+    def _score(self, ind: dict, direction: str) -> tuple:
+        """
+        Scoring after Volume + VWAP hard gates have already passed.
+        Max score = 9.0 (same as before — weights redistributed from removed gates).
+
+        ADX  full   : +3    (was +2)
+        ADX  partial: +1.5  (was +1)
+        EMA  full   : +3    (was +2)
+        EMA  partial: +1.5  (was +1)
+        RSI         : +1.5  (was +1)
+        ST          : +1    (unchanged)
+        BB          : +0.5  (unchanged)
+        """
         score, det = 0.0, {}
         c, rsi, e9, e21 = ind["close"], ind["rsi"], ind["ema9"], ind["ema21"]
         st, adx = ind["st_bull"], ind["adx"]
 
-        # ADX [2pts]
+        # ADX [3pts full / 1.5pts partial]
         adx_ok = adx >= CFG["adx_min"]
-        di_ok  = (direction=="CE" and ind["di_plus"]>ind["di_minus"]) or \
-                 (direction=="PE" and ind["di_minus"]>ind["di_plus"])
-        if adx_ok and di_ok: score+=2.0; det["adx"]=f" ADX={adx:.1f} DI aligned [+2]"
-        elif adx_ok:          score+=1.0; det["adx"]=f" ADX={adx:.1f} DI mismatch [+1]"
-        else:                             det["adx"]=f" ADX={adx:.1f}<{CFG['adx_min']} [+0]"
+        di_ok  = (direction == "CE" and ind["di_plus"] > ind["di_minus"]) or \
+                 (direction == "PE" and ind["di_minus"] > ind["di_plus"])
+        if adx_ok and di_ok:
+            score += 3.0; det["adx"] = f" ADX={adx:.1f} DI aligned [+3]"
+        elif adx_ok:
+            score += 1.5; det["adx"] = f" ADX={adx:.1f} DI mismatch [+1.5]"
+        else:
+            det["adx"] = f" ADX={adx:.1f}<{CFG['adx_min']} [+0]"
 
-        # EMA [2pts]
-        ef = (direction=="CE" and c>e9 and e9>e21) or (direction=="PE" and c<e9 and e9<e21)
-        ep = (direction=="CE" and c>e9) or (direction=="PE" and c<e9)
-        if ef: score+=2.0; det["ema"]=f" Full stack C={c:.0f} E9={e9:.0f} E21={e21:.0f} [+2]"
-        elif ep: score+=1.0; det["ema"]=" Partial EMA [+1]"
-        else: det["ema"]=" EMA against [+0]"
+        # EMA [3pts full / 1.5pts partial]
+        ef = (direction == "CE" and c > e9 and e9 > e21) or \
+             (direction == "PE" and c < e9 and e9 < e21)
+        ep = (direction == "CE" and c > e9) or \
+             (direction == "PE" and c < e9)
+        if ef:
+            score += 3.0; det["ema"] = f" Full stack C={c:.0f} E9={e9:.0f} E21={e21:.0f} [+3]"
+        elif ep:
+            score += 1.5; det["ema"] = " Partial EMA [+1.5]"
+        else:
+            det["ema"] = " EMA against [+0]"
 
-        # VWAP [1.5pts]
-        if vwap:
-            vok = (direction=="CE" and c>vwap) or (direction=="PE" and c<vwap)
-            if vok: score+=1.5; det["vwap"]=f" VWAP={vwap:.0f} [+1.5]"
-            else:               det["vwap"]=f" VWAP={vwap:.0f} wrong side [+0]"
-
-        # RSI [1pt]
-        rok = (direction=="CE" and rsi>=CFG["rsi_bull"]) or (direction=="PE" and rsi<=CFG["rsi_bear"])
-        if rok: score+=1.0; det["rsi"]=f" RSI={rsi:.1f} [+1]"
-        else: det["rsi"]=f" RSI={rsi:.1f} [+0]"
-
-        # Volume [1pt]
-        vs = ind["vol_l"]>ind["vol_3"] and ind["vol_l"]>CFG["vol_multiplier"]*ind["vol_avg"]
-        if vs: score+=1.0; det["vol"]=f" Vol surge [+1]"
-        else: det["vol"]=" Vol weak [+0]"
+        # RSI [1.5pts]
+        rok = (direction == "CE" and rsi >= CFG["rsi_bull"]) or \
+              (direction == "PE" and rsi <= CFG["rsi_bear"])
+        if rok:
+            score += 1.5; det["rsi"] = f" RSI={rsi:.1f} [+1.5]"
+        else:
+            det["rsi"] = f" RSI={rsi:.1f} [+0]"
 
         # Supertrend [1pt]
-        stok = (direction=="CE" and st) or (direction=="PE" and not st)
-        if stok: score+=1.0; det["st"]=" ST aligned [+1]"
-        else: det["st"]=" ST against [+0]"
+        stok = (direction == "CE" and st) or (direction == "PE" and not st)
+        if stok:
+            score += 1.0; det["st"] = " ST aligned [+1]"
+        else:
+            det["st"] = " ST against [+0]"
 
         # BB [0.5pt]
-        if ind["bb_exp"]: score+=0.5; det["bb"]=" BB expanding [+0.5]"
-        else: det["bb"]=" BB flat [+0]"
+        if ind["bb_exp"]:
+            score += 0.5; det["bb"] = " BB expanding [+0.5]"
+        else:
+            det["bb"] = " BB flat [+0]"
 
-        return round(score,1), det
+        return round(score, 1), det
 
     # ── CSV logger ────────────────────────────────────────────────────────────
 
