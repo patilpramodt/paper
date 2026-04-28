@@ -56,7 +56,7 @@ def _now_ist() -> datetime:
 #  Change to True when you are ready to trade SPIKE with real money.
 #  All other strategies remain in paper mode until their own flag is changed.
 # ─────────────────────────────────────────────────────────────────────────────
-LIVE_MODE = False
+LIVE_MODE = True
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIG
