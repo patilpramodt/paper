@@ -169,7 +169,7 @@ CFG = {
 
     # Volume filter
     "vol_avg_period"    : 10,       # bars to compute average volume
-    "vol_mult"          : 1.0,      # loosened: was 1.2 (1.2 blocked valid signals on average-vol days)
+    "vol_mult"          : 0.85,     # loosened: was 1.0 → 0.85 (1.0 was blocking 0.98–1.00x bars incl. float precision edge cases)
 
     # VWAP
     "vwap_buffer"       : 10.0,     # allow entry within N pts of VWAP line
@@ -377,12 +377,14 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     # ---- Filter 2: Volume ----
     # vol_ratio == -1.0 is the sentinel meaning "no volume data available".
     # In that case we bypass the filter (don't block) and log a warning.
-    # When real volume data is flowing, vol_ratio must exceed vol_mult (1.0x avg).
+    # When real volume data is flowing, vol_ratio must exceed vol_mult (0.85x avg).
+    # Note: round() prevents float precision edge cases (e.g. 0.9997 logged as 1.00
+    #       but failing strict >= 1.0 comparison).
     if vol_ratio == -1.0:
         vol_ok = True   # data unavailable -- bypass, do not block
         log.debug("[BB_STOCH] Volume data unavailable -- vol filter bypassed")
     else:
-        vol_ok = vol_ratio >= CFG["vol_mult"]
+        vol_ok = round(vol_ratio, 4) >= CFG["vol_mult"]
 
     if not vol_ok:
         return {"action": "HOLD", "blocked_by": "volume_low", **base}
