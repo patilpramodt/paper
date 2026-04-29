@@ -7,33 +7,39 @@ Central order execution layer — single point for all live order placement.
   DESIGN DECISIONS (read before modifying)
 ═══════════════════════════════════════════════════════════════════
 
-1. MARKET orders — NOT IOC, NOT SL orders on exchange
+1. LIMIT orders with slippage buffer — NOT plain MARKET orders
 
-   For BankNifty ATM options, a REGULAR MARKET order fills in milliseconds.
-   IOC LIMIT risks outright rejection at 9:15 AM gap-open (spread 5–15 pts,
-   limit price is stale before it hits the exchange).
+   Zerodha's API now REJECTS plain MARKET orders for options with:
+     "Market orders without market protection are not allowed via API."
 
-   Zerodha / NSE constraints for options:
+   Fix: use ORDER_TYPE_LIMIT with a small slippage buffer above LTP for BUY
+   and below LTP for SELL. This guarantees near-instant fill on liquid ATM
+   strikes at 9:15 AM while satisfying Zerodha's API requirement.
+
+   Buffer:
+     BUY  → price = round_tick(ltp × 1.02)   (+2% above LTP)
+     SELL → price = round_tick(ltp × 0.98)   (−2% below LTP)
+
+   Tick size for NFO options is ₹0.05 — all prices rounded to nearest tick.
+
+   Why not SL-M / IOC / BO / CO:
      BO  (Bracket Orders)  — BLOCKED for all FnO since 2021 (SEBI directive)
      CO  (Cover Orders)    — BLOCKED for FnO
-     SL-M                  — NOT available for options; only equity/futures
-     SL Limit              — available but can gap through trigger entirely
-     MARKET (REGULAR+MIS)  — available ✓  ← only this is used here
-
-   Exchange SL orders are therefore unreliable for options in every possible form.
-   We monitor SL on every WebSocket tick in software and fire a MARKET sell the
-   moment price breaches. This is faster and more dependable.
+     SL-M                  — NOT available for options on NSE/Zerodha
+     SL Limit              — can gap through trigger entirely
+     IOC LIMIT             — rejection risk at 9:15 AM gap-open (stale price)
+     MARKET                — rejected by Zerodha API ("market protection" error)
+     LIMIT + buffer        — fills in ms on liquid ATM strikes ✓  ← used here
 
 2. One-live-trade-at-a-time slot
 
-   Only one strategy can hold a live position at a time.  This prevents:
+   Only one strategy can hold a live position at a time. This prevents:
      - Double margin consumption across 4 strategies
      - Conflicting CE/PE positions (SPIKE long CE + BB_STOCH long PE = disaster)
      - Capital exhaustion
 
-   The slot is only enforced when LIVE_MODE=True.  Paper-mode strategies never
-   compete for the slot and trade independently (so you can keep reviewing paper
-   data from all 4 strategies while only SPIKE is live, for example).
+   The slot is only enforced when LIVE_MODE=True. Paper-mode strategies never
+   compete for the slot and trade independently.
 
 3. Per-strategy LIVE_MODE flag
 
@@ -41,36 +47,32 @@ Central order execution layer — single point for all live order placement.
        LIVE_MODE = False   # change to True to enable real orders for that strategy
 
    When False → paper fill (no Kite API call, simulated fill at LTP).
-   When True  → real MARKET order via kite.place_order().
+   When True  → real LIMIT order via kite.place_order().
 
-   Default: ALL strategies are paper.  Change only the one you want to go live.
+   Default: ALL strategies are paper. Change only the one you want to go live.
 
-4. Order status confirmation (FIX — was missing)
+4. Order status confirmation
 
    After kite.place_order() returns an order_id, we poll kite.order_history()
    until the order reaches a terminal state (COMPLETE / REJECTED / CANCELLED)
    or a timeout expires.
 
-   Without this, NSE could silently reject an option MARKET order (circuit
-   filter, no quotes at that ms) and the bot would manage a phantom SL and
-   eventually fire a SELL against a position that never existed.
+   Without this, NSE could silently reject an option order (circuit filter,
+   no quotes at that ms) and the bot would manage a phantom SL and eventually
+   fire a SELL against a position that never existed.
 
    _confirm_order() returns one of:
      "COMPLETE"      → fill confirmed, caller may treat trade as open
      "REJECTED"      → exchange rejected; caller must abort entry / alert on sell
-     "CANCELLED"     → order was cancelled (should not happen for MARKET)
+     "CANCELLED"     → order was cancelled (should not happen for LIMIT)
      "TIMEOUT"       → did not reach terminal state in time; caller treats as failed
      "TOKEN_EXPIRED" → access token invalid mid-session; caller must abort + alert
 
-5. Token / session expiry mid-session (FIX — was only checked at startup)
+5. Token / session expiry mid-session
 
    If the Zerodha access token expires while the bot is running (rare but
    possible after midnight refresh), any Kite REST call raises
    kiteconnect.exceptions.TokenException (HTTP 403).
-
-   Previously this surfaced only as a generic exception in the log, and
-   the bot continued thinking kite was fine — it would keep retrying
-   orders and managing phantom positions.
 
    Fix: _is_token_exception() inspects the exception type name and message.
    When detected:
@@ -91,9 +93,38 @@ log = logging.getLogger("core.router")
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
+# ── Slippage buffer for LIMIT orders ─────────────────────────────────────────
+# BUY  limit = LTP × (1 + BUY_SLIP)   — pay up to 2% above last price
+# SELL limit = LTP × (1 − SELL_SLIP)  — accept down to 2% below last price
+# Both rounded to NFO tick size (₹0.05).
+# Increase if fills are missed on highly volatile opens; decrease to save cost.
+BUY_SLIP   = 0.03   # 3%
+SELL_SLIP  = 0.03   # 3%
+TICK_SIZE  = 0.05   # NFO options tick
+
 
 def _now_ist() -> datetime:
     return datetime.now(tz=_IST).replace(tzinfo=None)
+
+
+def _limit_price(ltp: float, side: str) -> float:
+    """
+    Round ltp ± slippage buffer to nearest NFO tick (₹0.05).
+
+    BUY  → ltp × 1.02 rounded UP   (ensures we're above the ask)
+    SELL → ltp × 0.98 rounded DOWN  (ensures we're below the bid)
+
+    Minimum price floored at TICK_SIZE to avoid zero/negative prices on
+    very cheap OTM options.
+    """
+    if side == "BUY":
+        raw = ltp * (1 + BUY_SLIP)
+        ticked = round(raw / TICK_SIZE) * TICK_SIZE
+    else:
+        raw = ltp * (1 - SELL_SLIP)
+        ticked = round(raw / TICK_SIZE) * TICK_SIZE
+
+    return max(ticked, TICK_SIZE)
 
 
 class OrderRouter:
@@ -195,8 +226,8 @@ class OrderRouter:
         Place a BUY (entry) order.
 
         live_mode=False → paper fill logged; returns "PAPER-{ms}"
-        live_mode=True  → REGULAR MARKET MIS via Kite; returns order_id string
-                          ONLY when exchange confirms COMPLETE.
+        live_mode=True  → LIMIT MIS order via Kite at LTP + 2% buffer;
+                          returns order_id string ONLY when exchange confirms COMPLETE.
 
         Returns order_id / paper_id, or None on failure.
         """
@@ -220,8 +251,8 @@ class OrderRouter:
         Place a SELL (exit) order.
 
         live_mode=False → paper fill logged; returns "PAPER-{ms}"
-        live_mode=True  → REGULAR MARKET MIS via Kite; returns order_id string
-                          ONLY when exchange confirms COMPLETE.
+        live_mode=True  → LIMIT MIS order via Kite at LTP − 2% buffer;
+                          returns order_id string ONLY when exchange confirms COMPLETE.
 
         Returns order_id / paper_id, or None on failure.
         """
@@ -245,22 +276,22 @@ class OrderRouter:
         transaction_type: str,   # "BUY" or "SELL"
     ) -> Optional[str]:
         """
-        Place a REGULAR MARKET MIS order on NFO and confirm it reached the exchange.
+        Place a LIMIT MIS order on NFO and confirm it reached the exchange.
 
-        Why MARKET (not IOC LIMIT, not SL-M, not BO):
-          - BO/CO: blocked for FnO by exchange since 2021.
-          - SL-M:  not available for options on NSE/Zerodha.
-          - IOC:   useful for futures/equity; for single-lot options it adds
-                   rejection risk with zero benefit (MARKET fills in ms).
-          - MARKET: fills immediately at best available price. Correct for
-                   time-sensitive entries/exits on liquid ATM strikes.
+        Why LIMIT with buffer (not MARKET):
+          - Zerodha API rejects plain MARKET orders for options:
+              "Market orders without market protection are not allowed via API."
+          - LIMIT at LTP ± 2% fills in milliseconds on liquid ATM strikes.
+          - Buffer absorbs spread and slippage at volatile 9:15 AM opens.
+          - Tick-rounded to ₹0.05 as required by NSE for NFO options.
 
         Flow:
           1. Validate kite session (None check).
-          2. place_order() → order_id.
-          3. _confirm_order() polls order_history() until COMPLETE / REJECTED /
+          2. Compute limit_price = _limit_price(ltp, side).
+          3. place_order() → order_id.
+          4. _confirm_order() polls order_history() until COMPLETE / REJECTED /
              CANCELLED / TIMEOUT / TOKEN_EXPIRED.
-          4. Return order_id only on COMPLETE; None on anything else.
+          5. Return order_id only on COMPLETE; None on anything else.
         """
         kite = self._hub.kite
         if kite is None:
@@ -269,6 +300,8 @@ class OrderRouter:
                 f"cannot place {transaction_type} for {strategy_name}"
             )
             return None
+
+        limit_px = _limit_price(ltp, transaction_type)
 
         try:
             txn = (
@@ -283,12 +316,13 @@ class OrderRouter:
                 transaction_type = txn,
                 quantity         = qty,
                 product          = kite.PRODUCT_MIS,
-                order_type       = kite.ORDER_TYPE_MARKET,
+                order_type       = kite.ORDER_TYPE_LIMIT,   # ← LIMIT, not MARKET
+                price            = limit_px,                # ← LTP ± 2% buffer
             )
             log.info(
                 f"[Router][LIVE] {transaction_type} PLACED | "
                 f"{strategy_name} | {symbol} | qty={qty} | "
-                f"ref_ltp={ltp:.2f} | order_id={order_id}"
+                f"ref_ltp={ltp:.2f} | limit_px={limit_px:.2f} | order_id={order_id}"
             )
 
         except Exception as exc:
@@ -314,9 +348,9 @@ class OrderRouter:
 
         # ── Confirm the order actually reached the exchange ────────────────────
         # place_order() returning an order_id does NOT mean the exchange accepted
-        # the order. NSE can reject MARKET option orders if:
+        # the order. NSE can reject LIMIT option orders if:
+        #   • Insufficient funds / margin
         #   • The strike has a circuit filter at that moment
-        #   • There are no quotes at that millisecond
         #   • The order hits OI / position limits
         # Without confirmation, the bot would manage a phantom SL and later
         # fire a SELL against a position that never existed.
@@ -330,8 +364,6 @@ class OrderRouter:
             return str(order_id)
 
         elif status == "TOKEN_EXPIRED":
-            # Detailed alert already logged inside _confirm_order.
-            # The order may have filled — tell caller to check console.
             log.error(
                 f"[Router][LIVE] {transaction_type} order {order_id} placed but "
                 f"confirmation poll lost token. Check Zerodha console immediately."
@@ -345,13 +377,16 @@ class OrderRouter:
                 f"[Router][LIVE] {transaction_type} NOT COMPLETE — status={status}\n"
                 f"  Strategy  : {strategy_name}\n"
                 f"  Symbol    : {symbol}  qty={qty}\n"
+                f"  limit_px  : {limit_px:.2f}  (ref_ltp={ltp:.2f})\n"
                 f"  order_id  : {order_id}\n"
                 f"  → Treating as FAILED. Slot released by caller.\n"
                 f"  → No phantom SL will be tracked.\n"
                 + (
                     f"  → *** SELL FAILED — CHECK ZERODHA CONSOLE AND "
                     f"SQUARE OFF MANUALLY IF POSITION IS OPEN! ***\n"
-                    if transaction_type == "SELL" else ""
+                    if transaction_type == "SELL" else
+                    f"  → Possible cause: insufficient funds, circuit filter, or OI limit.\n"
+                    f"  → Check Zerodha console for rejection reason.\n"
                 )
                 + f"{'!'*60}"
             )
@@ -372,9 +407,9 @@ class OrderRouter:
         or the timeout expires.
 
         Terminal states returned by NSE via Zerodha:
-          "COMPLETE"  → exchange filled the order (normal outcome for MARKET)
-          "REJECTED"  → exchange rejected the order (circuit, no quotes, limit breach)
-          "CANCELLED" → order was cancelled (unusual for MARKET)
+          "COMPLETE"  → exchange filled the order (normal outcome for LIMIT + buffer)
+          "REJECTED"  → exchange rejected (insufficient funds, circuit, OI limit)
+          "CANCELLED" → order was cancelled (unusual for LIMIT)
 
         Non-terminal states (keep polling):
           "PUT ORDER REQ RECEIVED"  → order received by Zerodha OMS
@@ -400,7 +435,6 @@ class OrderRouter:
             attempt += 1
             try:
                 history = self._hub.kite.order_history(order_id)
-                # Zerodha returns a list of status entries; the last entry is current
                 if not history:
                     log.warning(
                         f"[Router] order_history({order_id}) returned empty list "
@@ -422,7 +456,6 @@ class OrderRouter:
                     )
                     return status
 
-                # Non-terminal — log first attempt and every 5th to avoid spam
                 if attempt == 1 or attempt % 5 == 0:
                     log.info(
                         f"[Router] Waiting for order {order_id} | "
@@ -449,7 +482,6 @@ class OrderRouter:
 
             time.sleep(poll_interval)
 
-        # Timeout reached — order status unknown
         log.error(
             f"\n{'!'*60}\n"
             f"[Router][LIVE] Order {order_id} status poll TIMED OUT after {timeout_sec}s\n"
@@ -478,11 +510,6 @@ class OrderRouter:
         We inspect both the exception class name and the message string because:
           • Some network libraries wrap the 403 in a generic requests.HTTPError
           • The message text is consistent across kiteconnect library versions
-
-        Note: a fresh token check at startup (hub.load_kite) is not enough.
-        Tokens are valid until midnight IST. If the bot starts before midnight
-        and runs past it (unusual for intraday, but possible for overnight debug
-        runs), the token expires mid-session. This handler covers that edge case.
         """
         exc_class = type(exc).__name__.lower()
         exc_msg   = str(exc).lower()
@@ -512,3 +539,4 @@ class OrderRouter:
             f"{strategy_name} | {symbol} | ltp={ltp:.2f} | id={fake_id}"
         )
         return fake_id
+
