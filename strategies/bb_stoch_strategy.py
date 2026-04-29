@@ -116,6 +116,22 @@ FIXES APPLIED:
             (potentially dozens per second). Second call was harmless but
             wasteful. Fix: added _squareoff_done flag — force-close fires
             once only.
+
+  Bug 11 (order_id SLOT FIX) — BBTrade used __slots__ but did NOT declare
+            "order_id" in the tuple. When _execute_fill() assigned
+            `trade.order_id = buy_order_id` after constructing the trade,
+            Python raised:
+                AttributeError: 'BBTrade' object has no attribute 'order_id'
+            This exception propagated up through on_candle() → MarketHub's
+            WebSocket callback, which caught it and logged:
+                [BB_STOCH] on_candle error: 'BBTrade' object has no attribute 'order_id'
+            As a result the trade object was constructed but never stored in
+            self._trade (exception fired before `with self._lock: self._trade = trade`),
+            so the strategy thought it had 0 trades all day while the paper
+            router had already logged a fill. EOD showed Trades=0, W=0, L=0
+            despite two paper fills (12:15 BUY_CE and 14:00 BUY_PE).
+            Fix: added "order_id" to __slots__ and initialised self.order_id = ""
+            in __init__ so the attribute always exists before _execute_fill runs.
 """
 
 import csv
@@ -484,6 +500,9 @@ class BBTrade:
         "entry", "sl", "target", "sl_pts", "tp_pts",
         "trail_stage", "spot", "atr", "timestamp",
         "exit_pending", "last_exit_ts",
+        "order_id",   # FIX (Bug 11): was missing from __slots__ → AttributeError when
+                      # _execute_fill() did `trade.order_id = buy_order_id`. Python's
+                      # __slots__ prevents setting any attribute not declared here.
     )
 
     def __init__(self, symbol, token, opt_type, ltp, qty,
@@ -521,6 +540,8 @@ class BBTrade:
         self.timestamp  = _now_ist().isoformat()         # FIX: was UTC on GitHub Actions
         self.exit_pending  = False
         self.last_exit_ts  = 0.0
+        self.order_id      = ""    # FIX (Bug 11): set default so slot is always initialised;
+                                   # _execute_fill() overwrites with the real order id.
 
 
 # ============================================================
@@ -1341,3 +1362,4 @@ class BBStochStrategy(BaseStrategy):
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
             log.info(f"[BB_STOCH] Top blocks: {top}")
+
