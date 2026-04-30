@@ -230,7 +230,7 @@ LUNCH_EMA_ATR_RATIO_5M  = 0.60  # Stricter 5-min regime
 # ------------------------------------------------------------------------------
 # Trade Parameters
 # ------------------------------------------------------------------------------
-QUANTITY            = 35        # BankNifty lot size as of Nov 2024
+QUANTITY            = 30        # BankNifty lot size as of Nov 2024
 SLIPPAGE_POINTS     = 1.5       # Simulated per side
 
 # ------------------------------------------------------------------------------
