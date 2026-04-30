@@ -220,7 +220,7 @@ CFG = {
     "max_trades_day"    : 4,
     "post_sl_cooldown"  : 120,      # 2 min wait after any SL hit
     "max_daily_loss"    : 6000,     # Rs circuit breaker
-    "quantity"          : 35,       # lots
+    "quantity"          : 30,       # lots
 
     # Signal persistence (candle bars)
     "persistence"       : 1,        # lowered: was 2 (10-min confirmation window misses fast 5m moves)
