@@ -81,7 +81,7 @@ LIVE_MODE = False
 
 # ── Strategy-specific config ──────────────────────────────────────────────────
 CFG = {
-    "lot_size"          : 35,   # BankNifty lot size as of Nov 2024
+    "lot_size"          : 30,   # BankNifty lot size as of Nov 2024
     "or_start"          : dtime(9, 15),
     "or_end"            : dtime(9, 30),
     "entry_start"       : dtime(9, 40),
