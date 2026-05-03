@@ -24,6 +24,7 @@
     ORB_v2      Opening range breakout, entry 9:40-10:15
     SCALPER_V7  Intraday scalper (11 filters), all-day 9:45-14:30
     BB_STOCH    Bollinger+Stochastic+Volume, all-day
+    HEDGED_SELL Iron Condor (sell OTM CE+PE, buy hedge), entry 9:30-10:15
 
   PCR SOURCE:
     WsPCR — computed from Zerodha WebSocket OI data (no NSE HTTP).
@@ -44,8 +45,8 @@
     ZERODHA_PASSWORD     Zerodha login password
     ZERODHA_TOTP_SECRET  Base32 TOTP secret from Zerodha 2FA setup page
 
-  RESOURCE SAVINGS (all 4 strategies share):
-    1 WebSocket instead of 4 (Zerodha limit: 3 per account)
+  RESOURCE SAVINGS (all 5 strategies share):
+    1 WebSocket instead of 5 (Zerodha limit: 3 per account)
     1 Kite session (avoids double login issues)
     1 NFO instruments call (saves ~2sec + API quota)
     1 VIX fetch (NSE rate-limits aggressive scrapers)
@@ -54,6 +55,7 @@
     ScalperV7 NO LONGER makes REST polling calls for candles
      candles are built live from the shared WebSocket ticks
     Same ATM option token  MarketHub deduplicates subscriptions
+
 
 """
 
@@ -87,20 +89,22 @@ from core.pcr_kite    import WsPCR
 from core.order_router import OrderRouter
 
 # ── Strategies — ADD/REMOVE here to enable/disable ──────────────────────────
-from strategies.spike               import SpikeStrategy
-from strategies.orb_v2              import ORBStrategy
-from strategies.scalper_v7_strategy import ScalperV7Strategy
-from strategies.bb_stoch_strategy   import BBStochStrategy
+from strategies.spike                import SpikeStrategy
+from strategies.orb_v2               import ORBStrategy
+from strategies.scalper_v7_strategy  import ScalperV7Strategy
+from strategies.bb_stoch_strategy    import BBStochStrategy
+from strategies.hedged_sell_strategy import HedgedSellStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
 #  Order matters: first in list = first to receive ticks
 # ─────────────────────────────────────────────────────────────────────────────
 ACTIVE_STRATEGIES = [
-    SpikeStrategy,       # Spike:      9:15-9:30   gap/spike trade
-    ORBStrategy,         # ORB v2:     9:40-10:15  breakout trade
-    ScalperV7Strategy,   # Scalper V7: all-day,    11-filter momentum scalper
-    BBStochStrategy,     # BB+Stoch:   all-day,    Bollinger+Stochastic+Volume
+    SpikeStrategy,       # Spike:        9:15-9:30   gap/spike trade
+    ORBStrategy,         # ORB v2:       9:40-10:15  breakout trade
+    ScalperV7Strategy,   # Scalper V7:   all-day,    11-filter momentum scalper
+    BBStochStrategy,     # BB+Stoch:     all-day,    Bollinger+Stochastic+Volume
+    HedgedSellStrategy,  # Hedged Sell:  9:30-10:15  Iron Condor option selling
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,48 +117,36 @@ PREMARKET_TIME = dtime(9,  8)    # Start pre-market setup at 9:08 AM IST
 MARKET_START   = dtime(9, 14)    # Start WebSocket at 9:14 AM IST
 MARKET_END     = dtime(15, 0)    # MarketHub forces WS close at 3:31 PM IST
 
-# WsPCR config — subscribe ATM ± PCR_RANGE pt CE+PE tokens for OI-based PCR
-# BankNifty strikes are 100pt apart. range=1000 → 21 strikes each side = 42 tokens.
-# Most overlap with BB_STOCH ATM±400 tokens (deduped by hub.subscribe()).
-PCR_SPOT_RANGE = 1000   # points either side of ATM
-PCR_STRIKE_STEP = 100   # BankNifty strike interval
+PCR_SPOT_RANGE  = 1000   # points either side of ATM
+PCR_STRIKE_STEP = 100    # strike interval for WsPCR subscriptions
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LOGGING — Separate log file per strategy + core.log for everything else
-#
-#  Files written to logs/ :
-#    core.log        ← t.py, core/market_hub, core/auto_login, core/premarket,
-#                       core/pcr_kite, scalper_v7_core/*
-#    spike.log       ← strategies/spike.py          (logger "strategy.spike")
-#    orb_v2.log      ← strategies/orb_v2.py         (logger "strategy.orb")
-#    scalper_v7.log  ← strategies/scalper_v7_strategy.py (logger "strategy.scalper_v7")
-#    bb_stoch.log    ← strategies/bb_stoch_strategy.py  (logger "strategy.bb_stoch")
+#  LOGGING SETUP
 # ─────────────────────────────────────────────────────────────────────────────
 def setup_logging():
-    import logging.handlers
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    fmt       = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-    datefmt   = "%Y-%m-%d %H:%M:%S"
-    formatter = logging.Formatter(fmt, datefmt=datefmt)
-
     def _file(filename):
-        h = logging.handlers.RotatingFileHandler(
+        h = logging.FileHandler(
             os.path.join(LOG_DIR, filename),
-            maxBytes=10 * 1024 * 1024,   # 10 MB
-            backupCount=5,
             encoding="utf-8",
-            mode="a",
         )
-        h.setFormatter(formatter)
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+            datefmt="%H:%M:%S",
+        ))
         return h
 
     def _console():
         h = logging.StreamHandler(sys.stdout)
-        h.setFormatter(formatter)
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+            datefmt="%H:%M:%S",
+        ))
         return h
 
-    # ── Root logger → core.log (catches t, core.*, scalper_v7_core.*) ─────────
+    # Root logger → core.log + console
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     root.addHandler(_file("core.log"))
@@ -162,10 +154,11 @@ def setup_logging():
 
     # ── Per-strategy loggers → own file, propagate=False (skip core.log) ──────
     _STRAT = {
-        "strategy.spike":      "spike.log",
-        "strategy.orb":        "orb_v2.log",
-        "strategy.scalper_v7": "scalper_v7.log",
-        "strategy.bb_stoch":   "bb_stoch.log",
+        "strategy.spike":        "spike.log",
+        "strategy.orb":          "orb_v2.log",
+        "strategy.scalper_v7":   "scalper_v7.log",
+        "strategy.bb_stoch":     "bb_stoch.log",
+        "strategy.hedged_sell":  "hedged_sell.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -210,7 +203,7 @@ def main():
     print("""
 
         ══ MULTI-STRATEGY TRADER ══ python t.py ══
-     SPIKE  +  ORB v2  +  SCALPER V7  +  BB STOCH  (paper mode)
+     SPIKE  +  ORB v2  +  SCALPER V7  +  BB STOCH  +  HEDGED SELL  (paper mode)
 
 """)
 
@@ -228,9 +221,6 @@ def main():
     hub.load_kite()
 
     # ── Create OrderRouter (single point for all order placement) ─────────────
-    # Attached to hub so every strategy can reach it via self._hub.order_router.
-    # All strategies start with LIVE_MODE=False (paper only).
-    # To go live for a specific strategy, set LIVE_MODE=True in that strategy file.
     hub.order_router = OrderRouter(hub)
     log.info("OrderRouter attached to hub (all strategies in PAPER mode by default)")
 
@@ -248,7 +238,7 @@ def main():
     log.info(f"{len(strategies)} strategies loaded: {[s.name for s in strategies]}")
 
     # ── Sleep until pre-market setup time (9:08 AM IST) ──────────────────────
-    now = now_ist()   # ← IST fix: was datetime.now() which gave UTC on GitHub
+    now = now_ist()
     if now.time() < PREMARKET_TIME:
         wait = (datetime.combine(now.date(), PREMARKET_TIME) - now).seconds
         log.info(f"Waiting {wait}s until 9:08 AM IST pre-market setup...")
@@ -262,16 +252,6 @@ def main():
     pm.fetch_all(hub.kite, index_token=260105, instruments=instruments)
 
     # ── WsPCR setup ───────────────────────────────────────────────────────────
-    # Create WsPCR AFTER fetch_all() so expiry_date is available.
-    # setup() subscribes ATM±PCR_SPOT_RANGE CE+PE tokens.
-    # Since the WebSocket isn't connected yet, hub.last_price(index_token)
-    # returns None — WsPCR.setup() detects this and defers subscriptions
-    # to the first compute_pcr() call (which happens at 9:16 AM after the
-    # WebSocket has connected and the first index tick has arrived).
-    #
-    # Token count: range=1000, step=100 → 21 strikes × 2 types = 42 tokens.
-    # ~20 of these overlap with BB_STOCH's ATM±400 (deduped by hub.subscribe()).
-    # Net new subscriptions: ~22 tokens. Negligible bandwidth overhead.
     log.info("=" * 60)
     log.info("  WsPCR SETUP — WebSocket OI-based PCR")
     log.info("=" * 60)
@@ -284,7 +264,7 @@ def main():
             spot_range  = PCR_SPOT_RANGE,
             step        = PCR_STRIKE_STEP,
         )
-        ws_pcr.setup()   # deferred if WS not yet connected — OK
+        ws_pcr.setup()
         log.info(
             f"  WsPCR ready | expiry={pm.expiry_date} | "
             f"range=±{PCR_SPOT_RANGE}pt | step={PCR_STRIKE_STEP}pt"
@@ -293,13 +273,11 @@ def main():
         log.warning("  WsPCR skipped — expiry_date not available (fetch_all failed?)")
 
     # ── Live refresh: VIX every 5 min, PCR every 10 min ──────────────────────
-    # When ws_pcr is not None, PCR is read from WebSocket OI (no NSE HTTP).
-    # When ws_pcr is None (expiry fetch failed), NSE HTTP fallback is used.
     pm.start_live_refresh(
         hub._done,
         vix_interval=300,
         pcr_interval=600,
-        ws_pcr=ws_pcr,        # ← NEW: wire WsPCR into the refresh loop
+        ws_pcr=ws_pcr,
     )
 
     # ── Call each strategy's pre_market() with shared data ───────────────────
@@ -326,7 +304,7 @@ def main():
     hub.backfill(hub.kite, index_token=260105)
 
     # ── Sleep until WebSocket start time (9:14 AM IST) ───────────────────────
-    now = now_ist()   # ← IST fix: was datetime.now() which gave UTC on GitHub
+    now = now_ist()
     if now.time() < MARKET_START:
         wait = (datetime.combine(now.date(), MARKET_START) - now).seconds
         log.info(f"Waiting {wait}s until 9:14 AM IST to start WebSocket...")
@@ -360,4 +338,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
