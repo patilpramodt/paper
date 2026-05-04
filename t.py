@@ -20,11 +20,13 @@
 
   ACTIVE STRATEGIES:
 
-    SPIKE       9:15 gap/spike trade, exits by 9:30
-    ORB_v2      Opening range breakout, entry 9:40-10:15
-    SCALPER_V7  Intraday scalper (11 filters), all-day 9:45-14:30
-    BB_STOCH    Bollinger+Stochastic+Volume, all-day
-    HEDGED_SELL Iron Condor (sell OTM CE+PE, buy hedge), entry 9:30-10:15
+    SPIKE        9:15 gap/spike trade, exits by 9:30
+    ORB_v2       Opening range breakout, entry 9:40-10:15
+    SCALPER_V7   Intraday scalper (11 filters), all-day 9:45-14:30
+    BB_STOCH     Bollinger+Stochastic+Volume, all-day
+    HEDGED_SELL  Iron Condor (sell OTM CE+PE, buy hedge), entry 9:30-10:15
+    SMART_HEDGE  Directional spread — scores PCR+EMA+gap+candle, auto-picks
+                 Bull Put Spread / Bear Call Spread / Iron Condor, entry 9:35-10:15
 
   PCR SOURCE:
     WsPCR — computed from Zerodha WebSocket OI data (no NSE HTTP).
@@ -45,8 +47,8 @@
     ZERODHA_PASSWORD     Zerodha login password
     ZERODHA_TOTP_SECRET  Base32 TOTP secret from Zerodha 2FA setup page
 
-  RESOURCE SAVINGS (all 5 strategies share):
-    1 WebSocket instead of 5 (Zerodha limit: 3 per account)
+  RESOURCE SAVINGS (all 6 strategies share):
+    1 WebSocket instead of 6 (Zerodha limit: 3 per account)
     1 Kite session (avoids double login issues)
     1 NFO instruments call (saves ~2sec + API quota)
     1 VIX fetch (NSE rate-limits aggressive scrapers)
@@ -94,6 +96,7 @@ from strategies.orb_v2               import ORBStrategy
 from strategies.scalper_v7_strategy  import ScalperV7Strategy
 from strategies.bb_stoch_strategy    import BBStochStrategy
 from strategies.hedged_sell_strategy import HedgedSellStrategy
+from strategies.smart_hedge_strategy import SmartHedgeStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -104,7 +107,8 @@ ACTIVE_STRATEGIES = [
     ORBStrategy,         # ORB v2:       9:40-10:15  breakout trade
     ScalperV7Strategy,   # Scalper V7:   all-day,    11-filter momentum scalper
     BBStochStrategy,     # BB+Stoch:     all-day,    Bollinger+Stochastic+Volume
-    HedgedSellStrategy,  # Hedged Sell:  9:30-10:15  Iron Condor option selling
+    HedgedSellStrategy,  # Hedged Sell:  9:30-10:15  Iron Condor (classic, no direction filter)
+    SmartHedgeStrategy,  # Smart Hedge:  9:35-10:15  Auto-directional: Bull Put / Bear Call / Condor
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,6 +163,7 @@ def setup_logging():
         "strategy.scalper_v7":   "scalper_v7.log",
         "strategy.bb_stoch":     "bb_stoch.log",
         "strategy.hedged_sell":  "hedged_sell.log",
+        "strategy.smart_hedge":  "smart_hedge.log",   # ← new
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -203,7 +208,7 @@ def main():
     print("""
 
         ══ MULTI-STRATEGY TRADER ══ python t.py ══
-     SPIKE  +  ORB v2  +  SCALPER V7  +  BB STOCH  +  HEDGED SELL  (paper mode)
+  SPIKE + ORB v2 + SCALPER V7 + BB STOCH + HEDGED SELL + SMART HEDGE  (paper mode)
 
 """)
 
@@ -338,3 +343,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
