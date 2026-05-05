@@ -340,7 +340,7 @@ class SmartHedgeStrategy(BaseStrategy):
         self._vix         = premarket_data.vix
 
         # Try to get EMA200 from premarket (set by ORB or premarket module)
-        self._ema200 = getattr(premarket_data, "ema200", None)
+        self._ema200 = getattr(premarket_data, "ema200_daily", None)
 
         if self._expiry_date is None:
             log.warning("[SMART_HEDGE] expiry_date not available — skipping today")
@@ -601,7 +601,7 @@ class SmartHedgeStrategy(BaseStrategy):
             )
         else:
             log.info(
-                f"[SMART_HEDGE]   VIX={vix:.1f if vix else 'N/A'} ≤ {CFG['vix_max']} → "
+                f"[SMART_HEDGE]   VIX={f'{vix:.1f}' if vix else 'N/A'} ≤ {CFG['vix_max']} → "
                 f"full size qty={qty}"
             )
 
@@ -1074,4 +1074,5 @@ class SmartHedgeStrategy(BaseStrategy):
                 f"{vix:.1f}"    if isinstance(vix,    float) else vix,
                 f"{gap:.0f}"    if isinstance(gap,    float) else gap,
             ])
+
 
