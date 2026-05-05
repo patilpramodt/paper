@@ -298,11 +298,21 @@ class ORBStrategy(BaseStrategy):
         # Breakout detection (HIGH/LOW)
         if   candle["high"] > orh: direction = "CE"
         elif candle["low"]  < orl: direction = "PE"
-        else: return
+        else:
+            log.info(f"[{self.name}]  {ts.strftime('%H:%M')} no breakout | "
+                     f"H={candle['high']:.0f} L={candle['low']:.0f} "
+                     f"OR=[{orl:.0f}~{orh:.0f}] — watching")
+            return
 
         # Confirmation: close must be beyond OR (reject wick-only)
-        if direction == "CE" and candle["close"] <= orh: return
-        if direction == "PE" and candle["close"] >= orl: return
+        if direction == "CE" and candle["close"] <= orh:
+            log.info(f"[{self.name}]  {ts.strftime('%H:%M')} CE wick rejected | "
+                     f"high={candle['high']:.0f} > ORH={orh:.0f} but close={candle['close']:.0f} ≤ ORH")
+            return
+        if direction == "PE" and candle["close"] >= orl:
+            log.info(f"[{self.name}]  {ts.strftime('%H:%M')} PE wick rejected | "
+                     f"low={candle['low']:.0f} < ORL={orl:.0f} but close={candle['close']:.0f} ≥ ORL")
+            return
 
         # 200 EMA trend filter
         if self._ema200:
@@ -322,7 +332,7 @@ class ORBStrategy(BaseStrategy):
                 log.info(f"[{self.name}]  PCR={self._pcr:.2f} > max={CFG['pcr_max']}  skip PE")
                 return
         else:
-            log.debug(f"[{self.name}]  PCR unavailable  skipping PCR filter")
+            log.info(f"[{self.name}]  PCR unavailable — skipping PCR filter")
 
         # FIX (Bug 5+6): use _candle_buf (full OHLCV dicts) instead of _cb.get_closed().
         # _candle_buf already has the current candle appended (done in on_candle before here),
@@ -355,7 +365,7 @@ class ORBStrategy(BaseStrategy):
                          f"(close={ind['close']:.0f}) — skip")
                 return
         else:
-            log.debug(f"[{self.name}]  VWAP unavailable — gate skipped")
+            log.info(f"[{self.name}]  VWAP unavailable — gate skipped")
 
         # ── Scoring (max 9.0 — Volume and VWAP removed, weights redistributed) ──
         score, details = self._score(ind, direction)
@@ -728,3 +738,4 @@ class ORBStrategy(BaseStrategy):
             log.info(f"[{self.name}]   #{i} {t['direction']} {t['exit_reason']} "
                      f"{t['pnl_total']:,.0f}")
         log.info(f"[{self.name}] {'─'*50}\n")
+
