@@ -217,7 +217,7 @@ CFG = {
     "exit_cooldown"     : 2.0,      # seconds between exit attempts
 
     # Risk
-    "max_trades_day"    : 4,
+    "max_trades_day"    : 999999,  # Paper mode: unlimited trades (was 4)
     "post_sl_cooldown"  : 120,      # 2 min wait after any SL hit
     "max_daily_loss"    : 6000,     # Rs circuit breaker
     "quantity"          : 30,       # lots
