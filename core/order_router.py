@@ -98,8 +98,8 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 # SELL limit = LTP × (1 − SELL_SLIP)  — accept down to 2% below last price
 # Both rounded to NFO tick size (₹0.05).
 # Increase if fills are missed on highly volatile opens; decrease to save cost.
-BUY_SLIP   = 0.03   # 3%
-SELL_SLIP  = 0.03   # 3%
+BUY_SLIP   = 1.1   # 11%
+SELL_SLIP  = 1.1   # 11%
 TICK_SIZE  = 0.05   # NFO options tick
 
 
