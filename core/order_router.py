@@ -51,7 +51,7 @@ Central order execution layer — single point for all live order placement.
 
    Default: ALL strategies are paper. Change only the one you want to go live.
 
-4. Order status confirmation
+4. Order status confirmation + actual fill price
 
    After kite.place_order() returns an order_id, we poll kite.order_history()
    until the order reaches a terminal state (COMPLETE / REJECTED / CANCELLED)
@@ -61,12 +61,30 @@ Central order execution layer — single point for all live order placement.
    no quotes at that ms) and the bot would manage a phantom SL and eventually
    fire a SELL against a position that never existed.
 
-   _confirm_order() returns one of:
-     "COMPLETE"      → fill confirmed, caller may treat trade as open
-     "REJECTED"      → exchange rejected; caller must abort entry / alert on sell
-     "CANCELLED"     → order was cancelled (should not happen for LIMIT)
-     "TIMEOUT"       → did not reach terminal state in time; caller treats as failed
-     "TOKEN_EXPIRED" → access token invalid mid-session; caller must abort + alert
+   _confirm_order() returns a tuple:
+     (status, avg_price)
+
+   Where status is one of:
+     "COMPLETE"      → fill confirmed, avg_price is the actual exchange fill price
+     "REJECTED"      → exchange rejected; avg_price is 0.0
+     "CANCELLED"     → order was cancelled; avg_price is 0.0
+     "TIMEOUT"       → did not reach terminal state in time; avg_price is 0.0
+     "TOKEN_EXPIRED" → access token invalid mid-session; avg_price is 0.0
+
+   place_buy() / place_sell() return a tuple:
+     (order_id, fill_price)  on success
+     None                    on failure
+
+   Callers must unpack:
+     result = self._place_buy(sym, token, qty, ltp)
+     if result is None:
+         # handle failure
+     order_id, fill_price = result
+
+   Using the actual fill_price (from order_history average_price) for SL
+   calculation is more accurate than the pre-order LTP, especially at
+   volatile 9:15 AM opens where the price can move 20–30 pts during the
+   ~15s _confirm_order() polling window.
 
 5. Token / session expiry mid-session
 
@@ -87,7 +105,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 log = logging.getLogger("core.router")
 
@@ -98,9 +116,9 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 # SELL limit = LTP × (1 − SELL_SLIP)  — accept down to 2% below last price
 # Both rounded to NFO tick size (₹0.05).
 # Increase if fills are missed on highly volatile opens; decrease to save cost.
-BUY_SLIP   = 0.1   # 11%
-SELL_SLIP  = 0.1   # 11%
-TICK_SIZE  = 0.05   # NFO options tick
+BUY_SLIP   = 0.1   # 10%
+SELL_SLIP  = 0.1   # 10%
+TICK_SIZE  = 0.05  # NFO options tick
 
 
 def _now_ist() -> datetime:
@@ -111,8 +129,8 @@ def _limit_price(ltp: float, side: str) -> float:
     """
     Round ltp ± slippage buffer to nearest NFO tick (₹0.05).
 
-    BUY  → ltp × 1.02 rounded UP   (ensures we're above the ask)
-    SELL → ltp × 0.98 rounded DOWN  (ensures we're below the bid)
+    BUY  → ltp × 1.10 rounded UP   (ensures we're above the ask)
+    SELL → ltp × 0.90 rounded DOWN  (ensures we're below the bid)
 
     Minimum price floored at TICK_SIZE to avoid zero/negative prices on
     very cheap OTM options.
@@ -132,17 +150,21 @@ class OrderRouter:
     Single point for all order placement across all strategies.
     Thread-safe. Enforces one-live-trade-at-a-time when in live mode.
 
+    place_buy() and place_sell() return a (order_id, fill_price) tuple on
+    success, or None on failure. Callers must check for None before unpacking.
+
     Usage in a strategy:
 
         # Entry
-        ok = self._hub.order_router.acquire_slot(self.name, LIVE_MODE)
-        if not ok:
-            return  # another live strategy already has a position
-        oid = self._hub.order_router.place_buy(self.name, symbol, token, qty, ltp, LIVE_MODE)
+        result = self._place_buy(symbol, token, qty, ltp)
+        if result is None:
+            return  # order failed
+        order_id, fill_price = result
+        sl = fill_price - INITIAL_SL_BUFFER   # use actual fill price for SL
 
         # Exit
-        self._hub.order_router.place_sell(self.name, symbol, token, qty, ltp, LIVE_MODE)
-        self._hub.order_router.release_slot(self.name, LIVE_MODE)
+        result = self._place_sell(symbol, token, qty, ltp)
+        # result may be None if sell failed — handle accordingly
     """
 
     def __init__(self, hub):
@@ -221,15 +243,19 @@ class OrderRouter:
         qty:           int,
         ltp:           float,
         live_mode:     bool,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Place a BUY (entry) order.
 
-        live_mode=False → paper fill logged; returns "PAPER-{ms}"
-        live_mode=True  → LIMIT MIS order via Kite at LTP + 2% buffer;
-                          returns order_id string ONLY when exchange confirms COMPLETE.
+        live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
+        live_mode=True  → LIMIT MIS order via Kite at LTP + buffer;
+                          returns (order_id, actual_fill_price) ONLY when
+                          exchange confirms COMPLETE.
 
-        Returns order_id / paper_id, or None on failure.
+        Returns (order_id, fill_price) on success, or None on failure.
+        fill_price is the actual average price from the exchange (live) or
+        the simulated LTP (paper). Use this for SL calculation, not the
+        pre-order LTP.
         """
         if live_mode:
             return self._live_order(
@@ -246,15 +272,16 @@ class OrderRouter:
         qty:           int,
         ltp:           float,
         live_mode:     bool,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Place a SELL (exit) order.
 
-        live_mode=False → paper fill logged; returns "PAPER-{ms}"
-        live_mode=True  → LIMIT MIS order via Kite at LTP − 2% buffer;
-                          returns order_id string ONLY when exchange confirms COMPLETE.
+        live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
+        live_mode=True  → LIMIT MIS order via Kite at LTP − buffer;
+                          returns (order_id, actual_fill_price) ONLY when
+                          exchange confirms COMPLETE.
 
-        Returns order_id / paper_id, or None on failure.
+        Returns (order_id, fill_price) on success, or None on failure.
         """
         if live_mode:
             return self._live_order(
@@ -274,14 +301,21 @@ class OrderRouter:
         qty:              int,
         ltp:              float,
         transaction_type: str,   # "BUY" or "SELL"
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Place a LIMIT MIS order on NFO and confirm it reached the exchange.
+
+        Returns (order_id, fill_price) on COMPLETE, None on any failure.
+
+        fill_price is taken from order_history[last]["average_price"] — the
+        actual exchange-confirmed average fill price. This is more accurate
+        than the pre-order LTP for SL calculation, especially at volatile
+        9:15 AM opens.
 
         Why LIMIT with buffer (not MARKET):
           - Zerodha API rejects plain MARKET orders for options:
               "Market orders without market protection are not allowed via API."
-          - LIMIT at LTP ± 2% fills in milliseconds on liquid ATM strikes.
+          - LIMIT at LTP ± buffer fills in milliseconds on liquid ATM strikes.
           - Buffer absorbs spread and slippage at volatile 9:15 AM opens.
           - Tick-rounded to ₹0.05 as required by NSE for NFO options.
 
@@ -291,7 +325,7 @@ class OrderRouter:
           3. place_order() → order_id.
           4. _confirm_order() polls order_history() until COMPLETE / REJECTED /
              CANCELLED / TIMEOUT / TOKEN_EXPIRED.
-          5. Return order_id only on COMPLETE; None on anything else.
+          5. Return (order_id, fill_price) only on COMPLETE; None otherwise.
         """
         kite = self._hub.kite
         if kite is None:
@@ -317,7 +351,7 @@ class OrderRouter:
                 quantity         = qty,
                 product          = kite.PRODUCT_MIS,
                 order_type       = kite.ORDER_TYPE_LIMIT,   # ← LIMIT, not MARKET
-                price            = limit_px,                # ← LTP ± 2% buffer
+                price            = limit_px,                # ← LTP ± buffer
             )
             log.info(
                 f"[Router][LIVE] {transaction_type} PLACED | "
@@ -354,14 +388,19 @@ class OrderRouter:
         #   • The order hits OI / position limits
         # Without confirmation, the bot would manage a phantom SL and later
         # fire a SELL against a position that never existed.
-        status = self._confirm_order(str(order_id))
+        #
+        # _confirm_order() also returns the actual average fill price from
+        # order_history so callers can use the real fill price for SL calculation
+        # instead of the pre-order LTP (which may be stale after ~15s of polling).
+        status, fill_price = self._confirm_order(str(order_id), fallback_price=ltp)
 
         if status == "COMPLETE":
             log.info(
                 f"[Router][LIVE] {transaction_type} CONFIRMED ✓ | "
-                f"{strategy_name} | {symbol} | order_id={order_id}"
+                f"{strategy_name} | {symbol} | "
+                f"fill_price={fill_price:.2f} | order_id={order_id}"
             )
-            return str(order_id)
+            return str(order_id), fill_price
 
         elif status == "TOKEN_EXPIRED":
             log.error(
@@ -398,13 +437,30 @@ class OrderRouter:
 
     def _confirm_order(
         self,
-        order_id:      str,
-        timeout_sec:   float = 15.0,
-        poll_interval: float = 0.5,
-    ) -> str:
+        order_id:       str,
+        fallback_price: float = 0.0,
+        timeout_sec:    float = 15.0,
+        poll_interval:  float = 0.5,
+    ) -> Tuple[str, float]:
         """
-        Poll kite.order_history(order_id) until the order reaches a terminal state
-        or the timeout expires.
+        Poll kite.order_history(order_id) until the order reaches a terminal
+        state or the timeout expires.
+
+        Returns a tuple: (status, avg_price)
+
+          status values:
+            "COMPLETE"      → exchange filled the order; avg_price is real fill
+            "REJECTED"      → exchange rejected; avg_price is 0.0
+            "CANCELLED"     → order was cancelled; avg_price is 0.0
+            "TIMEOUT"       → timed out; avg_price is 0.0
+            "TOKEN_EXPIRED" → session ended mid-poll; avg_price is 0.0
+
+          avg_price:
+            On COMPLETE — taken from order_history[last]["average_price"].
+            Falls back to fallback_price (pre-order LTP) if average_price is
+            missing or zero in the history response (should not happen on
+            Zerodha for a COMPLETE order, but defensive).
+            0.0 for all non-COMPLETE statuses.
 
         Terminal states returned by NSE via Zerodha:
           "COMPLETE"  → exchange filled the order (normal outcome for LIMIT + buffer)
@@ -419,13 +475,6 @@ class OrderRouter:
           "TRIGGER PENDING"         → SL trigger not yet hit (not applicable here)
           "MODIFY PENDING"          → modification in progress
           "CANCEL PENDING"          → cancellation in progress
-
-        Returns one of:
-          "COMPLETE"      — normal success path
-          "REJECTED"      — exchange rejected; entry must be aborted
-          "CANCELLED"     — order was cancelled
-          "TIMEOUT"       — timed out; treat as failed, check console
-          "TOKEN_EXPIRED" — session ended mid-poll; check console immediately
         """
         TERMINAL = {"COMPLETE", "REJECTED", "CANCELLED"}
         deadline = time.monotonic() + timeout_sec
@@ -443,18 +492,33 @@ class OrderRouter:
                     time.sleep(poll_interval)
                     continue
 
-                status = history[-1].get("status", "").upper()
+                last   = history[-1]
+                status = last.get("status", "").upper()
                 log.debug(
                     f"[Router] order_history({order_id}) attempt={attempt} "
                     f"status={status}"
                 )
 
                 if status in TERMINAL:
+                    # Extract actual fill price on COMPLETE
+                    avg_price = 0.0
+                    if status == "COMPLETE":
+                        raw_avg = last.get("average_price") or 0.0
+                        avg_price = float(raw_avg) if raw_avg else fallback_price
+                        if avg_price <= 0:
+                            # Defensive fallback — should not happen for COMPLETE
+                            avg_price = fallback_price
+                            log.warning(
+                                f"[Router] order {order_id} COMPLETE but "
+                                f"average_price missing — using fallback {fallback_price:.2f}"
+                            )
+
                     log.info(
                         f"[Router] order_history({order_id}) → {status} "
                         f"after {attempt} poll(s)"
+                        + (f" | avg_fill={avg_price:.2f}" if status == "COMPLETE" else "")
                     )
-                    return status
+                    return status, avg_price
 
                 if attempt == 1 or attempt % 5 == 0:
                     log.info(
@@ -473,7 +537,7 @@ class OrderRouter:
                         f"  → Restart the bot with a fresh token before next trade.\n"
                         f"{'!'*60}"
                     )
-                    return "TOKEN_EXPIRED"
+                    return "TOKEN_EXPIRED", 0.0
 
                 log.warning(
                     f"[Router] order_history({order_id}) poll error "
@@ -491,7 +555,7 @@ class OrderRouter:
             f"  → Bot treats this as FAILED to prevent phantom position management.\n"
             f"{'!'*60}"
         )
-        return "TIMEOUT"
+        return "TIMEOUT", 0.0
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Internal — token / session expiry detection
@@ -532,11 +596,12 @@ class OrderRouter:
         strategy_name: str,
         symbol:        str,
         ltp:           float,
-    ) -> str:
+    ) -> Tuple[str, float]:
         fake_id = f"PAPER-{int(time.time() * 1000)}"
         log.info(
             f"[Router][PAPER] {side} simulated | "
             f"{strategy_name} | {symbol} | ltp={ltp:.2f} | id={fake_id}"
         )
-        return fake_id
+        # Paper fill: return ltp as fill_price (no slippage simulated)
+        return fake_id, ltp
 
