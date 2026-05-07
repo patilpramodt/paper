@@ -27,11 +27,16 @@ TRAILING SL (software, tick-by-tick)
   trail_distance    : SL trails this many pts below highest_seen
   Both live and paper mode use identical trail logic.
 
-FIXES APPLIED (unchanged from previous version)
+FIXES APPLIED
   - pre_market() subscribes ATM CE+PE even when prev_close is None.
   - on_tick() subscribes ATM options on very first market tick if
     pre-subscription failed.
   - Pending entry mechanism for stale/missing pre-9:15 option prices.
+  - [BUG FIX] SL grace period: SL check is suppressed for
+    SL_GRACE_SECONDS after entry to prevent stale/volatile ticks
+    immediately after the BUY confirm from triggering a false SL exit.
+  - [BUG FIX] Unused option unsubscribed after entry to prevent
+    spurious on_option_tick calls from the idle leg.
 """
 
 import csv
@@ -73,6 +78,13 @@ CFG = {
     "bucket_sec"             : 8,
     "min_candles_before_mom" : 2,
     "csv_file"               : "spike_trades.csv",
+    # ── BUG FIX: SL grace period ──────────────────────────────────────────────
+    # After a live BUY confirm, the WebSocket may deliver ticks that were
+    # buffered during the _confirm_order() polling window (up to ~15s).
+    # These stale ticks can show a price that has already dropped below the SL,
+    # triggering an immediate exit 2 seconds after entry.
+    # Solution: ignore SL checks for this many seconds after entry fill.
+    "sl_grace_seconds"       : 10,
 }
 
 
@@ -224,6 +236,15 @@ class SpikeStrategy(BaseStrategy):
           1. Resolve pending gap entry (if option had no valid price at signal time).
           2. Software trailing SL management — check on EVERY tick.
              When SL breached: fire MARKET sell immediately (no exchange SL order).
+
+        BUG FIX — SL grace period:
+          After a live BUY is confirmed, _confirm_order() may have blocked for
+          several seconds while polling the exchange. During that window, WebSocket
+          ticks accumulate in the queue. The first ticks delivered after unblocking
+          can carry prices from those buffered seconds — prices that may already be
+          below the initial SL due to 9:15 AM volatility.
+          To prevent a false SL exit 2 seconds after entry, SL checks are skipped
+          for SL_GRACE_SECONDS after the entry fill time.
         """
         # 1. Resolve pending gap entry
         if self._pending_entry and token == self._pending_entry["token"] and not self._trade:
@@ -258,6 +279,19 @@ class SpikeStrategy(BaseStrategy):
             log.info(f"[{self.name}] TSL: {self._trade['sl']:.0f} → {new_sl:.0f} "
                      f"(highest={self._trade['highest_seen']:.0f})")
             self._trade["sl"] = new_sl
+
+        # ── BUG FIX: SL grace period ──────────────────────────────────────────
+        # Skip SL check for sl_grace_seconds after entry fill time.
+        # This prevents stale/buffered ticks (queued while _confirm_order() was
+        # polling the exchange) from triggering an immediate false SL exit.
+        sl_active_from = self._trade.get("sl_active_from")
+        if sl_active_from is not None and ts < sl_active_from:
+            log.debug(
+                f"[{self.name}] SL grace active — skipping SL check "
+                f"(ts={ts.strftime('%H:%M:%S')} < active_from={sl_active_from.strftime('%H:%M:%S')}) "
+                f"price={price:.0f} sl={self._trade['sl']:.0f}"
+            )
+            return
 
         # SL breached — MARKET sell immediately
         # (No exchange SL order is ever placed: SL-M not available for options,
@@ -394,11 +428,24 @@ class SpikeStrategy(BaseStrategy):
         Price guard: if option has no valid post-9:15 price yet, store a
         pending entry and return. on_option_tick() resolves it on first tick.
 
-        Live mode: places MARKET buy via OrderRouter.
+        Live mode: places LIMIT buy via OrderRouter and waits for exchange confirm.
         Paper mode: simulates fill at current LTP.
 
         NO exchange SL order is placed after entry. Trailing SL is managed
         purely in software via on_option_tick() on every WebSocket tick.
+
+        BUG FIX — unused option unsubscription:
+          Both CE and PE are pre-subscribed before market open (we don't know
+          which direction the gap will go). Once we enter on one leg, the other
+          keeps firing on_option_tick() calls with its own price. Although the
+          token-match guard prevents those ticks from interfering with SL logic,
+          unsubscribing the idle leg is cleaner and eliminates any future risk
+          of that leg's ticks being processed if the token check ever changes.
+
+        BUG FIX — SL grace period:
+          sl_active_from is set to ts + sl_grace_seconds after the BUY confirm.
+          on_option_tick() will not check SL until that time has passed, preventing
+          stale buffered ticks from triggering an immediate false SL exit.
         """
         opt_price = self.get_price(token)
         price_ts  = self.get_price_ts(token)
@@ -419,7 +466,7 @@ class SpikeStrategy(BaseStrategy):
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
             return
 
-        # Place BUY order (paper: simulated fill, live: MARKET order)
+        # Place BUY order (paper: simulated fill, live: LIMIT order confirmed by exchange)
         order_id = self._place_buy(sym, token, CFG["quantity"], opt_price)
         if order_id is None:
             # Live order failed — release slot and abort
@@ -428,20 +475,52 @@ class SpikeStrategy(BaseStrategy):
             return
 
         sl = opt_price - CFG["initial_sl_buffer"]
+
+        # ── BUG FIX: SL grace period ──────────────────────────────────────────
+        # _place_buy() in live mode blocks for up to ~15s inside _confirm_order().
+        # During that time, WebSocket ticks queue up. The first ticks delivered
+        # after unblocking may be stale prices from those buffered seconds.
+        # At 9:15 AM these can easily be 30+ pts below entry, triggering the SL
+        # instantly. We suppress SL checks for sl_grace_seconds after the fill
+        # so the bot only reacts to genuine real-time prices.
+        sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
+        log.info(
+            f"[{self.name}] SL grace period active until "
+            f"{sl_active_from.strftime('%H:%M:%S')} "
+            f"({CFG['sl_grace_seconds']}s after entry fill)"
+        )
+
         self._opt_8s = SecondCandleBuilder(seconds=CFG["bucket_sec"])
         self._trade = {
-            "state"       : "OPEN",
-            "symbol"      : sym,
-            "token"       : token,
-            "signal"      : signal,
-            "entry"       : opt_price,
-            "sl"          : sl,
-            "highest_seen": opt_price,
-            "entry_time"  : ts,
+            "state"        : "OPEN",
+            "symbol"       : sym,
+            "token"        : token,
+            "signal"       : signal,
+            "entry"        : opt_price,
+            "sl"           : sl,
+            "highest_seen" : opt_price,
+            "entry_time"   : ts,
+            "sl_active_from": sl_active_from,   # ← BUG FIX
             "gap_direction": self._gap_direction,
-            "order_id"    : order_id,
-            "qty"         : CFG["quantity"],
+            "order_id"     : order_id,
+            "qty"          : CFG["quantity"],
         }
+
+        # ── BUG FIX: unsubscribe the unused option leg ────────────────────────
+        # Both CE and PE were pre-subscribed. Now that we know which leg we
+        # entered, drop the other one so its ticks don't linger in the queue.
+        if signal == "CE" and self._pre_pe_token:
+            self.unsubscribe_option(self._pre_pe_token)
+            log.info(
+                f"[{self.name}] Unsubscribed unused PE leg: "
+                f"{self._pre_pe_sym} ({self._pre_pe_token})"
+            )
+        elif signal == "PE" and self._pre_ce_token:
+            self.unsubscribe_option(self._pre_ce_token)
+            log.info(
+                f"[{self.name}] Unsubscribed unused CE leg: "
+                f"{self._pre_ce_sym} ({self._pre_ce_token})"
+            )
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         log.info(f"[{self.name}] [{mode_tag}] ENTRY {sym} @ {opt_price:.0f} | "
