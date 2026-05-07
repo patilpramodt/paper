@@ -175,6 +175,8 @@ CFG = {
     "bb_std"            : 2.0,      # number of std deviations for bands
     "bb_squeeze_pct"    : 0.002,    # loosened: was 0.003 → 0.002 allows entries in tighter markets
                                     # band-width / close < this = squeeze (skip)
+    "bb_mid_squeeze_pct": 0.005,    # Stricter squeeze threshold for middle-band cross entries only
+                                    # Middle cross in a tight band = no real momentum → skip
 
     # Stochastic Oscillator
     "stoch_k"           : 9,        # %K lookback (lowered: was 14 → need=19 bars; 9 → need=14 bars matching min_bars)
@@ -443,6 +445,9 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         elif bb_bounce_up:
             mode = "bounce"
         else:
+            # Middle-band cross: require wider bands — tight bands = no momentum
+            if bb["bw_pct"] < CFG["bb_mid_squeeze_pct"]:
+                return {"action": "HOLD", "blocked_by": "bb_mid_squeeze", **base}
             mode = "middle"
         return {"action": "BUY_CE", "blocked_by": "", **base, "mode": mode}
 
@@ -471,6 +476,9 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         elif bb_bounce_dn:
             mode = "bounce"
         else:
+            # Middle-band cross: require wider bands — tight bands = no momentum
+            if bb["bw_pct"] < CFG["bb_mid_squeeze_pct"]:
+                return {"action": "HOLD", "blocked_by": "bb_mid_squeeze", **base}
             mode = "middle"
         return {"action": "BUY_PE", "blocked_by": "", **base, "mode": mode}
 
