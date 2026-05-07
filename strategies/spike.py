@@ -10,14 +10,14 @@ All other strategies remain in paper mode until their own flag is changed.
 
 ORDER EXECUTION (live mode)
 ────────────────────────────
-  Entry : REGULAR + MARKET + MIS via OrderRouter.place_buy()
-  Exit  : REGULAR + MARKET + MIS via OrderRouter.place_sell()
+  Entry : REGULAR + LIMIT + MIS via OrderRouter.place_buy()
+  Exit  : REGULAR + LIMIT + MIS via OrderRouter.place_sell()
 
   NO exchange SL orders are placed after entry.
   Reason: SL-M is not available for options on NSE/Zerodha.
           SL Limit can gap through the trigger entirely.
           We monitor the option price on every WebSocket tick (on_option_tick)
-          and fire a MARKET sell the moment the software SL is breached.
+          and fire a LIMIT sell the moment the software SL is breached.
           This is faster and more reliable than any exchange SL for options.
 
 TRAILING SL (software, tick-by-tick)
@@ -37,6 +37,9 @@ FIXES APPLIED
     immediately after the BUY confirm from triggering a false SL exit.
   - [BUG FIX] Unused option unsubscribed after entry to prevent
     spurious on_option_tick calls from the idle leg.
+  - [BUG FIX] SL now calculated from actual exchange fill price
+    (order_history average_price), not the pre-order LTP. Prevents
+    incorrect SL when the option moves during the ~15s confirm window.
 """
 
 import csv
@@ -434,13 +437,17 @@ class SpikeStrategy(BaseStrategy):
         NO exchange SL order is placed after entry. Trailing SL is managed
         purely in software via on_option_tick() on every WebSocket tick.
 
+        BUG FIX — actual fill price for SL:
+          _place_buy() now returns (order_id, fill_price) where fill_price is
+          the actual average_price from Zerodha's order_history after COMPLETE.
+          SL is calculated from fill_price, not the pre-order LTP. This prevents
+          an incorrectly wide or narrow SL when the option moves during the ~15s
+          _confirm_order() polling window.
+
         BUG FIX — unused option unsubscription:
-          Both CE and PE are pre-subscribed before market open (we don't know
-          which direction the gap will go). Once we enter on one leg, the other
-          keeps firing on_option_tick() calls with its own price. Although the
-          token-match guard prevents those ticks from interfering with SL logic,
-          unsubscribing the idle leg is cleaner and eliminates any future risk
-          of that leg's ticks being processed if the token check ever changes.
+          Both CE and PE are pre-subscribed before market open. Once we enter
+          on one leg, the other is unsubscribed to prevent its ticks from
+          lingering in the WebSocket queue.
 
         BUG FIX — SL grace period:
           sl_active_from is set to ts + sl_grace_seconds after the BUY confirm.
@@ -466,15 +473,26 @@ class SpikeStrategy(BaseStrategy):
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
             return
 
-        # Place BUY order (paper: simulated fill, live: LIMIT order confirmed by exchange)
-        order_id = self._place_buy(sym, token, CFG["quantity"], opt_price)
-        if order_id is None:
-            # Live order failed — release slot and abort
+        # ── BUG FIX: unpack (order_id, fill_price) tuple ─────────────────────
+        # _place_buy() returns (order_id, fill_price) on success, None on failure.
+        # fill_price is the actual exchange average_price (live) or LTP (paper).
+        # We use fill_price — not opt_price — for SL so the SL is always exactly
+        # initial_sl_buffer below the confirmed fill, regardless of market movement
+        # during the ~15s _confirm_order() polling window.
+        result = self._place_buy(sym, token, CFG["quantity"], opt_price)
+        if result is None:
             self._release_slot()
             log.error(f"[{self.name}] BUY order FAILED for {sym} — entry aborted")
             return
 
-        sl = opt_price - CFG["initial_sl_buffer"]
+        order_id, fill_price = result
+
+        log.info(
+            f"[{self.name}] BUY confirmed | pre_ltp={opt_price:.2f} "
+            f"fill_price={fill_price:.2f} | diff={fill_price - opt_price:+.2f}"
+        )
+
+        sl = fill_price - CFG["initial_sl_buffer"]
 
         # ── BUG FIX: SL grace period ──────────────────────────────────────────
         # _place_buy() in live mode blocks for up to ~15s inside _confirm_order().
@@ -492,18 +510,18 @@ class SpikeStrategy(BaseStrategy):
 
         self._opt_8s = SecondCandleBuilder(seconds=CFG["bucket_sec"])
         self._trade = {
-            "state"        : "OPEN",
-            "symbol"       : sym,
-            "token"        : token,
-            "signal"       : signal,
-            "entry"        : opt_price,
-            "sl"           : sl,
-            "highest_seen" : opt_price,
-            "entry_time"   : ts,
-            "sl_active_from": sl_active_from,   # ← BUG FIX
-            "gap_direction": self._gap_direction,
-            "order_id"     : order_id,
-            "qty"          : CFG["quantity"],
+            "state"         : "OPEN",
+            "symbol"        : sym,
+            "token"         : token,
+            "signal"        : signal,
+            "entry"         : fill_price,        # ← actual fill price, not pre-order LTP
+            "sl"            : sl,                # ← based on actual fill
+            "highest_seen"  : fill_price,
+            "entry_time"    : ts,
+            "sl_active_from": sl_active_from,    # ← grace period end time
+            "gap_direction" : self._gap_direction,
+            "order_id"      : order_id,
+            "qty"           : CFG["quantity"],
         }
 
         # ── BUG FIX: unsubscribe the unused option leg ────────────────────────
@@ -523,15 +541,15 @@ class SpikeStrategy(BaseStrategy):
             )
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
-        log.info(f"[{self.name}] [{mode_tag}] ENTRY {sym} @ {opt_price:.0f} | "
-                 f"SL={sl:.0f} | Trail kicks at {opt_price + CFG['trail_trigger_pts']:.0f} "
+        log.info(f"[{self.name}] [{mode_tag}] ENTRY {sym} @ {fill_price:.0f} | "
+                 f"SL={sl:.0f} | Trail kicks at {fill_price + CFG['trail_trigger_pts']:.0f} "
                  f"| Reason={reason} | order_id={order_id}")
 
         self._log_csv({
             "timestamp"    : ts.strftime("%Y-%m-%d %H:%M:%S"),
             "symbol"       : sym,
             "action"       : "ENTRY",
-            "price"        : opt_price,
+            "price"        : fill_price,
             "sl"           : sl,
             "status"       : "OPEN",
             "pnl"          : 0,
@@ -547,25 +565,29 @@ class SpikeStrategy(BaseStrategy):
         """
         Close the open position.
 
-        Live mode: places MARKET sell via OrderRouter, then releases slot.
+        Live mode: places LIMIT sell via OrderRouter, then releases slot.
         Paper mode: simulates fill at exit_price.
 
-        In both modes the SL is managed in software only — no exchange SL
-        order was placed at entry, so no cancellation is needed here.
+        _place_sell() returns (order_id, fill_price) on success, None on failure.
+        PnL is calculated from the confirmed sell fill_price for accuracy.
         """
         t = self._trade
         if not t or t["state"] != "OPEN":
             return
         t["state"] = "CLOSED"
 
-        # Place SELL order (paper: simulated, live: MARKET order)
-        sell_price = exit_price
-        order_id = self._place_sell(t["symbol"], t["token"], t["qty"], exit_price)
-        if LIVE_MODE and order_id is None:
-            # Live order failed — log loudly, still mark trade closed in software
-            log.error(f"[{self.name}] SELL order FAILED for {t['symbol']} — "
-                      f"trade marked closed in software but position may still be open in Zerodha! "
-                      f"Check and square off manually.")
+        # ── Place SELL and unpack confirmed fill price ────────────────────────
+        result = self._place_sell(t["symbol"], t["token"], t["qty"], exit_price)
+        if result is None:
+            if LIVE_MODE:
+                log.error(f"[{self.name}] SELL order FAILED for {t['symbol']} — "
+                          f"trade marked closed in software but position may still be open in Zerodha! "
+                          f"Check and square off manually.")
+            # Fall back to the SL trigger price for PnL logging
+            sell_price = exit_price
+            order_id   = None
+        else:
+            order_id, sell_price = result
 
         # Release global trade slot
         self._release_slot()
