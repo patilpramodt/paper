@@ -7,29 +7,30 @@ Central order execution layer — single point for all live order placement.
   DESIGN DECISIONS (read before modifying)
 ═══════════════════════════════════════════════════════════════════
 
-1. LIMIT orders with slippage buffer — NOT plain MARKET orders
+1. MARKET orders with market protection — fills at best available price
 
-   Zerodha's API now REJECTS plain MARKET orders for options with:
+   Zerodha's API requires market_protection for MARKET orders on options:
      "Market orders without market protection are not allowed via API."
 
-   Fix: use ORDER_TYPE_LIMIT with a small slippage buffer above LTP for BUY
-   and below LTP for SELL. This guarantees near-instant fill on liquid ATM
-   strikes at 9:15 AM while satisfying Zerodha's API requirement.
+   Fix: use ORDER_TYPE_MARKET with market_protection=-1 (auto protection).
+   This guarantees instant fill at the current best market price regardless
+   of how far price has moved from the last WebSocket tick — critical for
+   gap-open entries where LIMIT orders can miss entirely.
 
-   Buffer:
-     BUY  → price = round_tick(ltp × 1.02)   (+2% above LTP)
-     SELL → price = round_tick(ltp × 0.98)   (−2% below LTP)
+   market_protection values:
+     -1         → Auto protection applied by Zerodha/NSE (recommended)
+     1..100     → Custom protection percentage (e.g., 10 = ±10% band)
 
-   Tick size for NFO options is ₹0.05 — all prices rounded to nearest tick.
+   No price parameter is sent — the exchange matches at best available price
+   within the protection band.
 
-   Why not SL-M / IOC / BO / CO:
-     BO  (Bracket Orders)  — BLOCKED for all FnO since 2021 (SEBI directive)
-     CO  (Cover Orders)    — BLOCKED for FnO
-     SL-M                  — NOT available for options on NSE/Zerodha
-     SL Limit              — can gap through trigger entirely
-     IOC LIMIT             — rejection risk at 9:15 AM gap-open (stale price)
-     MARKET                — rejected by Zerodha API ("market protection" error)
-     LIMIT + buffer        — fills in ms on liquid ATM strikes ✓  ← used here
+   Why not LIMIT + buffer:
+     LIMIT            — can miss on fast gap-opens if LTP snapshot is stale
+                        (e.g., first WebSocket tick at 871, market at 980)
+     SL-M             — NOT available for options on NSE/Zerodha
+     IOC LIMIT        — same stale-price rejection risk at 9:15 AM
+     BO/CO            — BLOCKED for all FnO since 2021 (SEBI directive)
+     MARKET + protect — fills at whatever price market is trading ✓  ← used here
 
 2. One-live-trade-at-a-time slot
 
@@ -47,11 +48,11 @@ Central order execution layer — single point for all live order placement.
        LIVE_MODE = False   # change to True to enable real orders for that strategy
 
    When False → paper fill (no Kite API call, simulated fill at LTP).
-   When True  → real LIMIT order via kite.place_order().
+   When True  → real MARKET order via kite.place_order() with market protection.
 
    Default: ALL strategies are paper. Change only the one you want to go live.
 
-4. Order status confirmation + actual fill price
+4. Order status confirmation
 
    After kite.place_order() returns an order_id, we poll kite.order_history()
    until the order reaches a terminal state (COMPLETE / REJECTED / CANCELLED)
@@ -61,30 +62,12 @@ Central order execution layer — single point for all live order placement.
    no quotes at that ms) and the bot would manage a phantom SL and eventually
    fire a SELL against a position that never existed.
 
-   _confirm_order() returns a tuple:
-     (status, avg_price)
-
-   Where status is one of:
-     "COMPLETE"      → fill confirmed, avg_price is the actual exchange fill price
-     "REJECTED"      → exchange rejected; avg_price is 0.0
-     "CANCELLED"     → order was cancelled; avg_price is 0.0
-     "TIMEOUT"       → did not reach terminal state in time; avg_price is 0.0
-     "TOKEN_EXPIRED" → access token invalid mid-session; avg_price is 0.0
-
-   place_buy() / place_sell() return a tuple:
-     (order_id, fill_price)  on success
-     None                    on failure
-
-   Callers must unpack:
-     result = self._place_buy(sym, token, qty, ltp)
-     if result is None:
-         # handle failure
-     order_id, fill_price = result
-
-   Using the actual fill_price (from order_history average_price) for SL
-   calculation is more accurate than the pre-order LTP, especially at
-   volatile 9:15 AM opens where the price can move 20–30 pts during the
-   ~15s _confirm_order() polling window.
+   _confirm_order() returns one of:
+     "COMPLETE"      → fill confirmed, caller may treat trade as open
+     "REJECTED"      → exchange rejected; caller must abort entry / alert on sell
+     "CANCELLED"     → order was cancelled (rare for MARKET orders)
+     "TIMEOUT"       → did not reach terminal state in time; caller treats as failed
+     "TOKEN_EXPIRED" → access token invalid mid-session; caller must abort + alert
 
 5. Token / session expiry mid-session
 
@@ -105,44 +88,21 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple
+from typing import Optional
 
 log = logging.getLogger("core.router")
 
 _IST = timezone(timedelta(hours=5, minutes=30))
 
-# ── Slippage buffer for LIMIT orders ─────────────────────────────────────────
-# BUY  limit = LTP × (1 + BUY_SLIP)   — pay up to 2% above last price
-# SELL limit = LTP × (1 − SELL_SLIP)  — accept down to 2% below last price
-# Both rounded to NFO tick size (₹0.05).
-# Increase if fills are missed on highly volatile opens; decrease to save cost.
-BUY_SLIP   = 0.1   # 10%
-SELL_SLIP  = 0.1   # 10%
-TICK_SIZE  = 0.05  # NFO options tick
+# ── Market protection for MARKET orders ──────────────────────────────────────
+# -1  → Auto protection: Zerodha/NSE applies default band automatically
+# 1-100 → Custom %: e.g. 10 means order executes within ±10% of last price
+# Must be within circuit limits. -1 (auto) is recommended for options.
+MARKET_PROTECTION = -1   # auto protection (recommended)
 
 
 def _now_ist() -> datetime:
     return datetime.now(tz=_IST).replace(tzinfo=None)
-
-
-def _limit_price(ltp: float, side: str) -> float:
-    """
-    Round ltp ± slippage buffer to nearest NFO tick (₹0.05).
-
-    BUY  → ltp × 1.10 rounded UP   (ensures we're above the ask)
-    SELL → ltp × 0.90 rounded DOWN  (ensures we're below the bid)
-
-    Minimum price floored at TICK_SIZE to avoid zero/negative prices on
-    very cheap OTM options.
-    """
-    if side == "BUY":
-        raw = ltp * (1 + BUY_SLIP)
-        ticked = round(raw / TICK_SIZE) * TICK_SIZE
-    else:
-        raw = ltp * (1 - SELL_SLIP)
-        ticked = round(raw / TICK_SIZE) * TICK_SIZE
-
-    return max(ticked, TICK_SIZE)
 
 
 class OrderRouter:
@@ -150,21 +110,17 @@ class OrderRouter:
     Single point for all order placement across all strategies.
     Thread-safe. Enforces one-live-trade-at-a-time when in live mode.
 
-    place_buy() and place_sell() return a (order_id, fill_price) tuple on
-    success, or None on failure. Callers must check for None before unpacking.
-
     Usage in a strategy:
 
         # Entry
-        result = self._place_buy(symbol, token, qty, ltp)
-        if result is None:
-            return  # order failed
-        order_id, fill_price = result
-        sl = fill_price - INITIAL_SL_BUFFER   # use actual fill price for SL
+        ok = self._hub.order_router.acquire_slot(self.name, LIVE_MODE)
+        if not ok:
+            return  # another live strategy already has a position
+        oid = self._hub.order_router.place_buy(self.name, symbol, token, qty, ltp, LIVE_MODE)
 
         # Exit
-        result = self._place_sell(symbol, token, qty, ltp)
-        # result may be None if sell failed — handle accordingly
+        self._hub.order_router.place_sell(self.name, symbol, token, qty, ltp, LIVE_MODE)
+        self._hub.order_router.release_slot(self.name, LIVE_MODE)
     """
 
     def __init__(self, hub):
@@ -243,19 +199,15 @@ class OrderRouter:
         qty:           int,
         ltp:           float,
         live_mode:     bool,
-    ) -> Optional[Tuple[str, float]]:
+    ) -> Optional[str]:
         """
         Place a BUY (entry) order.
 
-        live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
-        live_mode=True  → LIMIT MIS order via Kite at LTP + buffer;
-                          returns (order_id, actual_fill_price) ONLY when
-                          exchange confirms COMPLETE.
+        live_mode=False → paper fill logged; returns "PAPER-{ms}"
+        live_mode=True  → MARKET MIS order via Kite with auto market protection;
+                          returns order_id string ONLY when exchange confirms COMPLETE.
 
-        Returns (order_id, fill_price) on success, or None on failure.
-        fill_price is the actual average price from the exchange (live) or
-        the simulated LTP (paper). Use this for SL calculation, not the
-        pre-order LTP.
+        Returns order_id / paper_id, or None on failure.
         """
         if live_mode:
             return self._live_order(
@@ -272,16 +224,15 @@ class OrderRouter:
         qty:           int,
         ltp:           float,
         live_mode:     bool,
-    ) -> Optional[Tuple[str, float]]:
+    ) -> Optional[str]:
         """
         Place a SELL (exit) order.
 
-        live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
-        live_mode=True  → LIMIT MIS order via Kite at LTP − buffer;
-                          returns (order_id, actual_fill_price) ONLY when
-                          exchange confirms COMPLETE.
+        live_mode=False → paper fill logged; returns "PAPER-{ms}"
+        live_mode=True  → MARKET MIS order via Kite with auto market protection;
+                          returns order_id string ONLY when exchange confirms COMPLETE.
 
-        Returns (order_id, fill_price) on success, or None on failure.
+        Returns order_id / paper_id, or None on failure.
         """
         if live_mode:
             return self._live_order(
@@ -301,31 +252,25 @@ class OrderRouter:
         qty:              int,
         ltp:              float,
         transaction_type: str,   # "BUY" or "SELL"
-    ) -> Optional[Tuple[str, float]]:
+    ) -> Optional[str]:
         """
-        Place a LIMIT MIS order on NFO and confirm it reached the exchange.
+        Place a MARKET MIS order with market protection on NFO and confirm
+        it reached the exchange.
 
-        Returns (order_id, fill_price) on COMPLETE, None on any failure.
-
-        fill_price is taken from order_history[last]["average_price"] — the
-        actual exchange-confirmed average fill price. This is more accurate
-        than the pre-order LTP for SL calculation, especially at volatile
-        9:15 AM opens.
-
-        Why LIMIT with buffer (not MARKET):
-          - Zerodha API rejects plain MARKET orders for options:
-              "Market orders without market protection are not allowed via API."
-          - LIMIT at LTP ± buffer fills in milliseconds on liquid ATM strikes.
-          - Buffer absorbs spread and slippage at volatile 9:15 AM opens.
-          - Tick-rounded to ₹0.05 as required by NSE for NFO options.
+        Why MARKET with protection (not LIMIT):
+          - LIMIT orders can miss entirely on gap-opens when the LTP snapshot
+            used to compute the limit price is stale (e.g., first WebSocket
+            tick at 871, actual market at 980 → limit=958, order never fills).
+          - MARKET + market_protection=-1 fills at the best available price
+            regardless of how far the market has moved, within NSE circuit band.
+          - No price parameter is sent — exchange matches at best available.
 
         Flow:
           1. Validate kite session (None check).
-          2. Compute limit_price = _limit_price(ltp, side).
-          3. place_order() → order_id.
-          4. _confirm_order() polls order_history() until COMPLETE / REJECTED /
+          2. place_order() with ORDER_TYPE_MARKET + market_protection=-1.
+          3. _confirm_order() polls order_history() until COMPLETE / REJECTED /
              CANCELLED / TIMEOUT / TOKEN_EXPIRED.
-          5. Return (order_id, fill_price) only on COMPLETE; None otherwise.
+          4. Return order_id only on COMPLETE; None on anything else.
         """
         kite = self._hub.kite
         if kite is None:
@@ -335,8 +280,6 @@ class OrderRouter:
             )
             return None
 
-        limit_px = _limit_price(ltp, transaction_type)
-
         try:
             txn = (
                 kite.TRANSACTION_TYPE_BUY
@@ -344,19 +287,19 @@ class OrderRouter:
                 else kite.TRANSACTION_TYPE_SELL
             )
             order_id = kite.place_order(
-                variety          = kite.VARIETY_REGULAR,
-                exchange         = kite.EXCHANGE_NFO,
-                tradingsymbol    = symbol,
-                transaction_type = txn,
-                quantity         = qty,
-                product          = kite.PRODUCT_MIS,
-                order_type       = kite.ORDER_TYPE_LIMIT,   # ← LIMIT, not MARKET
-                price            = limit_px,                # ← LTP ± buffer
+                variety           = kite.VARIETY_REGULAR,
+                exchange          = kite.EXCHANGE_NFO,
+                tradingsymbol     = symbol,
+                transaction_type  = txn,
+                quantity          = qty,
+                product           = kite.PRODUCT_MIS,
+                order_type        = kite.ORDER_TYPE_MARKET,  # ← MARKET order
+                market_protection = MARKET_PROTECTION,        # ← -1 = auto protect
             )
             log.info(
                 f"[Router][LIVE] {transaction_type} PLACED | "
                 f"{strategy_name} | {symbol} | qty={qty} | "
-                f"ref_ltp={ltp:.2f} | limit_px={limit_px:.2f} | order_id={order_id}"
+                f"ref_ltp={ltp:.2f} | market_protection={MARKET_PROTECTION} | order_id={order_id}"
             )
 
         except Exception as exc:
@@ -388,19 +331,14 @@ class OrderRouter:
         #   • The order hits OI / position limits
         # Without confirmation, the bot would manage a phantom SL and later
         # fire a SELL against a position that never existed.
-        #
-        # _confirm_order() also returns the actual average fill price from
-        # order_history so callers can use the real fill price for SL calculation
-        # instead of the pre-order LTP (which may be stale after ~15s of polling).
-        status, fill_price = self._confirm_order(str(order_id), fallback_price=ltp)
+        status = self._confirm_order(str(order_id))
 
         if status == "COMPLETE":
             log.info(
                 f"[Router][LIVE] {transaction_type} CONFIRMED ✓ | "
-                f"{strategy_name} | {symbol} | "
-                f"fill_price={fill_price:.2f} | order_id={order_id}"
+                f"{strategy_name} | {symbol} | order_id={order_id}"
             )
-            return str(order_id), fill_price
+            return str(order_id)
 
         elif status == "TOKEN_EXPIRED":
             log.error(
@@ -416,7 +354,7 @@ class OrderRouter:
                 f"[Router][LIVE] {transaction_type} NOT COMPLETE — status={status}\n"
                 f"  Strategy  : {strategy_name}\n"
                 f"  Symbol    : {symbol}  qty={qty}\n"
-                f"  limit_px  : {limit_px:.2f}  (ref_ltp={ltp:.2f})\n"
+                f"  ref_ltp   : {ltp:.2f}  market_protection={MARKET_PROTECTION}\n"
                 f"  order_id  : {order_id}\n"
                 f"  → Treating as FAILED. Slot released by caller.\n"
                 f"  → No phantom SL will be tracked.\n"
@@ -437,35 +375,18 @@ class OrderRouter:
 
     def _confirm_order(
         self,
-        order_id:       str,
-        fallback_price: float = 0.0,
-        timeout_sec:    float = 15.0,
-        poll_interval:  float = 0.5,
-    ) -> Tuple[str, float]:
+        order_id:      str,
+        timeout_sec:   float = 15.0,
+        poll_interval: float = 0.5,
+    ) -> str:
         """
-        Poll kite.order_history(order_id) until the order reaches a terminal
-        state or the timeout expires.
-
-        Returns a tuple: (status, avg_price)
-
-          status values:
-            "COMPLETE"      → exchange filled the order; avg_price is real fill
-            "REJECTED"      → exchange rejected; avg_price is 0.0
-            "CANCELLED"     → order was cancelled; avg_price is 0.0
-            "TIMEOUT"       → timed out; avg_price is 0.0
-            "TOKEN_EXPIRED" → session ended mid-poll; avg_price is 0.0
-
-          avg_price:
-            On COMPLETE — taken from order_history[last]["average_price"].
-            Falls back to fallback_price (pre-order LTP) if average_price is
-            missing or zero in the history response (should not happen on
-            Zerodha for a COMPLETE order, but defensive).
-            0.0 for all non-COMPLETE statuses.
+        Poll kite.order_history(order_id) until the order reaches a terminal state
+        or the timeout expires.
 
         Terminal states returned by NSE via Zerodha:
-          "COMPLETE"  → exchange filled the order (normal outcome for LIMIT + buffer)
+          "COMPLETE"  → exchange filled the order (normal outcome for MARKET orders)
           "REJECTED"  → exchange rejected (insufficient funds, circuit, OI limit)
-          "CANCELLED" → order was cancelled (unusual for LIMIT)
+          "CANCELLED" → order was cancelled
 
         Non-terminal states (keep polling):
           "PUT ORDER REQ RECEIVED"  → order received by Zerodha OMS
@@ -475,6 +396,13 @@ class OrderRouter:
           "TRIGGER PENDING"         → SL trigger not yet hit (not applicable here)
           "MODIFY PENDING"          → modification in progress
           "CANCEL PENDING"          → cancellation in progress
+
+        Returns one of:
+          "COMPLETE"      — normal success path
+          "REJECTED"      — exchange rejected; entry must be aborted
+          "CANCELLED"     — order was cancelled
+          "TIMEOUT"       — timed out; treat as failed, check console
+          "TOKEN_EXPIRED" — session ended mid-poll; check console immediately
         """
         TERMINAL = {"COMPLETE", "REJECTED", "CANCELLED"}
         deadline = time.monotonic() + timeout_sec
@@ -492,33 +420,18 @@ class OrderRouter:
                     time.sleep(poll_interval)
                     continue
 
-                last   = history[-1]
-                status = last.get("status", "").upper()
+                status = history[-1].get("status", "").upper()
                 log.debug(
                     f"[Router] order_history({order_id}) attempt={attempt} "
                     f"status={status}"
                 )
 
                 if status in TERMINAL:
-                    # Extract actual fill price on COMPLETE
-                    avg_price = 0.0
-                    if status == "COMPLETE":
-                        raw_avg = last.get("average_price") or 0.0
-                        avg_price = float(raw_avg) if raw_avg else fallback_price
-                        if avg_price <= 0:
-                            # Defensive fallback — should not happen for COMPLETE
-                            avg_price = fallback_price
-                            log.warning(
-                                f"[Router] order {order_id} COMPLETE but "
-                                f"average_price missing — using fallback {fallback_price:.2f}"
-                            )
-
                     log.info(
                         f"[Router] order_history({order_id}) → {status} "
                         f"after {attempt} poll(s)"
-                        + (f" | avg_fill={avg_price:.2f}" if status == "COMPLETE" else "")
                     )
-                    return status, avg_price
+                    return status
 
                 if attempt == 1 or attempt % 5 == 0:
                     log.info(
@@ -537,7 +450,7 @@ class OrderRouter:
                         f"  → Restart the bot with a fresh token before next trade.\n"
                         f"{'!'*60}"
                     )
-                    return "TOKEN_EXPIRED", 0.0
+                    return "TOKEN_EXPIRED"
 
                 log.warning(
                     f"[Router] order_history({order_id}) poll error "
@@ -555,7 +468,7 @@ class OrderRouter:
             f"  → Bot treats this as FAILED to prevent phantom position management.\n"
             f"{'!'*60}"
         )
-        return "TIMEOUT", 0.0
+        return "TIMEOUT"
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Internal — token / session expiry detection
@@ -596,12 +509,12 @@ class OrderRouter:
         strategy_name: str,
         symbol:        str,
         ltp:           float,
-    ) -> Tuple[str, float]:
+    ) -> str:
         fake_id = f"PAPER-{int(time.time() * 1000)}"
         log.info(
             f"[Router][PAPER] {side} simulated | "
             f"{strategy_name} | {symbol} | ltp={ltp:.2f} | id={fake_id}"
         )
-        # Paper fill: return ltp as fill_price (no slippage simulated)
-        return fake_id, ltp
+        return fake_id
+
 
