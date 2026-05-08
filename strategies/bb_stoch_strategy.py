@@ -3,28 +3,23 @@ strategies/bb_stoch_strategy.py
 -------------------------------------------------------------
 BBStochStrategy -- BankNifty options scalper using:
   * Bollinger Bands  (BB)   -- identifies breakout / volatility expansion
-  * Stochastic Oscillator   -- momentum confirmation + overbought/oversold
   * Volume Filter           -- confirms genuine institutional participation
+  * EMA trend filter        -- prevents counter-trend entries
 
-SIGNAL LOGIC (all three must agree before entry):
+SIGNAL LOGIC (all filters must agree before entry):
 --------------------------------------------------------------
   CE entry (buy call):
     1. BB Breakout : last close breaks ABOVE upper BB band
-       OR BB Bounce : last close crosses back above lower BB band
-          from below (mean-reversion mode, Stoch oversold)
+       OR BB Bounce : last close crosses back above lower BB band from below
        OR BB Middle : last close crosses ABOVE the BB middle band
-          (trend resumption, Stoch turning up from neutral)
-    2. Stoch      : %K > %D (positive crossover in last 2 bars)
-                    AND %K > 50  (momentum in bull territory)
-                    OR  %K < 20  (oversold bounce)
-                    OR  %K > 35  (middle band — looser condition)
-    3. Volume     : current bar volume >= VOL_MULT * rolling avg vol
-    4. VWAP       : close above session VWAP (hub provides tick-accurate VWAP)
+    2. Volume     : current bar volume >= VOL_MULT * rolling avg vol
+    3. VWAP       : close above session VWAP
+    4. EMA        : EMA20 > EMA50 (uptrend context)
     5. Session    : only between SESSION_START and ENTRY_CUTOFF
 
   PE entry (buy put):
-    Mirror of the above -- BB break below lower band, Stoch bear cross,
-    BB middle band cross DOWN (with Stoch K < 65), etc.
+    Mirror of the above -- BB break below lower band, bounce below upper
+    band, or middle band cross DOWN.
 
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
@@ -175,15 +170,8 @@ CFG = {
     "bb_std"            : 2.0,      # number of std deviations for bands
     "bb_squeeze_pct"    : 0.002,    # loosened: was 0.003 → 0.002 allows entries in tighter markets
                                     # band-width / close < this = squeeze (skip)
-    "bb_mid_squeeze_pct": 0.005,    # Stricter squeeze threshold for middle-band cross entries only
+    "bb_mid_squeeze_pct": 0.003,    # Stricter squeeze threshold for middle-band cross entries only
                                     # Middle cross in a tight band = no real momentum → skip
-
-    # Stochastic Oscillator
-    "stoch_k"           : 9,        # %K lookback (lowered: was 14 → need=19 bars; 9 → need=14 bars matching min_bars)
-    "stoch_d"           : 3,        # %D smoothing period (SMA of %K)
-    "stoch_signal"      : 3,        # signal line smoothing
-    "stoch_ob"          : 65,       # overbought level for PE reversal
-    "stoch_os"          : 35,       # oversold level for CE reversal
 
     # Volume filter
     "vol_avg_period"    : 10,       # bars to compute average volume
@@ -194,7 +182,7 @@ CFG = {
 
     # Session windows (HH, MM)
     "session_start"     : (9, 45),  # no entries before this (opening chaos)
-    "session_cutoff"    : (14, 30), # no NEW entries after this
+    "session_cutoff"    : (15, 0),  # no NEW entries after this
     "auto_squareoff"    : (15, 15), # force-close all open positions
 
     # Trade management
@@ -227,10 +215,10 @@ CFG = {
     # Signal persistence (candle bars)
     "persistence"       : 1,        # lowered: was 2 (10-min confirmation window misses fast 5m moves)
 
-    # Minimum 5-min bars needed before first signal
-    # With stoch_k=9: need = 9+3+2 = 14 bars → 14×5min = 70min from 9:15 = first signal ~10:25 AM
-    # BB now uses min_periods=bb_period//3 so it computes validly before 20 bars.
-    # Was 20 (100min from 9:15 → 10:55 AM, left only 3.5hrs trading window).
+    # Minimum 5-min bars needed before first signal.
+    # BB uses min_periods=bb_period//3=7, so it computes from bar 7.
+    # Keep at 14 to ensure enough price history for reliable BB bands.
+    # 14 bars × 5min = 70min from 9:15 → first signal ~10:25 AM.
     "min_bars"          : 14,       # was 20
 
     # FIX (Bug 6): strike offsets to pre-subscribe based on actual open price
@@ -296,39 +284,6 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
     }
 
 
-def compute_stoch(df: pd.DataFrame, k: int, d: int) -> dict:
-    """
-    Full Stochastic Oscillator.
-    %K = (close - lowest_low_k) / (highest_high_k - lowest_low_k) * 100
-    %D = SMA(%K, d)
-    Returns last and prev values for crossover detection.
-    """
-    need = k + d + 2
-    if len(df) < need:
-        return {"k": 50, "d": 50, "prev_k": 50, "prev_d": 50}
-
-    high  = df["high"].astype(float)
-    low   = df["low"].astype(float)
-    close = df["close"].astype(float)
-
-    lowest_low   = low.rolling(k).min()
-    highest_high = high.rolling(k).max()
-    denom        = highest_high - lowest_low
-    denom        = denom.replace(0, np.nan)
-    raw_k        = (close - lowest_low) / denom * 100
-    # Smooth %K with SMA(d)
-    smooth_k     = raw_k.rolling(d).mean()
-    # Signal = SMA(smooth_k, d)
-    signal_k     = smooth_k.rolling(d).mean()
-
-    return {
-        "k"      : round(float(smooth_k.iloc[-1]),  2),
-        "d"      : round(float(signal_k.iloc[-1]),  2),
-        "prev_k" : round(float(smooth_k.iloc[-2]),  2),
-        "prev_d" : round(float(signal_k.iloc[-2]),  2),
-    }
-
-
 def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
     """
     Ratio of last bar's volume vs rolling N-bar average.
@@ -390,33 +345,31 @@ def compute_ema(df: pd.DataFrame, period: int) -> float:
 
 def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     """
-    Run all three filters. Returns a signal dict:
+    Run all filters. Returns a signal dict:
         action      : "BUY_CE" | "BUY_PE" | "HOLD"
         blocked_by  : reason string if HOLD
-        bb, stoch, vol_ratio, atr: indicator snapshots for logging
+        bb, vol_ratio, atr: indicator snapshots for logging
     """
     empty = {"action": "HOLD", "blocked_by": "no_data",
-             "bb": {}, "stoch": {}, "vol_ratio": 0, "atr": 0}
+             "bb": {}, "vol_ratio": 0, "atr": 0}
 
     if df is None or len(df) < CFG["min_bars"]:
         return {**empty, "blocked_by": "insufficient_bars"}
 
     # ---- Indicators ----
     bb        = compute_bb(df, CFG["bb_period"], CFG["bb_std"])
-    stoch     = compute_stoch(df, CFG["stoch_k"], CFG["stoch_d"])
     vol_ratio = compute_vol_ratio(df, CFG["vol_avg_period"])
     atr       = _compute_atr(df, CFG["atr_period"])
     close     = float(df["close"].iloc[-1])
 
-    # CHANGE A: EMA trend filter -- 20 EMA vs 50 EMA on index candles.
+    # EMA trend filter -- 20 EMA vs 50 EMA on index candles.
     # Prevents CE entries in a strong downtrend and PE entries in a strong uptrend.
-    # BB + Stochastic alone cannot reliably distinguish pullback from reversal.
     ema20    = compute_ema(df, 20)
     ema50    = compute_ema(df, 50)
     ema_bull = ema20 > ema50   # uptrend  → CE entries allowed
     ema_bear = ema20 < ema50   # downtrend → PE entries allowed
 
-    base = {"bb": bb, "stoch": stoch, "vol_ratio": vol_ratio, "atr": atr,
+    base = {"bb": bb, "vol_ratio": vol_ratio, "atr": atr,
             "close": close, "ema20": ema20, "ema50": ema50}
 
     # ---- Filter 1: BB squeeze → skip (no trend) ----
@@ -438,10 +391,6 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     if not vol_ok:
         return {"action": "HOLD", "blocked_by": "volume_low", **base}
 
-    # ---- Stochastic crossovers ----
-    k_cross_up   = stoch["prev_k"] < stoch["prev_d"] and stoch["k"] >= stoch["d"]
-    k_cross_down = stoch["prev_k"] > stoch["prev_d"] and stoch["k"] <= stoch["d"]
-
     # ---- VWAP bias ----
     if vwap and vwap > 0:
         above_vwap = close >= (vwap - CFG["vwap_buffer"])
@@ -453,25 +402,17 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     # ================================================================
     # CE CONDITIONS
     #   1. Breakout  : close crosses ABOVE upper band
-    #   2. Bounce    : close crosses back ABOVE lower band (oversold mean-reversion)
-    #   3. Middle    : close crosses ABOVE middle band (NEW — trend resumption)
+    #   2. Bounce    : close crosses back ABOVE lower band (mean-reversion)
+    #   3. Middle    : close crosses ABOVE middle band (trend resumption)
     # ================================================================
     bb_breakout_up  = close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"]
-    bb_bounce_up    = (close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
-                       and stoch["k"] < CFG["stoch_os"])
-    bb_mid_cross_up = (close > bb["mid"] and bb["prev_close"] <= bb["prev_mid"]
-                       and stoch["k"] > 40)   # mid-cross needs at least neutral momentum
-
-    stoch_bull      = (stoch["k"] > 50 or stoch["k"] < CFG["stoch_os"]) and (k_cross_up or stoch["k"] > stoch["d"])
-    # For middle-band cross, allow a slightly looser stoch condition (momentum
-    # turning up from near-neutral is valid here)
-    stoch_bull_mid  = (k_cross_up or stoch["k"] > stoch["d"]) and stoch["k"] > 35
+    bb_bounce_up    = close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
+    bb_mid_cross_up = close > bb["mid"]   and bb["prev_close"] <= bb["prev_mid"]
 
     ce_bb_trigger = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
-    ce_stoch_ok   = (stoch_bull if (bb_breakout_up or bb_bounce_up) else stoch_bull_mid)
 
-    if ce_bb_trigger and ce_stoch_ok and above_vwap:
-        # CHANGE A: EMA trend filter -- CE only in uptrend (ema20 > ema50)
+    if ce_bb_trigger and above_vwap:
+        # EMA trend filter -- CE only in uptrend (ema20 > ema50)
         if not ema_bull:
             return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
         if bb_breakout_up:
@@ -489,23 +430,16 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     # PE CONDITIONS
     #   1. Breakout  : close crosses BELOW lower band
     #   2. Bounce    : close crosses back BELOW upper band (overbought reversal)
-    #   3. Middle    : close crosses BELOW middle band (NEW — trend resumption)
+    #   3. Middle    : close crosses BELOW middle band (trend resumption)
     # ================================================================
     bb_breakout_dn  = close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"]
-    bb_bounce_dn    = (close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
-                       and stoch["k"] > CFG["stoch_ob"])
-    bb_mid_cross_dn = (close < bb["mid"] and bb["prev_close"] >= bb["prev_mid"]
-                       and stoch["k"] < 60)   # mid-cross needs at least neutral-bearish momentum
-
-    stoch_bear      = (stoch["k"] < 50 or stoch["k"] > CFG["stoch_ob"]) and (k_cross_down or stoch["k"] < stoch["d"])
-    # For middle-band cross, allow a slightly looser stoch condition
-    stoch_bear_mid  = (k_cross_down or stoch["k"] < stoch["d"]) and stoch["k"] < 65
+    bb_bounce_dn    = close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
+    bb_mid_cross_dn = close < bb["mid"]   and bb["prev_close"] >= bb["prev_mid"]
 
     pe_bb_trigger = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
-    pe_stoch_ok   = (stoch_bear if (bb_breakout_dn or bb_bounce_dn) else stoch_bear_mid)
 
-    if pe_bb_trigger and pe_stoch_ok and below_vwap:
-        # CHANGE A: EMA trend filter -- PE only in downtrend (ema20 < ema50)
+    if pe_bb_trigger and below_vwap:
+        # EMA trend filter -- PE only in downtrend (ema20 < ema50)
         if not ema_bear:
             return {"action": "HOLD", "blocked_by": "ema_trend_pe", **base}
         if bb_breakout_dn:
@@ -520,16 +454,12 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         return {"action": "BUY_PE", "blocked_by": "", **base, "mode": mode}
 
     # ---- Granular block reasons for analysis ----
-    if bb_breakout_up or bb_bounce_up or bb_mid_cross_up:
-        if not ce_stoch_ok:
-            return {"action": "HOLD", "blocked_by": "stoch_not_bull", **base}
+    if ce_bb_trigger:
         if not above_vwap:
             return {"action": "HOLD", "blocked_by": "below_vwap", **base}
         if not ema_bull:
             return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
-    if bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn:
-        if not pe_stoch_ok:
-            return {"action": "HOLD", "blocked_by": "stoch_not_bear", **base}
+    if pe_bb_trigger:
         if not below_vwap:
             return {"action": "HOLD", "blocked_by": "above_vwap", **base}
         if not ema_bear:
@@ -632,8 +562,8 @@ class BBStochStrategy(BaseStrategy):
         super().__init__(market_hub)
 
         # Private 5-min candle buffer (fed from MarketHub's on_candle broadcast)
-        # Size: bb_period + stoch_k + stoch_d + headroom
-        buf_size = CFG["bb_period"] + CFG["stoch_k"] + CFG["stoch_d"] + 20
+        # Size: bb_period (20) + ema50 lookback + headroom
+        buf_size = max(CFG["bb_period"], 50) + 20
         self._buf_5m: deque = deque(maxlen=buf_size)
 
         # Trade state
@@ -991,7 +921,6 @@ class BBStochStrategy(BaseStrategy):
         )
 
         bb    = sig.get("bb", {})
-        stoch = sig.get("stoch", {})
         vwap_str = f"{vwap:.2f}" if vwap is not None else "N/A"
         vol_ratio_val = sig.get("vol_ratio", -1)
         vol_str = f"{vol_ratio_val:.2f}x" if vol_ratio_val >= 0 else "N/A(no-data)"
@@ -1000,7 +929,6 @@ class BBStochStrategy(BaseStrategy):
             f"Close={sig.get('close', 0):.2f} | "
             f"BB=[{bb.get('lower', 0):.1f}~{bb.get('upper', 0):.1f}] "
             f"BW={bb.get('bw_pct', 0)*100:.2f}% | "
-            f"Stoch K={stoch.get('k', 0):.1f} D={stoch.get('d', 0):.1f} | "
             f"Vol={vol_str} | "
             f"VWAP={vwap_str} | "
             f"EMA20={sig.get('ema20', 0):.2f} EMA50={sig.get('ema50', 0):.2f} | "
@@ -1180,7 +1108,6 @@ class BBStochStrategy(BaseStrategy):
         )
 
         bb = sig.get("bb", {})
-        st = sig.get("stoch", {})
         _csv_append(CFG["entry_csv"], {
             "timestamp"  : trade.timestamp,
             "symbol"     : tsym,
@@ -1202,8 +1129,6 @@ class BBStochStrategy(BaseStrategy):
             "bb_mid"     : bb.get("mid", ""),
             "bb_lower"   : bb.get("lower", ""),
             "bb_bw_pct"  : bb.get("bw_pct", ""),
-            "stoch_k"    : st.get("k", ""),
-            "stoch_d"    : st.get("d", ""),
             "vol_ratio"  : sig.get("vol_ratio", ""),
             "vwap"       : self._hub.session_vwap.value if self._hub.session_vwap.value is not None else "N/A",
             "pending_delay_ms": round(pending_delay_ms, 0) if pending_delay_ms is not None else "",
@@ -1463,7 +1388,6 @@ class BBStochStrategy(BaseStrategy):
 
     def _log_signal(self, ts: datetime, sig: dict):
         bb = sig.get("bb", {})
-        st = sig.get("stoch", {})
         _csv_append(CFG["signal_csv"], {
             "timestamp"  : ts.isoformat(),
             "action"     : sig.get("action", "HOLD"),
@@ -1475,13 +1399,8 @@ class BBStochStrategy(BaseStrategy):
             "bb_lower"   : bb.get("lower", ""),
             "bb_bw_pct"  : bb.get("bw_pct", ""),
             "bb_squeeze" : bb.get("squeeze", ""),
-            "stoch_k"    : st.get("k", ""),
-            "stoch_d"    : st.get("d", ""),
-            "stoch_pk"   : st.get("prev_k", ""),
-            "stoch_pd"   : st.get("prev_d", ""),
             "vol_ratio"  : sig.get("vol_ratio", ""),
             "atr"        : sig.get("atr", ""),
-            # CHANGE A: EMA trend filter values for analysis
             "ema20"      : sig.get("ema20", ""),
             "ema50"      : sig.get("ema50", ""),
             "vwap"       : self._hub.session_vwap.value if self._hub.session_vwap.value is not None else "N/A",
