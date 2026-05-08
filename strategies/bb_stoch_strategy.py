@@ -361,6 +361,29 @@ def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
     return round(current / avg, 3)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CHANGE A: EMA TREND FILTER
+#  20-period and 50-period Exponential Moving Averages on the index.
+#  Purpose: prevent buying CE in a strong downtrend (ema20 < ema50)
+#           and buying PE in a strong uptrend (ema20 > ema50).
+#  BB + Stochastic alone cannot distinguish pullback from reversal.
+#  The 20/50 EMA relationship provides a simple, robust trend context.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_ema(df: pd.DataFrame, period: int) -> float:
+    """
+    Exponential Moving Average on 'close'.
+    Uses ewm(span=period, adjust=False) — standard Wilder-style EMA.
+    Works with partial history (ewm computes from bar 1), so no min_bars
+    guard is needed here — caller decides whether value is meaningful.
+    """
+    if len(df) < 2:
+        return 0.0
+    close = df["close"].astype(float)
+    ema   = close.ewm(span=period, adjust=False).mean()
+    return float(round(ema.iloc[-1], 2))
+
+
 # ============================================================
 # SIGNAL BUILDER
 # ============================================================
@@ -379,14 +402,22 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         return {**empty, "blocked_by": "insufficient_bars"}
 
     # ---- Indicators ----
-    bb       = compute_bb(df, CFG["bb_period"], CFG["bb_std"])
-    stoch    = compute_stoch(df, CFG["stoch_k"], CFG["stoch_d"])
+    bb        = compute_bb(df, CFG["bb_period"], CFG["bb_std"])
+    stoch     = compute_stoch(df, CFG["stoch_k"], CFG["stoch_d"])
     vol_ratio = compute_vol_ratio(df, CFG["vol_avg_period"])
-    atr      = _compute_atr(df, CFG["atr_period"])
-    close    = float(df["close"].iloc[-1])
+    atr       = _compute_atr(df, CFG["atr_period"])
+    close     = float(df["close"].iloc[-1])
+
+    # CHANGE A: EMA trend filter -- 20 EMA vs 50 EMA on index candles.
+    # Prevents CE entries in a strong downtrend and PE entries in a strong uptrend.
+    # BB + Stochastic alone cannot reliably distinguish pullback from reversal.
+    ema20    = compute_ema(df, 20)
+    ema50    = compute_ema(df, 50)
+    ema_bull = ema20 > ema50   # uptrend  → CE entries allowed
+    ema_bear = ema20 < ema50   # downtrend → PE entries allowed
 
     base = {"bb": bb, "stoch": stoch, "vol_ratio": vol_ratio, "atr": atr,
-            "close": close}
+            "close": close, "ema20": ema20, "ema50": ema50}
 
     # ---- Filter 1: BB squeeze → skip (no trend) ----
     if bb["squeeze"]:
@@ -440,6 +471,9 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     ce_stoch_ok   = (stoch_bull if (bb_breakout_up or bb_bounce_up) else stoch_bull_mid)
 
     if ce_bb_trigger and ce_stoch_ok and above_vwap:
+        # CHANGE A: EMA trend filter -- CE only in uptrend (ema20 > ema50)
+        if not ema_bull:
+            return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
         if bb_breakout_up:
             mode = "breakout"
         elif bb_bounce_up:
@@ -471,6 +505,9 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     pe_stoch_ok   = (stoch_bear if (bb_breakout_dn or bb_bounce_dn) else stoch_bear_mid)
 
     if pe_bb_trigger and pe_stoch_ok and below_vwap:
+        # CHANGE A: EMA trend filter -- PE only in downtrend (ema20 < ema50)
+        if not ema_bear:
+            return {"action": "HOLD", "blocked_by": "ema_trend_pe", **base}
         if bb_breakout_dn:
             mode = "breakout"
         elif bb_bounce_dn:
@@ -488,11 +525,15 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
             return {"action": "HOLD", "blocked_by": "stoch_not_bull", **base}
         if not above_vwap:
             return {"action": "HOLD", "blocked_by": "below_vwap", **base}
+        if not ema_bull:
+            return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
     if bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn:
         if not pe_stoch_ok:
             return {"action": "HOLD", "blocked_by": "stoch_not_bear", **base}
         if not below_vwap:
             return {"action": "HOLD", "blocked_by": "above_vwap", **base}
+        if not ema_bear:
+            return {"action": "HOLD", "blocked_by": "ema_trend_pe", **base}
 
     return {"action": "HOLD", "blocked_by": "no_setup", **base}
 
@@ -637,6 +678,19 @@ class BBStochStrategy(BaseStrategy):
         # well within the same 5-minute window. No sleeping, no blocking.
         self._pending_entry: Optional[dict] = None
 
+        # CHANGE B: Entry delay — next-candle breakout confirmation.
+        # When a valid signal fires, we do NOT enter immediately. Instead, we
+        # store the breakout candle's high (CE) or low (PE) as a trigger level.
+        # on_tick() watches the live index price; if it trades through the trigger
+        # in the NEXT candle, the entry fires instantly. This eliminates fake
+        # breakouts that reverse within the same 5-min bar.
+        #
+        # Lifecycle:
+        #   on_candle() [bar N close]   → confirmed signal  → set _entry_delay_pending
+        #   on_tick()   [bar N+1 ticks] → index > trigger   → _enter_trade() fires
+        #   on_candle() [bar N+1 close] → if still pending  → expire (no confirmation)
+        self._entry_delay_pending: Optional[dict] = None
+
         log.info("[BB_STOCH] Strategy initialized")
 
     # ----------------------------------------------------------
@@ -710,6 +764,7 @@ class BBStochStrategy(BaseStrategy):
         self._squareoff_done     = False   # FIX (Bug 10): reset guard each day
         self._open_atm_subscribed = False  # FIX (Bug 6): reset so first candle re-subscribes
         self._pending_entry       = None   # FIX (Bug 7): discard any stale pending entry
+        self._entry_delay_pending = None   # CHANGE B: discard any stale entry delay
 
     # ----------------------------------------------------------
     # FIX (Bug 6): Dynamic spot-based subscription on first candle
@@ -769,6 +824,39 @@ class BBStochStrategy(BaseStrategy):
             self._squareoff_done = True
             self._force_close("AUTO-SQUAREOFF")
 
+        # CHANGE B: Entry delay confirmation.
+        # After a signal fires on candle close, we do not enter immediately.
+        # Instead, on_candle() stores the breakout high (CE) / low (PE) in
+        # _entry_delay_pending. Here, on every index tick in the NEXT candle,
+        # we check whether the live index price has traded through that level.
+        # The first tick that confirms triggers _enter_trade() instantly.
+        confirm = self._entry_delay_pending
+        if confirm and not self._trade and not self._is_halted:
+            now_time = ts.time()
+            action   = confirm["action"]
+            trigger  = confirm["trigger_level"]
+            # Expire if we've drifted past the entry cutoff
+            if now_time >= dtime(*CFG["session_cutoff"]):
+                log.info(
+                    f"[BB_STOCH] Entry delay expired (past cutoff) "
+                    f"| {action} trigger={trigger:.2f}"
+                )
+                self._entry_delay_pending = None
+            elif action == "BUY_CE" and price > trigger:
+                log.info(
+                    f"[BB_STOCH] Entry delay CONFIRMED | BUY_CE "
+                    f"| index={price:.2f} > trigger={trigger:.2f}"
+                )
+                self._entry_delay_pending = None
+                self._enter_trade(action, confirm["sig"], confirm["ts"])
+            elif action == "BUY_PE" and price < trigger:
+                log.info(
+                    f"[BB_STOCH] Entry delay CONFIRMED | BUY_PE "
+                    f"| index={price:.2f} < trigger={trigger:.2f}"
+                )
+                self._entry_delay_pending = None
+                self._enter_trade(action, confirm["sig"], confirm["ts"])
+
     def on_candle(self, candle: dict, ts: datetime):
         """
         Called by MarketHub when a 5-min index candle closes.
@@ -778,6 +866,10 @@ class BBStochStrategy(BaseStrategy):
         based on the actual spot price. This happens ~9:20 AM — 65+ minutes
         before the earliest possible BB_STOCH signal (min_bars=14 × 5min =
         70min from 9:15). All tokens are warm before any signal can fire.
+
+        CHANGE B: if _entry_delay_pending survived a full candle without
+        on_tick confirming (i.e. the next candle never traded through the
+        breakout level), it is expired here — the setup is invalidated.
         """
         with self._lock:
             self._buf_5m.append(candle)
@@ -790,6 +882,16 @@ class BBStochStrategy(BaseStrategy):
             if spot and spot > 0:
                 self._subscribe_spot_atm(spot)
                 self._open_atm_subscribed = True
+
+        # CHANGE B: expire entry delay that was not confirmed in the previous candle.
+        # A new candle starting means the confirmation window has closed.
+        if self._entry_delay_pending:
+            edp = self._entry_delay_pending
+            log.info(
+                f"[BB_STOCH] Entry delay expired (no confirmation in previous candle) "
+                f"| {edp['action']} trigger={edp['trigger_level']:.2f}"
+            )
+            self._entry_delay_pending = None
 
         # Don't look for entries if a trade is already open
         if self._trade:
@@ -901,6 +1003,7 @@ class BBStochStrategy(BaseStrategy):
             f"Stoch K={stoch.get('k', 0):.1f} D={stoch.get('d', 0):.1f} | "
             f"Vol={vol_str} | "
             f"VWAP={vwap_str} | "
+            f"EMA20={sig.get('ema20', 0):.2f} EMA50={sig.get('ema50', 0):.2f} | "
             f"Block={sig.get('blocked_by') or 'none'} | Persist={confirmed} | "
             f"PnL={self._daily_pnl:+.1f}Rs T={self._trades_today}/{CFG['max_trades_day']}"
         )
@@ -913,7 +1016,36 @@ class BBStochStrategy(BaseStrategy):
 
         # FIX (Bug 2): _persist_buf is NOT cleared here.
         # It is cleared inside _enter_trade() only after a genuine fill.
-        self._enter_trade(action, sig, ts)
+
+        # CHANGE B: Entry delay — do not enter on the breakout candle itself.
+        # Store the breakout candle's high (CE) / low (PE) as the trigger level.
+        # on_tick() will fire _enter_trade() the instant the NEXT candle's index
+        # price trades through that level. If the next candle closes without
+        # confirmation, on_candle() expires _entry_delay_pending (fake breakout).
+        last_candle   = candles[-1] if candles else {}
+        trigger_level = (float(last_candle.get("high", 0)) if action == "BUY_CE"
+                         else float(last_candle.get("low", 0)))
+
+        if trigger_level <= 0:
+            # Fallback: candle high/low unavailable — enter immediately as before
+            log.warning(
+                f"[BB_STOCH] Entry delay: trigger level unavailable for {action} "
+                f"(candle missing high/low) — entering immediately"
+            )
+            self._enter_trade(action, sig, ts)
+            return
+
+        log.info(
+            f"[BB_STOCH] Entry delay SET | {action} "
+            f"| trigger={'>' if action == 'BUY_CE' else '<'}{trigger_level:.2f} "
+            f"| waiting for next-candle index confirmation via on_tick()"
+        )
+        self._entry_delay_pending = {
+            "action"        : action,
+            "trigger_level" : trigger_level,
+            "sig"           : sig,
+            "ts"            : ts,
+        }
 
     # ----------------------------------------------------------
     # ENTRY
@@ -1261,6 +1393,14 @@ class BBStochStrategy(BaseStrategy):
             )
             self._pending_entry = None
 
+        # CHANGE B: also discard any entry delay pending on force-close
+        if self._entry_delay_pending:
+            log.info(
+                f"[BB_STOCH] Discarding entry delay "
+                f"({self._entry_delay_pending.get('action', '?')}) on {reason}"
+            )
+            self._entry_delay_pending = None
+
         with self._lock:
             trade = self._trade
         if not trade:
@@ -1341,6 +1481,9 @@ class BBStochStrategy(BaseStrategy):
             "stoch_pd"   : st.get("prev_d", ""),
             "vol_ratio"  : sig.get("vol_ratio", ""),
             "atr"        : sig.get("atr", ""),
+            # CHANGE A: EMA trend filter values for analysis
+            "ema20"      : sig.get("ema20", ""),
+            "ema50"      : sig.get("ema50", ""),
             "vwap"       : self._hub.session_vwap.value if self._hub.session_vwap.value is not None else "N/A",
         })
 
