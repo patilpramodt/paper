@@ -159,7 +159,7 @@ CFG = {
     # Remaining constraints: BB needs 7 bars, ATR needs 15 (falls
     # back to sl_min if not ready), Volume needs 11 (bypasses if
     # not ready). 14 bars = 70 min from 9:15 → first signal ~10:25 AM.
-    "min_bars"           : 14,
+    "min_bars"           : 7,
 
     # Spot-based strike offsets for Bug 6 subscription
     "spot_atm_offsets"   : [0, 200, -200, 400, -400],
