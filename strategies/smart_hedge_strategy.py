@@ -437,8 +437,10 @@ class SmartHedgeStrategy(BaseStrategy):
 
         # Track first candle (9:15–9:20 candle closes at 9:20) for signal 4
         if not self._first_candle_done and t >= dtime(9, 20) and t < dtime(9, 30):
-            self._first_candle      = candle
-            self._first_candle_done = True
+            with self._lock:
+                if not self._first_candle_done:
+                    self._first_candle      = candle
+                    self._first_candle_done = True
             candle_dir = "GREEN" if candle["close"] > candle["open"] else "RED"
             log.info(
                 f"[SMART_HEDGE] First candle recorded | "
@@ -594,7 +596,7 @@ class SmartHedgeStrategy(BaseStrategy):
         vix = getattr(self._pm, "vix", None) or self._vix
         qty = CFG["quantity"]
         if vix and vix > CFG["vix_max"]:
-            qty = max((CFG["quantity"] // 2 // 30) * 30, 30)
+            qty = max(round(CFG["quantity"] / 2 / 30) * 30, 30)
             log.info(
                 f"[SMART_HEDGE]   VIX={vix:.1f} > {CFG['vix_max']} → half-size qty={qty} "
                 f"(IV is rich, still trade)"
@@ -738,7 +740,9 @@ class SmartHedgeStrategy(BaseStrategy):
             oid_sp = self._place_sell(sp_sym, sp_tok, qty, sp_ltp)
             oid_lp = self._place_buy( lp_sym, lp_tok, qty, lp_ltp)
             if None in (oid_sp, oid_lp):
-                log.error("[SMART_HEDGE]   BULL_PUT order FAILED — releasing slot")
+                log.error("[SMART_HEDGE]   BULL_PUT order FAILED — rolling back placed legs")
+                if oid_sp: self._place_buy( sp_sym, sp_tok, qty, self.get_price(sp_tok) or sp_ltp)
+                if oid_lp: self._place_sell(lp_sym, lp_tok, qty, self.get_price(lp_tok) or lp_ltp)
                 self._release_slot()
                 with self._lock:
                     self._done_today = True
@@ -748,7 +752,9 @@ class SmartHedgeStrategy(BaseStrategy):
             oid_sc = self._place_sell(sc_sym, sc_tok, qty, sc_ltp)
             oid_lc = self._place_buy( lc_sym, lc_tok, qty, lc_ltp)
             if None in (oid_sc, oid_lc):
-                log.error("[SMART_HEDGE]   BEAR_CALL order FAILED — releasing slot")
+                log.error("[SMART_HEDGE]   BEAR_CALL order FAILED — rolling back placed legs")
+                if oid_sc: self._place_buy( sc_sym, sc_tok, qty, self.get_price(sc_tok) or sc_ltp)
+                if oid_lc: self._place_sell(lc_sym, lc_tok, qty, self.get_price(lc_tok) or lc_ltp)
                 self._release_slot()
                 with self._lock:
                     self._done_today = True
@@ -760,7 +766,11 @@ class SmartHedgeStrategy(BaseStrategy):
             oid_lc = self._place_buy( lc_sym, lc_tok, qty, lc_ltp)
             oid_lp = self._place_buy( lp_sym, lp_tok, qty, lp_ltp)
             if None in (oid_sc, oid_sp, oid_lc, oid_lp):
-                log.error("[SMART_HEDGE]   IRON_CONDOR order FAILED — releasing slot")
+                log.error("[SMART_HEDGE]   IRON_CONDOR order FAILED — rolling back placed legs")
+                if oid_sc: self._place_buy( sc_sym, sc_tok, qty, self.get_price(sc_tok) or sc_ltp)
+                if oid_sp: self._place_buy( sp_sym, sp_tok, qty, self.get_price(sp_tok) or sp_ltp)
+                if oid_lc: self._place_sell(lc_sym, lc_tok, qty, self.get_price(lc_tok) or lc_ltp)
+                if oid_lp: self._place_sell(lp_sym, lp_tok, qty, self.get_price(lp_tok) or lp_ltp)
                 self._release_slot()
                 with self._lock:
                     self._done_today = True
@@ -951,8 +961,8 @@ class SmartHedgeStrategy(BaseStrategy):
 
         if trade is not None:
             log.warning("[SMART_HEDGE] EOD: position still open — forcing close")
-            if not self._squareoff_done:
-                with self._lock:
+            with self._lock:
+                if not self._squareoff_done:
                     self._initiate_close("EOD_FORCE", _now_ist())
         else:
             log.info(
