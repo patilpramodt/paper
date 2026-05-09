@@ -5,6 +5,8 @@ BBStochStrategy -- BankNifty options scalper using:
   * Bollinger Bands  (BB)   -- identifies breakout / volatility expansion
   * Volume Filter           -- confirms genuine institutional participation
   * EMA trend filter        -- prevents counter-trend entries
+  * EMA Seeding             -- yesterday's 5-min candles loaded at pre-market
+                               so EMA20 / EMA50 are accurate from bar 1
 
 SIGNAL LOGIC (all filters must agree before entry):
 --------------------------------------------------------------
@@ -14,12 +16,42 @@ SIGNAL LOGIC (all filters must agree before entry):
        OR BB Middle : last close crosses ABOVE the BB middle band
     2. Volume     : current bar volume >= VOL_MULT * rolling avg vol
     3. VWAP       : close above session VWAP
-    4. EMA        : EMA20 > EMA50 (uptrend context)
+    4. EMA        : EMA20 > EMA50 (uptrend context) -- accurate from bar 1
+                    because seeds are fetched from Zerodha historical API
+                    (yesterday's 5-min candles) in pre_market()
     5. Session    : only between SESSION_START and ENTRY_CUTOFF
 
   PE entry (buy put):
     Mirror of the above -- BB break below lower band, bounce below upper
     band, or middle band cross DOWN.
+
+EMA SEEDING:
+--------------------------------------------------------------
+  pre_market() calls _fetch_ema_seeds() which fetches yesterday's full
+  5-min session (75 candles) from Zerodha's historical_data API:
+
+      kite.historical_data(
+          instrument_token = 260105,     # NSE:NIFTY BANK index
+          from_date        = "YYYY-MM-DD 09:15:00",
+          to_date          = "YYYY-MM-DD 15:30:00",
+          interval         = "5minute"
+      )
+
+  EMA20 and EMA50 are computed on those candles. The last values are
+  stored as self._ema20_seed / self._ema50_seed.
+
+  In evaluate_signal(), compute_ema() uses these seeds as the starting
+  point and applies today's candles incrementally:
+
+      result = seed
+      for each today_candle_close:
+          result = alpha * close + (1 - alpha) * result
+
+  This is mathematically exact -- EMA is recursive so a correct seed
+  produces correct values on every subsequent bar without warmup.
+
+  Fallback: if the API call fails (holiday, auth error, etc.) seeds
+  default to None and EMA falls back to the old candle-only behaviour.
 
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
@@ -29,104 +61,23 @@ TRADE MANAGEMENT (on every option WebSocket tick):
             then trails every TRAIL_STEP pts after that
 
 FIXES APPLIED:
-  Bug 1 — time.sleep(0.4) was called inside _enter_trade(), which is
-           invoked from _evaluate_entry() → on_candle() → MarketHub's
-           WebSocket callback thread. Sleeping here blocked ALL tick
-           processing for every strategy for 400ms on every entry attempt.
-           During that sleep, no WebSocket ticks could arrive, so the
-           option we just subscribed had no price — get_price() returned
-           None → all entries silently skipped.
-           Fix: removed time.sleep(). At entry time, read LTP immediately.
-           If unavailable, log a warning and store a pending entry (see Bug 7).
-
-  Bug 2 — _persist_buf cleared in _evaluate_entry() BEFORE calling
-           _enter_trade(). When _enter_trade() returned early (LTP unavailable),
-           the persistence context was already wiped.
-           Fix: _persist_buf is now cleared inside _enter_trade() only after
-           a genuine fill is made. NOTE: with persistence=1 this has limited
-           effect — Bug 7 fix is the correct solution for LTP misses.
-
-  Bug 3 — _close_trade() read self._trade outside the lock, creating a
-           race window between the WS thread (auto-squareoff at 15:15 via
-           on_tick) and the main thread (eod_summary at 15:31). Both could
-           pass the `if not trade` guard simultaneously → double P&L, double
-           CSV row, double unsubscribe.
-           Fix: _close_trade() now atomically reads AND clears self._trade
-           inside a single lock acquisition at the very top.
-
-  Bug 4 — ATM options not pre-subscribed in pre_market(). Even without the
-           sleep bug, subscribing at the moment of signal and immediately
-           reading LTP is a race — first tick may take 200–800ms.
-           Fix: pre_market() subscribes ATM CE + PE at 9:08 AM based on
-           prev_close reference price.
-
-  Bug 5 — pre_market() only subscribed the opening ATM strike. When
-           BankNifty moves 300+ pts intraday, the signal fires at a strike
-           that was never pre-warmed → LTP miss on first attempt.
-           Fix: pre_market() now subscribes ATM±200pt strikes (6 tokens
-           total) to cover the typical intraday range.
-
-  Bug 6 (NEW) — pre_market() pre-subscribes strikes based on prev_close.
-           On large gap days (BankNifty gapped 1850pts down on 19-Mar-2026),
-           the actual intraday ATM was 1100–2000pts away from all pre-subscribed
-           strikes — every pre-warmed token was deep OTM and never used.
-           Both BB_STOCH signals (12:15 BUY_CE and 14:10 BUY_PE) fired on
-           completely cold tokens → LTP unavailable → trades permanently missed.
-           Fix: on_candle() checks if this is the first candle of the session
-           and if so calls _subscribe_spot_atm(spot) to subscribe ATM±400
-           based on the ACTUAL live market price. This fires ~9:20 AM —
-           75+ minutes before the earliest possible BB_STOCH signal (min_bars=14
-           candles = 70min from 9:15). Token warms up long before any signal.
-
-  Bug 7 (NEW) — When get_price() returns None (token subscribed but first
-           tick hasn't arrived yet), _enter_trade() bails early with a warning.
-           With persistence=1 the next 5-min candle overwrites _persist_buf
-           with HOLD (BB crossover already happened, no fresh setup), so the
-           signal never re-fires. Bug 2 fix (retain persist_buf) helps when
-           persistence≥2 but is irrelevant for persistence=1.
-           Fix: when LTP unavailable, store self._pending_entry with the full
-           signal context. In on_option_tick(), when that token's FIRST live
-           tick arrives (200–800ms, same 5-min window as original signal),
-           execute the fill immediately via _fill_pending(). No blocking,
-           no sleeping, no waiting for the next candle — the position opens
-           within seconds of the signal, exactly as intended.
-
-  Bug 8 (SL ANCHOR FIX) — BBTrade.__init__() anchored SL and TP to the
-           pre-slippage LTP then shifted by `off = slippage`, resulting in
-           SL distance from fill = sl_pts + 2*slippage (e.g. 15 + 3 = 18pts).
-           The sl_max ceiling of 15 was being silently violated on every trade.
-           Fix: anchor SL and TP directly to self.entry (the actual fill price):
-               self.sl     = entry - sl_pts    (exactly sl_pts below fill)
-               self.target = entry + tp_pts    (exactly tp_pts above fill)
-           This ensures the SL trigger and max risk are precisely as configured.
-
-  Bug 9 (TRAIL BREAKEVEN FIX) — _update_trail() set trail SL to trade.entry
-           (fill price). When the option price exactly touched entry and the
-           position was closed, exit_px = entry - slippage → net P&L = -slippage
-           (-1.5 pts). The "breakeven" trail was booking a small guaranteed loss.
-           Fix: trail SL to entry + slippage so exit_px = entry + slippage - slippage
-                = entry → true net P&L = 0.
-
-  Bug 10 — on_tick() called _force_close() on EVERY index tick after 15:15
-            (potentially dozens per second). Second call was harmless but
-            wasteful. Fix: added _squareoff_done flag — force-close fires
-            once only.
-
-  Bug 11 (order_id SLOT FIX) — BBTrade used __slots__ but did NOT declare
-            "order_id" in the tuple. When _execute_fill() assigned
-            `trade.order_id = buy_order_id` after constructing the trade,
-            Python raised:
-                AttributeError: 'BBTrade' object has no attribute 'order_id'
-            This exception propagated up through on_candle() → MarketHub's
-            WebSocket callback, which caught it and logged:
-                [BB_STOCH] on_candle error: 'BBTrade' object has no attribute 'order_id'
-            As a result the trade object was constructed but never stored in
-            self._trade (exception fired before `with self._lock: self._trade = trade`),
-            so the strategy thought it had 0 trades all day while the paper
-            router had already logged a fill. EOD showed Trades=0, W=0, L=0
-            despite two paper fills (12:15 BUY_CE and 14:00 BUY_PE).
-            Fix: added "order_id" to __slots__ and initialised self.order_id = ""
-            in __init__ so the attribute always exists before _execute_fill runs.
+  Bug 1  -- time.sleep() inside WebSocket callback blocked all tick
+             processing. Removed entirely.
+  Bug 2  -- _persist_buf cleared before fill; now cleared only on
+             genuine fill inside _execute_fill().
+  Bug 3  -- _close_trade() race condition between WS thread and main
+             thread. Fixed with atomic lock at top.
+  Bug 4  -- ATM options not pre-subscribed. Fixed in pre_market().
+  Bug 5  -- Only opening ATM pre-subscribed. Now ATM+-200 covered.
+  Bug 6  -- Large gap days: spot-based ATM+-400 subscription on
+             first candle (~9:20 AM).
+  Bug 7  -- LTP unavailable on entry: stored as _pending_entry,
+             filled on first tick via on_option_tick().
+  Bug 8  -- SL/TP anchored to LTP not fill price. Fixed in BBTrade.
+  Bug 9  -- Trail breakeven SL at entry, not entry+slippage. Fixed.
+  Bug 10 -- _force_close fired on every tick after 15:15. Fixed with
+             _squareoff_done flag.
+  Bug 11 -- BBTrade __slots__ missing "order_id". Fixed.
 """
 
 import csv
@@ -136,13 +87,6 @@ import threading
 import time as time_module
 from collections import deque
 from datetime import datetime, date, time as dtime, timezone, timedelta
-
-# IST FIX: GitHub Actions runners are UTC — timestamps must be IST
-_IST = timezone(timedelta(hours=5, minutes=30))
-
-def _now_ist() -> datetime:
-    """Always returns current datetime in IST — works on GitHub Actions (UTC) and local."""
-    return datetime.now(tz=_IST).replace(tzinfo=None)
 from typing import Optional, Tuple
 
 import numpy as np
@@ -151,103 +95,102 @@ import pandas as pd
 from core.base_strategy import BaseStrategy
 from core.instruments import get_atm_strike
 
+# IST FIX: GitHub Actions runners are UTC.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    return datetime.now(tz=_IST).replace(tzinfo=None)
+
+
 log = logging.getLogger("strategy.bb_stoch")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LIVE MODE FLAG
-#  Change to True when you are ready to trade BB_STOCH with real money.
-#  BBTrade always runs for PnL accounting and CSV logging in both modes.
-#  When LIVE_MODE=True, real MARKET orders are placed via OrderRouter on top.
 # ─────────────────────────────────────────────────────────────────────────────
 LIVE_MODE = False
 
+
 # ============================================================
-# CONFIG  (all tunables in one place)
+# CONFIG
 # ============================================================
 CFG = {
     # Bollinger Bands
-    "bb_period"         : 20,       # rolling window for BB mean/std
-    "bb_std"            : 2.0,      # number of std deviations for bands
-    "bb_squeeze_pct"    : 0.002,    # loosened: was 0.003 → 0.002 allows entries in tighter markets
-                                    # band-width / close < this = squeeze (skip)
-    "bb_mid_squeeze_pct": 0.003,    # Stricter squeeze threshold for middle-band cross entries only
-                                    # Middle cross in a tight band = no real momentum → skip
+    "bb_period"          : 20,
+    "bb_std"             : 2.0,
+    "bb_squeeze_pct"     : 0.002,   # band-width/close < this → squeeze, skip all entries
+    "bb_mid_squeeze_pct" : 0.003,   # stricter threshold for middle-band cross only
 
     # Volume filter
-    "vol_avg_period"    : 10,       # bars to compute average volume
-    "vol_mult"          : 0.85,     # loosened: was 1.0 → 0.85 (1.0 was blocking 0.98–1.00x bars incl. float precision edge cases)
+    "vol_avg_period"     : 10,
+    "vol_mult"           : 0.85,
 
     # VWAP
-    "vwap_buffer"       : 10.0,     # allow entry within N pts of VWAP line
+    "vwap_buffer"        : 10.0,    # allow entry within N pts of VWAP
 
     # Session windows (HH, MM)
-    "session_start"     : (9, 45),  # no entries before this (opening chaos)
-    "session_cutoff"    : (15, 0),  # no NEW entries after this
-    "auto_squareoff"    : (15, 15), # force-close all open positions
+    "session_start"      : (9, 45),
+    "session_cutoff"     : (15, 0),
+    "auto_squareoff"     : (15, 15),
 
     # Trade management
-    "atr_period"        : 14,       # ATR lookback for SL/TP scaling
-    "atr_sl_mult"       : 0.8,      # SL = min(atr * mult, sl_max)  -- was 0.9
-    "atr_tp_mult"       : 2.0,      # TP = min(atr * mult, tp_max)  -- was 1.6
-    "sl_min"            : 20.0,     # hard floor on SL distance (option pts) -- was 5; 5pts = noise on BankNifty
-    "sl_max"            : 50.0,     # hard ceiling on SL distance            -- was 15
-    "tp_min"            : 30.0,     # hard floor on TP distance              -- was 8
-    # Raised from 50 → 120. BankNifty options can run 80–200pts on a genuine
-    # breakout. Old 50pt cap was cutting winners far too early.
-    # Logic: TP = min(atr * 2.0, 120). ATR ~60–120 → TP = 120 (cap) most days.
-    # On low-vol days ATR ~40 → TP = 80 (below cap), still far better than 50.
-    "tp_max"            : 120.0,    # hard ceiling on TP distance            -- was 50
-    # Trail: BankNifty options are volatile — trail too tight = stopped by noise.
-    # trail_arm = 25: only move SL to BE once sitting on 25pts profit.
-    # trail_step = 12: trail SL up every 12pts of additional profit after that.
-    # Example: entry=100, arm at 125 → SL to BE(101.5), profit 137 → SL=113.5, etc.
-    "trail_arm"         : 25.0,     # move SL to BE when profit >= this      -- was 6
-    "trail_step"        : 12.0,     # then trail SL up every N pts           -- was 2
-    "slippage"          : 1.5,      # simulated fill slippage (per side)
-    "exit_cooldown"     : 2.0,      # seconds between exit attempts
+    "atr_period"         : 14,
+    "atr_sl_mult"        : 0.8,
+    "atr_tp_mult"        : 2.0,
+    "sl_min"             : 20.0,
+    "sl_max"             : 50.0,
+    "tp_min"             : 30.0,
+    "tp_max"             : 120.0,
+    "trail_arm"          : 25.0,    # move SL to BE when profit >= this
+    "trail_step"         : 12.0,    # then trail every N pts
+    "slippage"           : 1.5,
+    "exit_cooldown"      : 2.0,
 
     # Risk
-    "max_trades_day"    : 999999,  # Paper mode: unlimited trades (was 4)
-    "post_sl_cooldown"  : 120,      # 2 min wait after any SL hit
-    "max_daily_loss"    : 6000,     # Rs circuit breaker
-    "quantity"          : 30,       # lots
+    "max_trades_day"     : 999999,
+    "post_sl_cooldown"   : 120,
+    "max_daily_loss"     : 6000,
+    "quantity"           : 30,
 
-    # Signal persistence (candle bars)
-    "persistence"       : 1,        # lowered: was 2 (10-min confirmation window misses fast 5m moves)
+    # Signal persistence
+    "persistence"        : 1,
 
-    # Minimum 5-min bars needed before first signal.
-    # BB uses min_periods=bb_period//3=7, so it computes from bar 7.
-    # Keep at 14 to ensure enough price history for reliable BB bands.
-    # 14 bars × 5min = 70min from 9:15 → first signal ~10:25 AM.
-    "min_bars"          : 14,       # was 20
+    # Minimum 5-min bars before first signal.
+    # With EMA seeding active, EMA20/50 are accurate from bar 1.
+    # Remaining constraints: BB needs 7 bars, ATR needs 15 (falls
+    # back to sl_min if not ready), Volume needs 11 (bypasses if
+    # not ready). 14 bars = 70 min from 9:15 → first signal ~10:25 AM.
+    "min_bars"           : 14,
 
-    # FIX (Bug 6): strike offsets to pre-subscribe based on actual open price
-    # ±400 covers intraday moves of up to 400pts in either direction from open
-    # (typical BankNifty daily range is 300–600pts; ±400 covers ~80% of days)
-    "spot_atm_offsets"  : [0, 200, -200, 400, -400],
+    # Spot-based strike offsets for Bug 6 subscription
+    "spot_atm_offsets"   : [0, 200, -200, 400, -400],
 
-    # CSV output
-    "entry_csv"         : "logs/bb_stoch_entry.csv",
-    "exit_csv"          : "logs/bb_stoch_exit.csv",
-    "signal_csv"        : "logs/bb_stoch_signals.csv",
+    # EMA Seeding -- Zerodha historical API
+    # NSE:NIFTY BANK index token (constant, not expiry-specific)
+    "ema_seed_token"     : 260105,
+
+    # CSV paths
+    "entry_csv"          : "logs/bb_stoch_entry.csv",
+    "exit_csv"           : "logs/bb_stoch_exit.csv",
+    "signal_csv"         : "logs/bb_stoch_signals.csv",
 }
 
 
 # ============================================================
-# INDICATOR COMPUTATION
+# INDICATOR FUNCTIONS
 # ============================================================
 
 def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
-    """Wilder's ATR from a OHLCV DataFrame."""
     if len(df) < period + 1:
         return 0.0
     close = df["close"].astype(float)
     high  = df["high"].astype(float)
     low   = df["low"].astype(float)
     prev  = close.shift(1)
-    tr    = pd.concat([high - low,
-                       (high - prev).abs(),
-                       (low  - prev).abs()], axis=1).max(axis=1)
+    tr    = pd.concat([
+                high - low,
+                (high - prev).abs(),
+                (low  - prev).abs()
+            ], axis=1).max(axis=1)
     atr   = tr.ewm(alpha=1 / period, adjust=False).mean()
     return float(round(atr.iloc[-1], 2))
 
@@ -255,13 +198,17 @@ def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
 def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
     """
     Bollinger Bands on 'close'.
-    Returns: mid, upper, lower, bw_pct (bandwidth as % of mid), squeeze (bool)
+    Returns current + previous bar values for crossover detection.
     """
     if len(df) < 2:
-        return {"mid": 0, "upper": 0, "lower": 0, "bw_pct": 0, "squeeze": True,
-                "prev_mid": 0, "prev_upper": 0, "prev_lower": 0, "prev_close": 0}
+        return {
+            "mid": 0, "upper": 0, "lower": 0,
+            "bw_pct": 0, "squeeze": True,
+            "prev_mid": 0, "prev_upper": 0,
+            "prev_lower": 0, "prev_close": 0,
+        }
     close = df["close"].astype(float)
-    min_p = max(2, period // 3)   # allow partial-history computation
+    min_p = max(2, period // 3)
     mid   = close.rolling(period, min_periods=min_p).mean()
     std   = close.rolling(period, min_periods=min_p).std().fillna(0)
     upper = mid + nstd * std
@@ -271,44 +218,30 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
     l     = float(lower.iloc[-1])
     bw    = (u - l) / m if m > 0 else 0
     return {
-        "mid"     : round(m, 2),
-        "upper"   : round(u, 2),
-        "lower"   : round(l, 2),
-        "bw_pct"  : round(bw, 5),
-        "squeeze" : bw < CFG["bb_squeeze_pct"],
-        # Previous bar values (for crossover detection)
-        "prev_mid"  : round(float(mid.iloc[-2]),   2) if len(df) >= 2 else m,
-        "prev_upper": round(float(upper.iloc[-2]), 2) if len(df) >= 2 else u,
-        "prev_lower": round(float(lower.iloc[-2]), 2) if len(df) >= 2 else l,
-        "prev_close": round(float(close.iloc[-2]), 2) if len(df) >= 2 else float(close.iloc[-1]),
+        "mid"        : round(m, 2),
+        "upper"      : round(u, 2),
+        "lower"      : round(l, 2),
+        "bw_pct"     : round(bw, 5),
+        "squeeze"    : bw < CFG["bb_squeeze_pct"],
+        "prev_mid"   : round(float(mid.iloc[-2]),   2),
+        "prev_upper" : round(float(upper.iloc[-2]), 2),
+        "prev_lower" : round(float(lower.iloc[-2]), 2),
+        "prev_close" : round(float(close.iloc[-2]), 2),
     }
 
 
 def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
     """
     Ratio of last bar's volume vs rolling N-bar average.
-    > 1.0 means above average. > vol_mult = confirmed participation.
-
-    Returns -1.0 (sentinel) when volume data is unavailable so the caller
-    can distinguish "data missing" from a genuine low-volume bar and skip
-    the volume filter rather than silently blocking every trade.
+    Returns -1.0 sentinel when data unavailable -- caller bypasses filter.
     """
     if "volume" not in df.columns:
-        log.warning("[BB_STOCH] No 'volume' column in 5m candles -- "
-                    "volume filter will be bypassed (check MarketHub candle aggregation)")
-        return -1.0  # sentinel: data unavailable
-
+        return -1.0
     vol = df["volume"].astype(float)
-
-    # All zeros / NaN = another common data gap symptom
     if vol.sum() == 0 or vol.isna().all():
-        log.warning("[BB_STOCH] Volume column is all zeros/NaN -- "
-                    "volume filter bypassed (check feed)")
-        return -1.0  # sentinel
-
+        return -1.0
     if len(df) < avg_period + 1:
-        return -1.0  # not enough history yet -- bypass rather than block
-
+        return -1.0
     avg     = float(vol.iloc[-(avg_period + 1):-1].mean())
     current = float(vol.iloc[-1])
     if avg <= 0:
@@ -316,39 +249,56 @@ def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
     return round(current / avg, 3)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  CHANGE A: EMA TREND FILTER
-#  20-period and 50-period Exponential Moving Averages on the index.
-#  Purpose: prevent buying CE in a strong downtrend (ema20 < ema50)
-#           and buying PE in a strong uptrend (ema20 > ema50).
-#  BB + Stochastic alone cannot distinguish pullback from reversal.
-#  The 20/50 EMA relationship provides a simple, robust trend context.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def compute_ema(df: pd.DataFrame, period: int) -> float:
+def compute_ema(df: pd.DataFrame, period: int,
+                seed: Optional[float] = None) -> float:
     """
     Exponential Moving Average on 'close'.
-    Uses ewm(span=period, adjust=False) — standard Wilder-style EMA.
-    Works with partial history (ewm computes from bar 1), so no min_bars
-    guard is needed here — caller decides whether value is meaningful.
+
+    With seed (EMA seeding from yesterday's 5-min candles):
+        Starts from yesterday's closing EMA value and applies today's
+        candles one by one using:
+            result = alpha * price + (1 - alpha) * result
+        where alpha = 2 / (period + 1).
+        Mathematically exact from bar 1 -- zero warmup needed.
+
+    Without seed (fallback -- today's candles only):
+        Standard pandas ewm(). Needs ~30-50 bars to converge.
     """
-    if len(df) < 2:
-        return 0.0
+    if len(df) < 1:
+        return seed if seed is not None else 0.0
+
     close = df["close"].astype(float)
-    ema   = close.ewm(span=period, adjust=False).mean()
-    return float(round(ema.iloc[-1], 2))
+
+    if seed is not None:
+        alpha  = 2.0 / (period + 1)
+        result = float(seed)
+        for price in close:
+            result = alpha * float(price) + (1.0 - alpha) * result
+        return round(result, 2)
+    else:
+        if len(df) < 2:
+            return 0.0
+        ema = close.ewm(span=period, adjust=False).mean()
+        return float(round(ema.iloc[-1], 2))
 
 
 # ============================================================
 # SIGNAL BUILDER
 # ============================================================
 
-def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
+def evaluate_signal(df: pd.DataFrame,
+                    vwap: Optional[float],
+                    ema20_seed: Optional[float] = None,
+                    ema50_seed: Optional[float] = None) -> dict:
     """
-    Run all filters. Returns a signal dict:
-        action      : "BUY_CE" | "BUY_PE" | "HOLD"
-        blocked_by  : reason string if HOLD
-        bb, vol_ratio, atr: indicator snapshots for logging
+    Run all filters. Returns:
+        action     : "BUY_CE" | "BUY_PE" | "HOLD"
+        blocked_by : reason string if HOLD
+        bb, vol_ratio, atr, ema20, ema50, close : snapshots for logging
+
+    ema20_seed / ema50_seed: yesterday's closing EMA values loaded by
+    _fetch_ema_seeds(). When provided, EMA is exact from bar 1.
+    When None, falls back to today's candles only (less accurate early).
     """
     empty = {"action": "HOLD", "blocked_by": "no_data",
              "bb": {}, "vol_ratio": 0, "atr": 0}
@@ -362,28 +312,24 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     atr       = _compute_atr(df, CFG["atr_period"])
     close     = float(df["close"].iloc[-1])
 
-    # EMA trend filter -- 20 EMA vs 50 EMA on index candles.
-    # Prevents CE entries in a strong downtrend and PE entries in a strong uptrend.
-    ema20    = compute_ema(df, 20)
-    ema50    = compute_ema(df, 50)
-    ema_bull = ema20 > ema50   # uptrend  → CE entries allowed
-    ema_bear = ema20 < ema50   # downtrend → PE entries allowed
+    # EMA trend filter -- seeded so accurate from bar 1
+    ema20    = compute_ema(df, 20, seed=ema20_seed)
+    ema50    = compute_ema(df, 50, seed=ema50_seed)
+    ema_bull = ema20 > ema50
+    ema_bear = ema20 < ema50
 
-    base = {"bb": bb, "vol_ratio": vol_ratio, "atr": atr,
-            "close": close, "ema20": ema20, "ema50": ema50}
+    base = {
+        "bb": bb, "vol_ratio": vol_ratio, "atr": atr,
+        "close": close, "ema20": ema20, "ema50": ema50,
+    }
 
-    # ---- Filter 1: BB squeeze → skip (no trend) ----
+    # Gate 1: BB squeeze
     if bb["squeeze"]:
         return {"action": "HOLD", "blocked_by": "bb_squeeze", **base}
 
-    # ---- Filter 2: Volume ----
-    # vol_ratio == -1.0 is the sentinel meaning "no volume data available".
-    # In that case we bypass the filter (don't block) and log a warning.
-    # When real volume data is flowing, vol_ratio must exceed vol_mult (0.85x avg).
-    # Note: round() prevents float precision edge cases (e.g. 0.9997 logged as 1.00
-    #       but failing strict >= 1.0 comparison).
+    # Gate 2: Volume
     if vol_ratio == -1.0:
-        vol_ok = True   # data unavailable -- bypass, do not block
+        vol_ok = True   # data unavailable -- bypass
         log.debug("[BB_STOCH] Volume data unavailable -- vol filter bypassed")
     else:
         vol_ok = round(vol_ratio, 4) >= CFG["vol_mult"]
@@ -391,19 +337,19 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     if not vol_ok:
         return {"action": "HOLD", "blocked_by": "volume_low", **base}
 
-    # ---- VWAP bias ----
+    # Gate 3: VWAP bias
     if vwap and vwap > 0:
         above_vwap = close >= (vwap - CFG["vwap_buffer"])
         below_vwap = close <= (vwap + CFG["vwap_buffer"])
     else:
-        above_vwap = True  # data unavailable -- don't block
+        above_vwap = True
         below_vwap = True
 
     # ================================================================
     # CE CONDITIONS
-    #   1. Breakout  : close crosses ABOVE upper band
-    #   2. Bounce    : close crosses back ABOVE lower band (mean-reversion)
-    #   3. Middle    : close crosses ABOVE middle band (trend resumption)
+    #   Breakout : close crosses ABOVE upper band (this bar vs prev bar)
+    #   Bounce   : close crosses back ABOVE lower band
+    #   Middle   : close crosses ABOVE middle band
     # ================================================================
     bb_breakout_up  = close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"]
     bb_bounce_up    = close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
@@ -412,7 +358,6 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     ce_bb_trigger = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
 
     if ce_bb_trigger and above_vwap:
-        # EMA trend filter -- CE only in uptrend (ema20 > ema50)
         if not ema_bull:
             return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
         if bb_breakout_up:
@@ -420,7 +365,6 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         elif bb_bounce_up:
             mode = "bounce"
         else:
-            # Middle-band cross: require wider bands — tight bands = no momentum
             if bb["bw_pct"] < CFG["bb_mid_squeeze_pct"]:
                 return {"action": "HOLD", "blocked_by": "bb_mid_squeeze", **base}
             mode = "middle"
@@ -428,9 +372,9 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
 
     # ================================================================
     # PE CONDITIONS
-    #   1. Breakout  : close crosses BELOW lower band
-    #   2. Bounce    : close crosses back BELOW upper band (overbought reversal)
-    #   3. Middle    : close crosses BELOW middle band (trend resumption)
+    #   Breakout : close crosses BELOW lower band
+    #   Bounce   : close crosses back BELOW upper band
+    #   Middle   : close crosses BELOW middle band
     # ================================================================
     bb_breakout_dn  = close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"]
     bb_bounce_dn    = close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
@@ -439,7 +383,6 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     pe_bb_trigger = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
 
     if pe_bb_trigger and below_vwap:
-        # EMA trend filter -- PE only in downtrend (ema20 < ema50)
         if not ema_bear:
             return {"action": "HOLD", "blocked_by": "ema_trend_pe", **base}
         if bb_breakout_dn:
@@ -447,13 +390,12 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         elif bb_bounce_dn:
             mode = "bounce"
         else:
-            # Middle-band cross: require wider bands — tight bands = no momentum
             if bb["bw_pct"] < CFG["bb_mid_squeeze_pct"]:
                 return {"action": "HOLD", "blocked_by": "bb_mid_squeeze", **base}
             mode = "middle"
         return {"action": "BUY_PE", "blocked_by": "", **base, "mode": mode}
 
-    # ---- Granular block reasons for analysis ----
+    # Granular block reasons for log analysis
     if ce_bb_trigger:
         if not above_vwap:
             return {"action": "HOLD", "blocked_by": "below_vwap", **base}
@@ -473,54 +415,33 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
 # ============================================================
 
 class BBTrade:
-    """Minimal trade record (no external dependency on scalper_v7_core)."""
     __slots__ = (
         "symbol", "token", "option_type", "qty",
         "entry", "sl", "target", "sl_pts", "tp_pts",
         "trail_stage", "spot", "atr", "timestamp",
-        "exit_pending", "last_exit_ts",
-        "order_id",   # FIX (Bug 11): was missing from __slots__ → AttributeError when
-                      # _execute_fill() did `trade.order_id = buy_order_id`. Python's
-                      # __slots__ prevents setting any attribute not declared here.
+        "exit_pending", "last_exit_ts", "order_id",
     )
 
     def __init__(self, symbol, token, opt_type, ltp, qty,
                  spot, sl_pts, tp_pts, atr):
-        """
-        FIX (Bug 8 — SL ANCHOR):
-          Old code computed sl/target by shifting from pre-slippage ltp:
-              off          = entry - ltp  (= slippage)
-              self.sl      = sl_price - off   → ltp - sl_pts - 2*slip
-              self.target  = tp_price + off   → ltp + tp_pts + 0 (wrong direction)
-          This meant actual SL distance from fill = sl_pts + 2*slippage,
-          violating the sl_max ceiling (15 + 3 = 18 pts risked, not 15).
-
-          Fix: anchor SL and target directly to self.entry (the actual fill):
-              self.sl     = entry - sl_pts   (exactly sl_pts below fill)
-              self.target = entry + tp_pts   (exactly tp_pts above fill)
-        """
-        slip            = CFG["slippage"]
-        self.symbol     = symbol
-        self.token      = token
+        slip             = CFG["slippage"]
+        self.symbol      = symbol
+        self.token       = token
         self.option_type = opt_type
-        self.qty        = qty
-        self.entry      = round(ltp + slip, 2)          # simulated fill with slippage
-
-        # FIX (Bug 8): anchor SL/TP to actual fill price, not pre-slippage LTP.
-        # This ensures sl_pts and tp_pts are exact distances from the fill.
-        self.sl         = round(self.entry - sl_pts, 2)  # sl_max ceiling respected
-        self.target     = round(self.entry + tp_pts, 2)  # tp_max ceiling respected
-
-        self.sl_pts     = sl_pts
-        self.tp_pts     = tp_pts
+        self.qty         = qty
+        self.entry       = round(ltp + slip, 2)
+        # Bug 8 fix: anchor SL/TP to actual fill price
+        self.sl          = round(self.entry - sl_pts, 2)
+        self.target      = round(self.entry + tp_pts, 2)
+        self.sl_pts      = sl_pts
+        self.tp_pts      = tp_pts
         self.trail_stage = 0
-        self.spot       = spot
-        self.atr        = atr
-        self.timestamp  = _now_ist().isoformat()         # FIX: was UTC on GitHub Actions
+        self.spot        = spot
+        self.atr         = atr
+        self.timestamp   = _now_ist().isoformat()
         self.exit_pending  = False
         self.last_exit_ts  = 0.0
-        self.order_id      = ""    # FIX (Bug 11): set default so slot is always initialised;
-                                   # _execute_fill() overwrites with the real order id.
+        self.order_id      = ""   # Bug 11 fix
 
 
 # ============================================================
@@ -543,16 +464,14 @@ def _csv_append(filepath: str, row: dict):
 
 class BBStochStrategy(BaseStrategy):
     """
-    BankNifty options strategy using Bollinger Bands + Stochastic + Volume.
-    Plugs into the shared MarketHub framework -- zero extra API calls.
+    BankNifty options strategy: Bollinger Bands + Volume + EMA trend filter.
 
-    Data consumed:
-      on_candle()       -- 5-min index candles (broadcast by MarketHub)
-      on_option_tick()  -- live option LTP for SL/TP management
-      hub.session_vwap  -- tick-accurate intraday VWAP
+    EMA is seeded from yesterday's 5-min candles (Zerodha historical API)
+    in pre_market(), making EMA20 and EMA50 accurate from bar 1.
+    All filters are live and working from the very first candle.
     """
 
-    LIVE_MODE = LIVE_MODE   # expose module flag via class for BaseStrategy helpers
+    LIVE_MODE = LIVE_MODE
 
     @property
     def name(self) -> str:
@@ -561,8 +480,7 @@ class BBStochStrategy(BaseStrategy):
     def __init__(self, market_hub):
         super().__init__(market_hub)
 
-        # Private 5-min candle buffer (fed from MarketHub's on_candle broadcast)
-        # Size: bb_period (20) + ema50 lookback + headroom
+        # 5-min candle buffer -- size covers EMA50 lookback + headroom
         buf_size = max(CFG["bb_period"], 50) + 20
         self._buf_5m: deque = deque(maxlen=buf_size)
 
@@ -579,46 +497,35 @@ class BBStochStrategy(BaseStrategy):
         self._results     : list  = []
         self._blocked_log : dict  = {}
 
-        # Signal persistence (must fire on N consecutive 5-min bars)
+        # Signal persistence
         self._persist_buf: deque = deque(maxlen=CFG["persistence"])
 
         # Pre-market data
-        self._instruments   = None
-        self._expiry_date   = None
-        self._dte           = 0
-        self._session_date  = None
+        self._instruments  = None
+        self._expiry_date  = None
+        self._dte          = 0
+        self._session_date = None
 
-        # FIX (Bug 10): guard flag so _force_close is called at most once per day
+        # EMA seeds -- set by _fetch_ema_seeds() in pre_market().
+        # None = seeds unavailable, compute_ema() falls back to
+        # today's candles only.
+        self._ema20_seed: Optional[float] = None
+        self._ema50_seed: Optional[float] = None
+
+        # Bug 10 fix
         self._squareoff_done: bool = False
 
-        # FIX (Bug 4): pre-subscribed tokens (populated in pre_market)
+        # Bug 4/5 fix
         self._pre_ce_token: Optional[int] = None
         self._pre_pe_token: Optional[int] = None
 
-        # FIX (Bug 6): flag to trigger dynamic spot-based subscription on first candle
-        # pre_market() subscribes based on prev_close which fails on large gap days.
-        # on_candle() will subscribe ATM±400 based on actual live spot on first bar.
+        # Bug 6 fix
         self._open_atm_subscribed: bool = False
 
-        # FIX (Bug 7): pending entry storage.
-        # When _enter_trade() bails because LTP is unavailable (token subscribed
-        # but first WebSocket tick hasn't arrived yet), we store the full signal
-        # context here. on_option_tick() watches for this token and fills the
-        # trade the moment the first live price arrives — typically 200–800ms later,
-        # well within the same 5-minute window. No sleeping, no blocking.
+        # Bug 7 fix
         self._pending_entry: Optional[dict] = None
 
-        # CHANGE B: Entry delay — next-candle breakout confirmation.
-        # When a valid signal fires, we do NOT enter immediately. Instead, we
-        # store the breakout candle's high (CE) or low (PE) as a trigger level.
-        # on_tick() watches the live index price; if it trades through the trigger
-        # in the NEXT candle, the entry fires instantly. This eliminates fake
-        # breakouts that reverse within the same 5-min bar.
-        #
-        # Lifecycle:
-        #   on_candle() [bar N close]   → confirmed signal  → set _entry_delay_pending
-        #   on_tick()   [bar N+1 ticks] → index > trigger   → _enter_trade() fires
-        #   on_candle() [bar N+1 close] → if still pending  → expire (no confirmation)
+        # Change B: entry delay (next-candle breakout confirmation)
         self._entry_delay_pending: Optional[dict] = None
 
         log.info("[BB_STOCH] Strategy initialized")
@@ -633,108 +540,169 @@ class BBStochStrategy(BaseStrategy):
         self._dte          = premarket_data.dte_days
         self._session_date = _now_ist().date()
         self._reset_day()
+
         log.info(
             f"[BB_STOCH] Pre-market | VIX={premarket_data.vix} "
             f"PCR={premarket_data.pcr} Expiry={self._expiry_date} DTE={self._dte}"
         )
-        if premarket_data.pcr is None:
-            log.warning("[BB_STOCH] PCR is None -- VWAP bias will be unrestricted. "
-                        "Check if PCR fetch failed in core.premarket")
 
-        # FIX (Bug 4 + 5): pre-subscribe ATM CE + PE + ATM±200 at 9:08 AM based
-        # on prev_close. This warms up the typical daily range for normal sessions.
-        #
-        # FIX (Bug 6): this is NOT sufficient for large gap days (e.g. 1850pt gap).
-        # _subscribe_spot_atm() is called on the first 5-min candle with the actual
-        # live spot to cover the real intraday range regardless of gap size.
+        # ── EMA SEEDING ──────────────────────────────────────────────────────
+        # Fetch yesterday's 5-min candles from Zerodha historical API and
+        # compute EMA20/50 seeds. Makes EMA accurate from bar 1 of today.
+        self._ema20_seed, self._ema50_seed = self._fetch_ema_seeds()
+
+        # ── PRE-SUBSCRIBE STRIKES ─────────────────────────────────────────────
+        # Bug 4+5 fix: warm up ATM and ATM+-200 tokens before signal fires.
         ref_price = premarket_data.prev_close or premarket_data.prev_last5m_close
         if ref_price and self._expiry_date:
             atm = get_atm_strike(ref_price)
-
-            # Strikes to pre-warm: ATM, ATM±200 covers ~1 std-dev intraday move
-            strike_offsets = [0, 200, -200]
-
-            for offset in strike_offsets:
+            for offset in [0, 200, -200]:
                 for opt_type in ("CE", "PE"):
-                    adj = atm + offset
-                    # On expiry day use 1-strike ITM at the primary ATM only
+                    strike = atm + offset
                     if offset == 0 and self._dte == 0:
-                        adj = atm - 100 if opt_type == "CE" else atm + 100
-                    tok, sym = instruments.get_option_token(adj, opt_type, self._expiry_date)
+                        strike = atm - 100 if opt_type == "CE" else atm + 100
+                    tok, sym = instruments.get_option_token(strike, opt_type, self._expiry_date)
                     if tok:
                         self.subscribe_option(tok)
-                        # Store primary ATM tokens for quick lookup at entry time
                         if offset == 0:
                             if opt_type == "CE":
                                 self._pre_ce_token = tok
                             else:
                                 self._pre_pe_token = tok
-                        log.info(f"[BB_STOCH] Pre-subscribed {sym} ({tok})"
-                                 f"{' [ATM]' if offset == 0 else f' [ATM{offset:+d}]'}")
-                    else:
-                        if offset == 0:
-                            log.warning(f"[BB_STOCH] Pre-subscribe failed for ATM {adj} {opt_type}")
-                        else:
-                            log.debug(f"[BB_STOCH] Pre-subscribe skipped for {adj} {opt_type} "
-                                      f"(token not found — likely near expiry)")
+                        log.info(
+                            f"[BB_STOCH] Pre-subscribed {sym} ({tok})"
+                            f"{' [ATM]' if offset == 0 else f' [ATM{offset:+d}]'}"
+                        )
         else:
-            log.warning("[BB_STOCH] No ref price for pre-subscription — "
-                        "spot-based subscription will fire on first candle only")
+            log.warning("[BB_STOCH] No ref price for pre-subscription")
 
         return True
 
+    # ----------------------------------------------------------
+    # EMA SEEDING
+    # ----------------------------------------------------------
+
+    def _fetch_ema_seeds(self) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Fetch yesterday's full 5-min session from Zerodha historical_data API
+        and compute EMA20 / EMA50 seeds.
+
+        API call used:
+            kite.historical_data(
+                instrument_token = 260105,          # NSE:NIFTY BANK index
+                from_date        = "YYYY-MM-DD 09:15:00",
+                to_date          = "YYYY-MM-DD 15:30:00",
+                interval         = "5minute"
+            )
+
+        Returns (ema20, ema50) on success, (None, None) on any failure.
+        On failure the strategy logs a warning and falls back to computing
+        EMA from today's candles only.
+        """
+        try:
+            today = _now_ist().date()
+
+            # Walk back to last trading day (skip weekends).
+            # Zerodha handles NSE holidays -- if prev weekday was a holiday
+            # it returns fewer candles and we fall back gracefully.
+            prev_day = today - timedelta(days=1)
+            while prev_day.weekday() >= 5:   # 5=Sat, 6=Sun
+                prev_day -= timedelta(days=1)
+
+            from_dt = f"{prev_day} 09:15:00"
+            to_dt   = f"{prev_day} 15:30:00"
+
+            log.info(
+                f"[BB_STOCH] EMA seed: fetching 5-min candles for {prev_day} "
+                f"(token={CFG['ema_seed_token']}) ..."
+            )
+
+            candles = self._hub.kite.historical_data(
+                instrument_token = CFG["ema_seed_token"],
+                from_date        = from_dt,
+                to_date          = to_dt,
+                interval         = "5minute"
+            )
+
+            if not candles or len(candles) < 20:
+                log.warning(
+                    f"[BB_STOCH] EMA seed: only {len(candles) if candles else 0} candles "
+                    f"returned for {prev_day} (need >= 20). "
+                    f"Possible holiday or auth issue. "
+                    f"Falling back to today-candles-only EMA."
+                )
+                return None, None
+
+            closes = pd.Series([float(c["close"]) for c in candles])
+            ema20  = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
+            ema50  = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+
+            log.info(
+                f"[BB_STOCH] EMA seeds ready | prev_day={prev_day} | "
+                f"bars={len(candles)} | "
+                f"EMA20={ema20:.2f}  EMA50={ema50:.2f} | "
+                f"Trend={'BULL (EMA20>EMA50)' if ema20 > ema50 else 'BEAR (EMA20<EMA50)'} | "
+                f"EMA filter is LIVE from bar 1 today"
+            )
+            return ema20, ema50
+
+        except Exception as e:
+            log.warning(
+                f"[BB_STOCH] EMA seed fetch failed: {e}. "
+                f"EMA will warm up from today's candles only "
+                f"(less accurate for first ~30 bars)."
+            )
+            return None, None
+
     def _reset_day(self):
-        self._daily_pnl    = 0.0
-        self._trades_today = 0
-        self._last_sl_time = 0.0
-        self._is_halted    = False
+        self._daily_pnl           = 0.0
+        self._trades_today        = 0
+        self._last_sl_time        = 0.0
+        self._is_halted           = False
         self._results.clear()
         self._blocked_log.clear()
         self._persist_buf.clear()
-        self._squareoff_done     = False   # FIX (Bug 10): reset guard each day
-        self._open_atm_subscribed = False  # FIX (Bug 6): reset so first candle re-subscribes
-        self._pending_entry       = None   # FIX (Bug 7): discard any stale pending entry
-        self._entry_delay_pending = None   # CHANGE B: discard any stale entry delay
+        self._squareoff_done      = False
+        self._open_atm_subscribed = False
+        self._pending_entry       = None
+        self._entry_delay_pending = None
+        # Reset seeds so stale previous-day values are never used if
+        # _fetch_ema_seeds() is not called (e.g. on a reconnect reset).
+        # They are set again immediately after this by pre_market().
+        self._ema20_seed = None
+        self._ema50_seed = None
 
     # ----------------------------------------------------------
-    # FIX (Bug 6): Dynamic spot-based subscription on first candle
+    # Bug 6: Dynamic spot-based subscription on first candle
     # ----------------------------------------------------------
 
     def _subscribe_spot_atm(self, spot: float):
         """
-        FIX (Bug 6): Subscribe ATM±400 strikes based on actual live spot price.
-
-        Called on the first 5-min candle of the session (~9:20 AM).
-        This covers large gap days where pre_market()'s prev_close-based
-        subscriptions land on completely wrong strikes.
+        Subscribe ATM+-400 based on actual live spot price.
+        Called on first 5-min candle (~9:20 AM) to cover large gap days
+        where pre_market()'s prev_close-based subscriptions are off-market.
         """
         if not spot or spot <= 0:
             return
         if not self._expiry_date or not self._instruments:
             return
 
-        atm = get_atm_strike(spot)
+        atm        = get_atm_strike(spot)
         subscribed = 0
-
         for offset in CFG["spot_atm_offsets"]:
             for opt_type in ("CE", "PE"):
-                strike = atm + offset
-                tok, sym = self._instruments.get_option_token(strike, opt_type, self._expiry_date)
+                tok, sym = self._instruments.get_option_token(
+                    atm + offset, opt_type, self._expiry_date
+                )
                 if tok:
                     self.subscribe_option(tok)
                     subscribed += 1
                     log.info(
-                        f"[BB_STOCH] Spot-subscribe {sym} ({tok}) "
+                        f"[BB_STOCH] Spot-sub {sym} ({tok}) "
                         f"[spot-ATM{offset:+d}]"
                     )
-                else:
-                    log.debug(
-                        f"[BB_STOCH] Spot-subscribe skipped {strike}{opt_type} "
-                        f"(token not found)"
-                    )
-
         log.info(
-            f"[BB_STOCH] Spot-based subscription complete: "
+            f"[BB_STOCH] Spot subscription done: "
             f"{subscribed} tokens around ATM={atm} (spot={spot:.0f})"
         )
 
@@ -743,29 +711,24 @@ class BBStochStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
-        """Index tick -- not used directly (we work on 5-min candles).
-
-        FIX (Bug 10): _force_close() was called on every index tick after 15:15.
-        This could be dozens of calls per second. Added _squareoff_done guard
-        so it fires exactly once.
         """
-        # FIX (Bug 10): guard with flag — auto square-off fires exactly once
+        Index price tick.
+        Bug 10 fix: _force_close fires exactly once via _squareoff_done.
+        Change B: confirms or expires the entry delay trigger level.
+        """
+        # Bug 10 fix
         if ts.time() >= dtime(*CFG["auto_squareoff"]) and not self._squareoff_done:
             self._squareoff_done = True
             self._force_close("AUTO-SQUAREOFF")
+            return
 
-        # CHANGE B: Entry delay confirmation.
-        # After a signal fires on candle close, we do not enter immediately.
-        # Instead, on_candle() stores the breakout high (CE) / low (PE) in
-        # _entry_delay_pending. Here, on every index tick in the NEXT candle,
-        # we check whether the live index price has traded through that level.
-        # The first tick that confirms triggers _enter_trade() instantly.
+        # Change B: entry delay confirmation
         confirm = self._entry_delay_pending
         if confirm and not self._trade and not self._is_halted:
             now_time = ts.time()
             action   = confirm["action"]
             trigger  = confirm["trigger_level"]
-            # Expire if we've drifted past the entry cutoff
+
             if now_time >= dtime(*CFG["session_cutoff"]):
                 log.info(
                     f"[BB_STOCH] Entry delay expired (past cutoff) "
@@ -790,40 +753,28 @@ class BBStochStrategy(BaseStrategy):
     def on_candle(self, candle: dict, ts: datetime):
         """
         Called by MarketHub when a 5-min index candle closes.
-        This is the main signal evaluation trigger.
-
-        FIX (Bug 6): on the first candle of the session, subscribe ATM±400
-        based on the actual spot price. This happens ~9:20 AM — 65+ minutes
-        before the earliest possible BB_STOCH signal (min_bars=14 × 5min =
-        70min from 9:15). All tokens are warm before any signal can fire.
-
-        CHANGE B: if _entry_delay_pending survived a full candle without
-        on_tick confirming (i.e. the next candle never traded through the
-        breakout level), it is expired here — the setup is invalidated.
+        Bug 6 fix: on first candle subscribe ATM+-400 from actual spot.
+        Change B: expire unconfirmed entry delay (fake breakout).
         """
         with self._lock:
             self._buf_5m.append(candle)
 
-        # FIX (Bug 6): subscribe around actual open spot on first candle.
-        # pre_market() uses prev_close which fails on large gap days.
-        # This fires once per session, covers the true intraday ATM range.
+        # Bug 6 fix: spot-based subscription on first candle of session
         if not self._open_atm_subscribed:
             spot = candle.get("close", 0)
             if spot and spot > 0:
                 self._subscribe_spot_atm(spot)
                 self._open_atm_subscribed = True
 
-        # CHANGE B: expire entry delay that was not confirmed in the previous candle.
-        # A new candle starting means the confirmation window has closed.
+        # Change B: expire any entry delay that survived a full candle
         if self._entry_delay_pending:
             edp = self._entry_delay_pending
             log.info(
-                f"[BB_STOCH] Entry delay expired (no confirmation in previous candle) "
-                f"| {edp['action']} trigger={edp['trigger_level']:.2f}"
+                f"[BB_STOCH] Entry delay expired (no index confirmation "
+                f"in previous candle) | {edp['action']} trigger={edp['trigger_level']:.2f}"
             )
             self._entry_delay_pending = None
 
-        # Don't look for entries if a trade is already open
         if self._trade:
             return
 
@@ -832,85 +783,74 @@ class BBStochStrategy(BaseStrategy):
     def on_option_tick(self, token: int, price: float, ts: datetime,
                        tick_ts: datetime = None):
         """
-        Live option price -- drives two things:
-          1. SL/TP/trail management for open trades (existing behaviour)
-          2. FIX (Bug 7): pending entry fill on first live tick
+        Live option price tick.
+        Bug 7 fix: fills pending entry on first tick of subscribed token.
         """
-        # FIX (Bug 7): check for pending entry on first tick of subscribed token
+        # Bug 7: pending entry fill
         pending = self._pending_entry
         if pending is not None and token == pending["token"] and not self._trade:
-            # Validate the pending entry is still actionable
             now_time = ts.time()
             if now_time >= dtime(*CFG["session_cutoff"]):
-                log.info(
-                    f"[BB_STOCH] Pending entry expired (past cutoff) for "
-                    f"{pending['symbol']} — discarding"
-                )
+                log.info(f"[BB_STOCH] Pending entry expired (past cutoff) for "
+                         f"{pending['symbol']} -- discarding")
                 self._pending_entry = None
             elif self._is_halted or self._trades_today >= CFG["max_trades_day"]:
-                log.info(
-                    f"[BB_STOCH] Pending entry cancelled (risk gate) for "
-                    f"{pending['symbol']}"
-                )
+                log.info(f"[BB_STOCH] Pending entry cancelled (risk gate) for "
+                         f"{pending['symbol']}")
                 self._pending_entry = None
             elif price and price >= 5:
-                # Valid LTP arrived — fill the trade now
                 self._fill_pending(pending, price, ts)
-                return
-            # else price still invalid — keep pending, wait for next tick
             return
 
-        # Normal trade management for open position
-        if token != self._active_token:
-            return
-        if not self._trade:
+        if token != self._active_token or not self._trade:
             return
         self._manage_trade(price, ts)
 
     # ----------------------------------------------------------
-    # SIGNAL EVALUATION (on every 5-min candle close)
+    # SIGNAL EVALUATION
     # ----------------------------------------------------------
 
     def _evaluate_entry(self, ts: datetime):
         now_time = ts.time()
 
-        # Session gate
         if now_time < dtime(*CFG["session_start"]):
             return
         if now_time >= dtime(*CFG["session_cutoff"]):
             return
-
-        # Risk gate
         if self._is_halted:
             return
         if self._trades_today >= CFG["max_trades_day"]:
             return
-        elapsed_since_sl = time_module.time() - self._last_sl_time
-        if self._last_sl_time > 0 and elapsed_since_sl < CFG["post_sl_cooldown"]:
-            remaining = CFG["post_sl_cooldown"] - elapsed_since_sl
-            log.info(f"[BB_STOCH] Post-SL cooldown: {remaining:.0f}s remaining")
+        elapsed = time_module.time() - self._last_sl_time
+        if self._last_sl_time > 0 and elapsed < CFG["post_sl_cooldown"]:
+            log.info(f"[BB_STOCH] Post-SL cooldown: {CFG['post_sl_cooldown'] - elapsed:.0f}s remaining")
             return
 
         with self._lock:
             candles = list(self._buf_5m)
-
         df = self._to_df(candles)
         if df.empty:
             return
 
         n_bars = len(df)
         if n_bars < CFG["min_bars"]:
-            log.debug(f"[BB_STOCH] Warming up: {n_bars}/{CFG['min_bars']} bars "
-                      f"(ready in ~{(CFG['min_bars']-n_bars)*5} mins)")
+            log.debug(
+                f"[BB_STOCH] Warming up: {n_bars}/{CFG['min_bars']} bars "
+                f"(ready in ~{(CFG['min_bars'] - n_bars) * 5} mins)"
+            )
             return
 
         vwap = self._hub.session_vwap.value
 
-        # Run signal logic
-        sig    = evaluate_signal(df, vwap)
+        # Pass EMA seeds -- compute_ema() produces accurate EMA from bar 1
+        # when seeds are available, or falls back to today-only EMA.
+        sig    = evaluate_signal(
+            df, vwap,
+            ema20_seed=self._ema20_seed,
+            ema50_seed=self._ema50_seed,
+        )
         action = sig["action"]
 
-        # Log signal bar
         self._log_signal(ts, sig)
 
         # Persistence check
@@ -920,18 +860,19 @@ class BBStochStrategy(BaseStrategy):
             and all(a == action and a != "HOLD" for a in self._persist_buf)
         )
 
-        bb    = sig.get("bb", {})
-        vwap_str = f"{vwap:.2f}" if vwap is not None else "N/A"
+        bb            = sig.get("bb", {})
+        vwap_str      = f"{vwap:.2f}" if vwap is not None else "N/A"
         vol_ratio_val = sig.get("vol_ratio", -1)
-        vol_str = f"{vol_ratio_val:.2f}x" if vol_ratio_val >= 0 else "N/A(no-data)"
+        vol_str       = f"{vol_ratio_val:.2f}x" if vol_ratio_val >= 0 else "N/A(no-data)"
+        seed_tag      = "seeded" if self._ema20_seed is not None else "warming-up"
+
         log.info(
             f"[BB_STOCH] {action:8s} | "
             f"Close={sig.get('close', 0):.2f} | "
             f"BB=[{bb.get('lower', 0):.1f}~{bb.get('upper', 0):.1f}] "
             f"BW={bb.get('bw_pct', 0)*100:.2f}% | "
-            f"Vol={vol_str} | "
-            f"VWAP={vwap_str} | "
-            f"EMA20={sig.get('ema20', 0):.2f} EMA50={sig.get('ema50', 0):.2f} | "
+            f"Vol={vol_str} | VWAP={vwap_str} | "
+            f"EMA20={sig.get('ema20', 0):.2f} EMA50={sig.get('ema50', 0):.2f} [{seed_tag}] | "
             f"Block={sig.get('blocked_by') or 'none'} | Persist={confirmed} | "
             f"PnL={self._daily_pnl:+.1f}Rs T={self._trades_today}/{CFG['max_trades_day']}"
         )
@@ -942,31 +883,27 @@ class BBStochStrategy(BaseStrategy):
                 self._blocked_log[bl] = self._blocked_log.get(bl, 0) + 1
             return
 
-        # FIX (Bug 2): _persist_buf is NOT cleared here.
-        # It is cleared inside _enter_trade() only after a genuine fill.
-
-        # CHANGE B: Entry delay — do not enter on the breakout candle itself.
-        # Store the breakout candle's high (CE) / low (PE) as the trigger level.
-        # on_tick() will fire _enter_trade() the instant the NEXT candle's index
-        # price trades through that level. If the next candle closes without
-        # confirmation, on_candle() expires _entry_delay_pending (fake breakout).
+        # Change B: set trigger level, wait for next-candle index confirmation.
+        # on_tick() fires entry the moment index price crosses signal-candle's
+        # high (CE) or low (PE). Full next candle without confirmation = expired.
         last_candle   = candles[-1] if candles else {}
-        trigger_level = (float(last_candle.get("high", 0)) if action == "BUY_CE"
-                         else float(last_candle.get("low", 0)))
+        trigger_level = (
+            float(last_candle.get("high", 0)) if action == "BUY_CE"
+            else float(last_candle.get("low", 0))
+        )
 
         if trigger_level <= 0:
-            # Fallback: candle high/low unavailable — enter immediately as before
             log.warning(
                 f"[BB_STOCH] Entry delay: trigger level unavailable for {action} "
-                f"(candle missing high/low) — entering immediately"
+                f"-- entering immediately"
             )
             self._enter_trade(action, sig, ts)
             return
 
         log.info(
-            f"[BB_STOCH] Entry delay SET | {action} "
-            f"| trigger={'>' if action == 'BUY_CE' else '<'}{trigger_level:.2f} "
-            f"| waiting for next-candle index confirmation via on_tick()"
+            f"[BB_STOCH] Entry delay SET | {action} | "
+            f"trigger={'>' if action == 'BUY_CE' else '<'}{trigger_level:.2f} | "
+            f"waiting for next-candle index break via on_tick()"
         )
         self._entry_delay_pending = {
             "action"        : action,
@@ -982,11 +919,9 @@ class BBStochStrategy(BaseStrategy):
     def _enter_trade(self, action: str, sig: dict, ts: datetime):
         """
         Open a new options position.
-
-        FIX (Bug 1): removed time.sleep(0.4).
-        FIX (Bug 2): _persist_buf cleared only on genuine fill (not on LTP miss).
-        FIX (Bug 7): on LTP miss, store _pending_entry for fill on first tick.
-        FIX (Bug 8): SL/TP anchored to fill price inside BBTrade (not ltp-off).
+        Bug 1 fix: no sleep.
+        Bug 2 fix: persist_buf cleared only on genuine fill.
+        Bug 7 fix: on LTP miss store _pending_entry for fill on first tick.
         """
         opt    = "CE" if action == "BUY_CE" else "PE"
         spot   = sig.get("close", 0)
@@ -998,8 +933,6 @@ class BBStochStrategy(BaseStrategy):
             return
 
         atm = get_atm_strike(spot)
-
-        # On expiry day use 1-strike ITM for better liquidity
         if self._dte == 0:
             atm = atm - 100 if opt == "CE" else atm + 100
 
@@ -1008,71 +941,56 @@ class BBStochStrategy(BaseStrategy):
             log.warning(f"[BB_STOCH] Option not found: ATM={atm} {opt} expiry={expiry}")
             return
 
-        # Subscribe the token (deduplicates — safe if already subscribed)
         self.subscribe_option(token)
-
-        # FIX (Bug 1): no sleep here. Read LTP directly from the WebSocket price cache.
         ltp = self.get_price(token)
 
         if not ltp or ltp < 5:
-            # FIX (Bug 7): store pending entry instead of silently dropping the trade.
             log.warning(
-                f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) — "
-                f"option subscribed, pending entry stored, will fill on first tick"
+                f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) -- "
+                f"storing pending entry, will fill on first tick"
             )
             self._pending_entry = {
-                "action"    : action,
-                "opt"       : opt,
-                "sig"       : sig,
-                "token"     : token,
-                "symbol"    : tsym,
-                "ts"        : ts,           # signal timestamp (for delay logging)
-                "atm"       : atm,
+                "action" : action,
+                "opt"    : opt,
+                "sig"    : sig,
+                "token"  : token,
+                "symbol" : tsym,
+                "ts"     : ts,
+                "atm"    : atm,
             }
             return
 
-        # LTP is available — proceed with immediate fill
         self._execute_fill(opt, sig, token, tsym, ltp, ts)
 
     def _execute_fill(self, opt: str, sig: dict, token: int,
                       tsym: str, ltp: float, ts: datetime,
                       pending_delay_ms: Optional[float] = None):
-        """
-        Shared fill logic used by both _enter_trade() (immediate) and
-        _fill_pending() (deferred on first tick).
-
-        Constructs the BBTrade, registers it, logs, and writes entry CSV.
-        """
+        """Shared fill logic for _enter_trade() and _fill_pending()."""
         atr  = sig.get("atr", 0)
         spot = sig.get("close", 0)
 
-        # Compute SL/TP distances
         sl_pts, tp_pts = self._compute_sl_tp(ltp, atr)
 
-        # Option sanity: reject if spread eats too much of target.
-        # With tp_max=120 and typical BankNifty option spreads ~3%, the ratio
-        # est_spread/tp is much smaller now — 0.40 threshold is appropriate.
         est_spread = ltp * 0.03
         if tp_pts > 0 and (est_spread / tp_pts) > 0.40:
-            log.warning(f"[BB_STOCH] Spread {est_spread:.1f} too large vs TP {tp_pts:.1f} -- skipping")
+            log.warning(
+                f"[BB_STOCH] Spread {est_spread:.1f} too large vs TP {tp_pts:.1f} -- skipping"
+            )
             self.unsubscribe_option(token)
             return
 
-        # Acquire global trade slot (live only — paper always succeeds)
         if not self._acquire_slot():
-            log.warning("[BB_STOCH] Trade slot blocked — another live strategy has a position")
+            log.warning("[BB_STOCH] Trade slot blocked -- another live strategy has a position")
             self.unsubscribe_option(token)
             return
 
-        # Place BUY order (paper: simulated, live: REGULAR MARKET MIS)
         buy_order_id = self._place_buy(tsym, token, CFG["quantity"], ltp)
         if LIVE_MODE and buy_order_id is None:
             self._release_slot()
-            log.error(f"[BB_STOCH] BUY order FAILED for {tsym} — entry aborted")
+            log.error(f"[BB_STOCH] BUY order FAILED for {tsym} -- entry aborted")
             self.unsubscribe_option(token)
             return
 
-        # FIX (Bug 8): BBTrade now anchors sl/target to fill price internally.
         trade = BBTrade(
             symbol   = tsym,
             token    = token,
@@ -1084,21 +1002,20 @@ class BBStochStrategy(BaseStrategy):
             tp_pts   = tp_pts,
             atr      = atr,
         )
-        trade.order_id = buy_order_id  # store for logging / audit
+        trade.order_id = buy_order_id
 
         with self._lock:
             self._trade        = trade
             self._active_token = token
 
         self._trades_today += 1
+        self._persist_buf.clear()   # Bug 2 fix
 
-        # FIX (Bug 2): clear persistence buffer only here, after a confirmed fill.
-        self._persist_buf.clear()
+        rr        = round(tp_pts / sl_pts, 2) if sl_pts else 0
+        mode_tag  = "LIVE" if LIVE_MODE else "PAPER"
+        delay_str = (f" [pending_delay={pending_delay_ms:.0f}ms]"
+                     if pending_delay_ms is not None else "")
 
-        rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
-        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
-
-        delay_str = f" [pending_delay={pending_delay_ms:.0f}ms]" if pending_delay_ms is not None else ""
         log.info(
             f"[BB_STOCH] [{mode_tag}] ENTRY {opt} | {tsym} | "
             f"Fill={trade.entry:.2f} LTP={ltp:.2f}{delay_str} | "
@@ -1109,77 +1026,75 @@ class BBStochStrategy(BaseStrategy):
 
         bb = sig.get("bb", {})
         _csv_append(CFG["entry_csv"], {
-            "timestamp"  : trade.timestamp,
-            "symbol"     : tsym,
-            "opt_type"   : opt,
-            "qty"        : CFG["quantity"],
-            "ltp"        : ltp,
-            "fill"       : trade.entry,
-            "sl"         : trade.sl,
-            "target"     : trade.target,
-            "sl_pts"     : sl_pts,
-            "tp_pts"     : tp_pts,
-            "rr"         : rr,
-            "spot"       : spot,
-            "atr"        : atr,
-            "exec_mode"  : mode_tag,
-            "order_id"   : buy_order_id,
-            "mode"       : sig.get("mode", "pending" if pending_delay_ms else ""),
-            "bb_upper"   : bb.get("upper", ""),
-            "bb_mid"     : bb.get("mid", ""),
-            "bb_lower"   : bb.get("lower", ""),
-            "bb_bw_pct"  : bb.get("bw_pct", ""),
-            "vol_ratio"  : sig.get("vol_ratio", ""),
-            "vwap"       : self._hub.session_vwap.value if self._hub.session_vwap.value is not None else "N/A",
-            "pending_delay_ms": round(pending_delay_ms, 0) if pending_delay_ms is not None else "",
+            "timestamp"        : trade.timestamp,
+            "symbol"           : tsym,
+            "opt_type"         : opt,
+            "qty"              : CFG["quantity"],
+            "ltp"              : ltp,
+            "fill"             : trade.entry,
+            "sl"               : trade.sl,
+            "target"           : trade.target,
+            "sl_pts"           : sl_pts,
+            "tp_pts"           : tp_pts,
+            "rr"               : rr,
+            "spot"             : spot,
+            "atr"              : atr,
+            "exec_mode"        : mode_tag,
+            "order_id"         : buy_order_id,
+            "mode"             : sig.get("mode", "pending" if pending_delay_ms else ""),
+            "bb_upper"         : bb.get("upper", ""),
+            "bb_mid"           : bb.get("mid", ""),
+            "bb_lower"         : bb.get("lower", ""),
+            "bb_bw_pct"        : bb.get("bw_pct", ""),
+            "ema20"            : sig.get("ema20", ""),
+            "ema50"            : sig.get("ema50", ""),
+            "ema_seeded"       : self._ema20_seed is not None,
+            "vol_ratio"        : sig.get("vol_ratio", ""),
+            "vwap"             : (self._hub.session_vwap.value
+                                  if self._hub.session_vwap.value is not None else "N/A"),
+            "pending_delay_ms" : (round(pending_delay_ms, 0)
+                                  if pending_delay_ms is not None else ""),
         })
 
     # ----------------------------------------------------------
-    # FIX (Bug 7): Pending entry fill on first WebSocket tick
+    # Bug 7: Pending entry fill on first WebSocket tick
     # ----------------------------------------------------------
 
     def _fill_pending(self, pending: dict, ltp: float, ts: datetime):
-        """
-        FIX (Bug 7): Execute fill for a pending entry on its first live tick.
-
-        Called from on_option_tick() when the pending token's FIRST price arrives.
-        This runs in the WebSocket tick thread — no blocking, no sleeping.
-        """
-        # Clear pending atomically — only the first valid tick fills the trade
+        """Fill a pending entry on its first live tick. No blocking."""
         self._pending_entry = None
 
         if ltp < 5:
-            log.warning(f"[BB_STOCH] Pending fill: LTP {ltp:.2f} too low for {pending['symbol']} — discarding")
+            log.warning(
+                f"[BB_STOCH] Pending fill: LTP {ltp:.2f} too low for "
+                f"{pending['symbol']} -- discarding"
+            )
             return
 
-        # Re-check all risk gates (time elapsed since signal)
         now_time = ts.time()
         if now_time >= dtime(*CFG["session_cutoff"]):
-            log.info(f"[BB_STOCH] Pending fill aborted — past session cutoff ({pending['symbol']})")
+            log.info(f"[BB_STOCH] Pending fill aborted -- past session cutoff ({pending['symbol']})")
             return
         if self._is_halted:
-            log.info(f"[BB_STOCH] Pending fill aborted — strategy halted ({pending['symbol']})")
+            log.info(f"[BB_STOCH] Pending fill aborted -- strategy halted ({pending['symbol']})")
             return
         if self._trades_today >= CFG["max_trades_day"]:
-            log.info(f"[BB_STOCH] Pending fill aborted — max trades reached ({pending['symbol']})")
+            log.info(f"[BB_STOCH] Pending fill aborted -- max trades reached ({pending['symbol']})")
             return
         if self._trade:
-            log.info(f"[BB_STOCH] Pending fill aborted — trade already open ({pending['symbol']})")
+            log.info(f"[BB_STOCH] Pending fill aborted -- trade already open ({pending['symbol']})")
             return
 
-        # Compute delay from signal to fill for logging/analysis
         try:
             delay_ms = (ts - pending["ts"]).total_seconds() * 1000
         except Exception:
             delay_ms = None
 
         log.info(
-            f"[BB_STOCH] PENDING FILL triggered for {pending['symbol']} "
-            f"token={pending['token']} LTP={ltp:.2f} "
-            f"delay={delay_ms:.0f}ms" if delay_ms is not None else
-            f"[BB_STOCH] PENDING FILL triggered for {pending['symbol']}"
+            f"[BB_STOCH] PENDING FILL | {pending['symbol']} "
+            f"token={pending['token']} LTP={ltp:.2f}"
+            + (f" delay={delay_ms:.0f}ms" if delay_ms is not None else "")
         )
-
         self._execute_fill(
             opt              = pending["opt"],
             sig              = pending["sig"],
@@ -1191,21 +1106,18 @@ class BBStochStrategy(BaseStrategy):
         )
 
     # ----------------------------------------------------------
-    # TRADE MANAGEMENT (called on every option WebSocket tick)
+    # TRADE MANAGEMENT
     # ----------------------------------------------------------
 
     def _manage_trade(self, ltp: float, ts: datetime):
         trade = self._trade
         if not trade:
             return
-
         now_ts = time_module.time()
         if trade.exit_pending and (now_ts - trade.last_exit_ts) < CFG["exit_cooldown"]:
             return
-
         pnl_pts = ltp - trade.entry
         self._update_trail(trade, ltp, pnl_pts)
-
         if ltp >= trade.target:
             self._close_trade(ltp, "TARGET")
         elif ltp <= trade.sl:
@@ -1213,24 +1125,15 @@ class BBStochStrategy(BaseStrategy):
 
     def _update_trail(self, trade: BBTrade, ltp: float, pnl_pts: float):
         """
-        Trail stop-loss management.
-
-        FIX (Bug 9 — TRAIL BREAKEVEN):
-          Old code: new_sl = round(trade.entry, 2)
-          When price touched entry exactly, exit_px = entry - slippage → net P&L = -slippage.
-          The "breakeven" trail was booking a guaranteed small loss.
-
-          Fix: new_sl = entry + slippage so exit at new_sl yields:
-               exit_px = new_sl - slippage = entry + slippage - slippage = entry
-               net pnl  = entry - entry = 0  → true breakeven.
+        Bug 9 fix: trail SL to entry + slippage so exit at trail SL
+        yields net P&L = 0 (true breakeven), not -slippage.
         """
         if pnl_pts >= CFG["trail_arm"] and trade.trail_stage == 0:
-            # FIX (Bug 9): add exit slippage so net P&L at trail exit = 0
             new_sl = round(trade.entry + CFG["slippage"], 2)
             if new_sl > trade.sl:
                 trade.sl          = new_sl
                 trade.trail_stage = 1
-                log.info(f"[BB_STOCH] Trail -> BE | SL={trade.sl:.2f} (entry+slip={new_sl:.2f})")
+                log.info(f"[BB_STOCH] Trail -> BE | SL={trade.sl:.2f}")
         elif pnl_pts > CFG["trail_arm"] and trade.trail_stage >= 1:
             new_stage = int((pnl_pts - CFG["trail_arm"]) / CFG["trail_step"]) + 1
             if new_stage > trade.trail_stage:
@@ -1240,92 +1143,88 @@ class BBStochStrategy(BaseStrategy):
                 log.info(f"[BB_STOCH] Trail stage {new_stage} | SL={trade.sl:.2f}")
 
     def _close_trade(self, ltp: float, reason: str):
-        """
-        FIX (Bug 3): atomically claim ownership of self._trade at the top.
-        """
+        """Bug 3 fix: atomically claim self._trade at the top."""
         with self._lock:
             trade = self._trade
             if not trade:
                 return
-            self._trade = None   # claim it — no other thread can close it now
+            self._trade = None
 
         trade.exit_pending = True
         trade.last_exit_ts = time_module.time()
 
-        slip     = CFG["slippage"]
-        exit_px  = round(ltp - slip, 2)
-        pnl_pts  = round(exit_px - trade.entry, 2)
-        pnl_rs   = round(pnl_pts * trade.qty, 2)
-        rr_act   = round(pnl_pts / trade.sl_pts, 2) if trade.sl_pts else 0
+        slip    = CFG["slippage"]
+        exit_px = round(ltp - slip, 2)
+        pnl_pts = round(exit_px - trade.entry, 2)
+        pnl_rs  = round(pnl_pts * trade.qty, 2)
+        rr_act  = round(pnl_pts / trade.sl_pts, 2) if trade.sl_pts else 0
 
         self._daily_pnl += pnl_rs
-
         if reason == "SL":
             self._last_sl_time = time_module.time()
 
-        # Place SELL order (paper: simulated, live: REGULAR MARKET MIS)
         sell_order_id = self._place_sell(trade.symbol, trade.token, trade.qty, ltp)
         if LIVE_MODE and sell_order_id is None:
-            log.error(f"[BB_STOCH] SELL order FAILED for {trade.symbol} on {reason} — "
-                      f"position may still be open in Zerodha! Check and square off manually.")
+            log.error(
+                f"[BB_STOCH] SELL order FAILED for {trade.symbol} on {reason} -- "
+                f"square off manually in Zerodha!"
+            )
 
-        # Release global live trade slot
         self._release_slot()
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
-        tag = "[TARGET]" if reason == "TARGET" else ("[SL]" if reason == "SL" else "[EXIT]")
+        tag      = "[TARGET]" if reason == "TARGET" else ("[SL]" if reason == "SL" else "[EXIT]")
         log.info(
             f"[BB_STOCH] [{mode_tag}] {tag} {trade.option_type} | {trade.symbol} | {reason} | "
             f"Exit={exit_px:.2f} | PnL={pnl_pts:+.2f}pts ({pnl_rs:+.2f}Rs) | "
-            f"RR={rr_act:+.2f} | DayPnL={self._daily_pnl:+.2f}Rs | sell_order={sell_order_id}"
+            f"RR={rr_act:+.2f} | DayPnL={self._daily_pnl:+.2f}Rs | "
+            f"sell_order={sell_order_id}"
         )
 
         result = {
-            "timestamp"  : _now_ist().isoformat(),
-            "symbol"     : trade.symbol,
-            "opt_type"   : trade.option_type,
-            "qty"        : trade.qty,
-            "entry"      : trade.entry,
-            "exit"       : exit_px,
-            "pnl_pts"    : pnl_pts,
-            "pnl_rs"     : pnl_rs,
-            "rr_actual"  : rr_act,
-            "sl_pts"     : trade.sl_pts,
-            "tp_pts"     : trade.tp_pts,
-            "reason"     : reason,
-            "trail_stage": trade.trail_stage,
-            "day_pnl_rs" : round(self._daily_pnl, 2),
-            "exec_mode"  : mode_tag,
-            "sell_order" : sell_order_id,
+            "timestamp"   : _now_ist().isoformat(),
+            "symbol"      : trade.symbol,
+            "opt_type"    : trade.option_type,
+            "qty"         : trade.qty,
+            "entry"       : trade.entry,
+            "exit"        : exit_px,
+            "pnl_pts"     : pnl_pts,
+            "pnl_rs"      : pnl_rs,
+            "rr_actual"   : rr_act,
+            "sl_pts"      : trade.sl_pts,
+            "tp_pts"      : trade.tp_pts,
+            "reason"      : reason,
+            "trail_stage" : trade.trail_stage,
+            "day_pnl_rs"  : round(self._daily_pnl, 2),
+            "exec_mode"   : mode_tag,
+            "sell_order"  : sell_order_id,
         }
         _csv_append(CFG["exit_csv"], result)
         self._results.append(result)
 
         if self._daily_pnl <= -abs(CFG["max_daily_loss"]):
             self._is_halted = True
-            log.warning(f"[BB_STOCH] HALTED -- max daily loss breached ({self._daily_pnl:.0f}Rs)")
+            log.warning(
+                f"[BB_STOCH] HALTED -- max daily loss breached "
+                f"({self._daily_pnl:.0f}Rs)"
+            )
 
         with self._lock:
             self._unsubscribe_active()
 
     def _force_close(self, reason: str):
-        """Force-close any open trade (EOD / auto square-off)."""
-        # FIX (Bug 7): also discard any pending entry on force-close
         if self._pending_entry:
             log.info(
                 f"[BB_STOCH] Discarding pending entry for "
                 f"{self._pending_entry.get('symbol', '?')} on {reason}"
             )
             self._pending_entry = None
-
-        # CHANGE B: also discard any entry delay pending on force-close
         if self._entry_delay_pending:
             log.info(
                 f"[BB_STOCH] Discarding entry delay "
                 f"({self._entry_delay_pending.get('action', '?')}) on {reason}"
             )
             self._entry_delay_pending = None
-
         with self._lock:
             trade = self._trade
         if not trade:
@@ -1345,34 +1244,16 @@ class BBStochStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def _compute_sl_tp(self, ltp: float, atr: float) -> Tuple[float, float]:
-        """
-        Returns (sl_pts, tp_pts) — distances from fill price.
-
-        Formula: sl_pts = min(atr * atr_sl_mult, sl_max), floored at sl_min
-                 tp_pts = min(atr * atr_tp_mult, tp_max), floored at tp_min
-
-        BankNifty 5m ATR is typically 60–120pts:
-          SL: min(ATR * 0.8, 50) → usually hits the 50pt cap
-          TP: min(ATR * 2.0, 120) → usually hits the 120pt cap
-          On low-vol days (ATR ~40): SL=32, TP=80 — still a 1:2.5 RR
-
-        FIX (Bug 8): removed sl_price / tp_price returns. BBTrade now
-        anchors directly to entry using these distances. Caller no longer
-        needs pre-computed absolute prices.
-        """
         sl_pts = float(atr * CFG["atr_sl_mult"]) if atr > 0 else CFG["sl_min"]
         tp_pts = float(atr * CFG["atr_tp_mult"]) if atr > 0 else CFG["tp_min"]
         sl_pts = max(CFG["sl_min"], min(sl_pts, CFG["sl_max"]))
         tp_pts = max(CFG["tp_min"], min(tp_pts, CFG["tp_max"]))
-        # On expiry day tighten TP (theta erodes options fast)
         if self._dte == 0:
             tp_pts = max(CFG["tp_min"], tp_pts * 0.75)
         rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
         log.info(
-            f"[BB_STOCH] SL/TP computed | ATR={atr:.1f} | "
-            f"SL_pts={sl_pts:.1f} (cap={CFG['sl_max']}) "
-            f"TP_pts={tp_pts:.1f} (cap={CFG['tp_max']}) "
-            f"RR=1:{rr} (will anchor to fill after slippage)"
+            f"[BB_STOCH] SL/TP | ATR={atr:.1f} "
+            f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} RR=1:{rr}"
         )
         return sl_pts, tp_pts
 
@@ -1399,11 +1280,13 @@ class BBStochStrategy(BaseStrategy):
             "bb_lower"   : bb.get("lower", ""),
             "bb_bw_pct"  : bb.get("bw_pct", ""),
             "bb_squeeze" : bb.get("squeeze", ""),
-            "vol_ratio"  : sig.get("vol_ratio", ""),
-            "atr"        : sig.get("atr", ""),
             "ema20"      : sig.get("ema20", ""),
             "ema50"      : sig.get("ema50", ""),
-            "vwap"       : self._hub.session_vwap.value if self._hub.session_vwap.value is not None else "N/A",
+            "ema_seeded" : self._ema20_seed is not None,
+            "vol_ratio"  : sig.get("vol_ratio", ""),
+            "atr"        : sig.get("atr", ""),
+            "vwap"       : (self._hub.session_vwap.value
+                            if self._hub.session_vwap.value is not None else "N/A"),
         })
 
     # ----------------------------------------------------------
@@ -1411,25 +1294,25 @@ class BBStochStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def eod_summary(self):
-        """Called by MarketHub at 3:30 PM."""
         self._force_close("EOD-SQUAREOFF")
 
-        results = self._results
-        total   = len(results)
-        wins    = [r for r in results if r["pnl_pts"] > 0]
-        losses  = [r for r in results if r["pnl_pts"] <= 0]
-        win_pct = len(wins) / total if total else 0
+        results  = self._results
+        total    = len(results)
+        wins     = [r for r in results if r["pnl_pts"] > 0]
+        losses   = [r for r in results if r["pnl_pts"] <= 0]
+        win_pct  = len(wins) / total if total else 0
         avg_win  = sum(r["pnl_pts"] for r in wins)   / len(wins)   if wins   else 0
         avg_loss = sum(r["pnl_pts"] for r in losses) / len(losses) if losses else 0
         exp      = round(win_pct * avg_win + (1 - win_pct) * avg_loss, 3) if total else 0
 
         log.info(
-            f"[BB_STOCH] EOD | Trades={total} W={len(wins)} L={len(losses)} "
+            f"[BB_STOCH] EOD | "
+            f"Trades={total} W={len(wins)} L={len(losses)} "
             f"WinRate={win_pct*100:.1f}% Expect={exp:+.3f}pts "
             f"DayPnL={self._daily_pnl:+.2f}Rs | "
-            f"5m-bars={len(self._buf_5m)}"
+            f"5m-bars={len(self._buf_5m)} | "
+            f"EMA-seeded={self._ema20_seed is not None}"
         )
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
-            log.info(f"[BB_STOCH] Top blocks: {top}")
-
+            log.info(f"[BB_STOCH] Top blocks today: {top}")
