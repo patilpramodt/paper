@@ -69,7 +69,21 @@ Central order execution layer — single point for all live order placement.
      "TIMEOUT"       → did not reach terminal state in time; caller treats as failed
      "TOKEN_EXPIRED" → access token invalid mid-session; caller must abort + alert
 
-5. Token / session expiry mid-session
+5. Return value: (order_id, fill_price) tuple
+
+   place_buy() and place_sell() both return Optional[Tuple[str, float]]:
+     - Live mode:  (order_id, average_price) fetched from order_history after COMPLETE.
+                   Falls back to ref_ltp if average_price is missing.
+     - Paper mode: ("PAPER-{ms}", ltp) — simulated fill at the ref LTP.
+     - Failure:    None
+
+   Callers unpack like:
+       result = self._place_buy(sym, token, qty, ltp)
+       if result is None:
+           return
+       order_id, fill_price = result
+
+6. Token / session expiry mid-session
 
    If the Zerodha access token expires while the bot is running (rare but
    possible after midnight refresh), any Kite REST call raises
@@ -88,7 +102,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Tuple
 
 log = logging.getLogger("core.router")
 
@@ -116,10 +130,13 @@ class OrderRouter:
         ok = self._hub.order_router.acquire_slot(self.name, LIVE_MODE)
         if not ok:
             return  # another live strategy already has a position
-        oid = self._hub.order_router.place_buy(self.name, symbol, token, qty, ltp, LIVE_MODE)
+        result = self._hub.order_router.place_buy(self.name, symbol, token, qty, ltp, LIVE_MODE)
+        if result is None:
+            return  # order failed
+        order_id, fill_price = result
 
         # Exit
-        self._hub.order_router.place_sell(self.name, symbol, token, qty, ltp, LIVE_MODE)
+        result = self._hub.order_router.place_sell(self.name, symbol, token, qty, ltp, LIVE_MODE)
         self._hub.order_router.release_slot(self.name, LIVE_MODE)
     """
 
@@ -199,15 +216,16 @@ class OrderRouter:
         qty:           int,
         ltp:           float,
         live_mode:     bool,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Place a BUY (entry) order.
 
-        live_mode=False → paper fill logged; returns "PAPER-{ms}"
+        live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
         live_mode=True  → MARKET MIS order via Kite with auto market protection;
-                          returns order_id string ONLY when exchange confirms COMPLETE.
+                          returns (order_id, fill_price) ONLY when exchange confirms COMPLETE.
+                          fill_price is the actual average_price from order_history.
 
-        Returns order_id / paper_id, or None on failure.
+        Returns (order_id, fill_price) on success, None on failure.
         """
         if live_mode:
             return self._live_order(
@@ -224,15 +242,16 @@ class OrderRouter:
         qty:           int,
         ltp:           float,
         live_mode:     bool,
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Place a SELL (exit) order.
 
-        live_mode=False → paper fill logged; returns "PAPER-{ms}"
+        live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
         live_mode=True  → MARKET MIS order via Kite with auto market protection;
-                          returns order_id string ONLY when exchange confirms COMPLETE.
+                          returns (order_id, fill_price) ONLY when exchange confirms COMPLETE.
+                          fill_price is the actual average_price from order_history.
 
-        Returns order_id / paper_id, or None on failure.
+        Returns (order_id, fill_price) on success, None on failure.
         """
         if live_mode:
             return self._live_order(
@@ -252,7 +271,7 @@ class OrderRouter:
         qty:              int,
         ltp:              float,
         transaction_type: str,   # "BUY" or "SELL"
-    ) -> Optional[str]:
+    ) -> Optional[Tuple[str, float]]:
         """
         Place a MARKET MIS order with market protection on NFO and confirm
         it reached the exchange.
@@ -270,7 +289,8 @@ class OrderRouter:
           2. place_order() with ORDER_TYPE_MARKET + market_protection=-1.
           3. _confirm_order() polls order_history() until COMPLETE / REJECTED /
              CANCELLED / TIMEOUT / TOKEN_EXPIRED.
-          4. Return order_id only on COMPLETE; None on anything else.
+          4. On COMPLETE: fetch average_price from order_history for accurate SL.
+          5. Return (order_id, fill_price) on COMPLETE; None on anything else.
         """
         kite = self._hub.kite
         if kite is None:
@@ -324,21 +344,33 @@ class OrderRouter:
             return None
 
         # ── Confirm the order actually reached the exchange ────────────────────
-        # place_order() returning an order_id does NOT mean the exchange accepted
-        # the order. NSE can reject LIMIT option orders if:
-        #   • Insufficient funds / margin
-        #   • The strike has a circuit filter at that moment
-        #   • The order hits OI / position limits
-        # Without confirmation, the bot would manage a phantom SL and later
-        # fire a SELL against a position that never existed.
         status = self._confirm_order(str(order_id))
 
         if status == "COMPLETE":
+            # ── Fetch actual fill price from order_history ─────────────────────
+            # average_price from the exchange is the true fill price.
+            # We use this (not ref_ltp) so the SL is anchored to the real fill,
+            # not the pre-order WebSocket snapshot which may be stale at 9:15 AM.
+            fill_price = ltp  # safe fallback
+            try:
+                history = kite.order_history(str(order_id))
+                for h in reversed(history):
+                    ap = h.get("average_price")
+                    if h.get("status", "").upper() == "COMPLETE" and ap:
+                        fill_price = float(ap)
+                        break
+            except Exception as exc:
+                log.warning(
+                    f"[Router][LIVE] Could not fetch fill price for {order_id}: {exc} "
+                    f"— falling back to ref_ltp={ltp:.2f}"
+                )
+
             log.info(
                 f"[Router][LIVE] {transaction_type} CONFIRMED ✓ | "
-                f"{strategy_name} | {symbol} | order_id={order_id}"
+                f"{strategy_name} | {symbol} | order_id={order_id} | "
+                f"fill_price={fill_price:.2f} (ref_ltp={ltp:.2f})"
             )
-            return str(order_id)
+            return str(order_id), fill_price
 
         elif status == "TOKEN_EXPIRED":
             log.error(
@@ -509,12 +541,14 @@ class OrderRouter:
         strategy_name: str,
         symbol:        str,
         ltp:           float,
-    ) -> str:
+    ) -> Tuple[str, float]:
+        """
+        Simulate an order fill in paper mode.
+        Returns (fake_id, ltp) — same tuple shape as live mode.
+        """
         fake_id = f"PAPER-{int(time.time() * 1000)}"
         log.info(
             f"[Router][PAPER] {side} simulated | "
             f"{strategy_name} | {symbol} | ltp={ltp:.2f} | id={fake_id}"
         )
-        return fake_id
-
-
+        return fake_id, ltp
