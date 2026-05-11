@@ -26,11 +26,25 @@ When True:  real MARKET orders placed via core/order_router.py.
 
 Only ONE strategy should have LIVE_MODE=True at a time, so the global
 trade slot in OrderRouter prevents simultaneous live positions.
+
+ORDER RETURN VALUES
+───────────────────
+_place_buy() and _place_sell() both return Optional[Tuple[str, float]]:
+  - Success: (order_id, fill_price)
+      Live mode:  order_id = Zerodha order ID, fill_price = exchange average_price
+      Paper mode: order_id = "PAPER-{ms}",    fill_price = ref LTP
+  - Failure: None
+
+Callers must unpack:
+    result = self._place_buy(sym, token, qty, ltp)
+    if result is None:
+        return
+    order_id, fill_price = result
 """
 
 from abc import ABC, abstractmethod
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 
 class BaseStrategy(ABC):
@@ -126,23 +140,27 @@ class BaseStrategy(ABC):
         """Release the slot after a position is fully closed."""
         self._hub.order_router.release_slot(self.name, self.LIVE_MODE)
 
-    def _place_buy(self, symbol: str, token: int, qty: int, ltp: float) -> Optional[str]:
+    def _place_buy(self, symbol: str, token: int, qty: int, ltp: float) -> Optional[Tuple[str, float]]:
         """
         Place a BUY (entry) order.
         Paper mode: logged simulation, no Kite call.
         Live mode:  REGULAR MARKET MIS on NFO via Kite.
-        Returns order_id string, or None on failure.
+
+        Returns (order_id, fill_price) on success, None on failure.
+          fill_price = exchange average_price (live) or ref ltp (paper).
         """
         return self._hub.order_router.place_buy(
             self.name, symbol, token, qty, ltp, self.LIVE_MODE
         )
 
-    def _place_sell(self, symbol: str, token: int, qty: int, ltp: float) -> Optional[str]:
+    def _place_sell(self, symbol: str, token: int, qty: int, ltp: float) -> Optional[Tuple[str, float]]:
         """
         Place a SELL (exit) order.
         Paper mode: logged simulation, no Kite call.
         Live mode:  REGULAR MARKET MIS on NFO via Kite.
-        Returns order_id string, or None on failure.
+
+        Returns (order_id, fill_price) on success, None on failure.
+          fill_price = exchange average_price (live) or ref ltp (paper).
         """
         return self._hub.order_router.place_sell(
             self.name, symbol, token, qty, ltp, self.LIVE_MODE
