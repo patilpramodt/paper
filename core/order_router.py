@@ -112,7 +112,7 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 # -1  → Auto protection: Zerodha/NSE applies default band automatically
 # 1-100 → Custom %: e.g. 10 means order executes within ±10% of last price
 # Must be within circuit limits. -1 (auto) is recommended for options.
-MARKET_PROTECTION = -1   # auto protection (recommended)
+MARKET_PROTECTION = 20   # auto protection (recommended)
 
 
 def _now_ist() -> datetime:
