@@ -131,9 +131,20 @@ PCR_STRIKE_STEP = 100    # strike interval for WsPCR subscriptions
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
 
-    def _file(filename):
+    # Date stamp in IST so log filenames always reflect the trading day,
+    # even when the process is running in UTC (e.g. GitHub Actions).
+    _date = now_ist().strftime("%Y-%m-%d")
+
+    # Each call creates a dated sub-folder  logs/2026-05-13/
+    dated_dir = os.path.join(LOG_DIR, _date)
+    os.makedirs(dated_dir, exist_ok=True)
+
+    def _file(basename):
+        """Return a FileHandler writing to  logs/<YYYY-MM-DD>/<basename>."""
+        name, ext = os.path.splitext(basename)
+        filename = f"{name}_{_date}{ext}"          # e.g. core_2026-05-13.log
         h = logging.FileHandler(
-            os.path.join(LOG_DIR, filename),
+            os.path.join(dated_dir, filename),
             encoding="utf-8",
         )
         h.setFormatter(logging.Formatter(
@@ -150,20 +161,20 @@ def setup_logging():
         ))
         return h
 
-    # Root logger → core.log + console
+    # Root logger → core_<date>.log + console
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
     root.addHandler(_file("core.log"))
     root.addHandler(_console())
 
-    # ── Per-strategy loggers → own file, propagate=False (skip core.log) ──────
+    # ── Per-strategy loggers → own dated file, propagate=False ───────────────
     _STRAT = {
         "strategy.spike":        "spike.log",
         "strategy.orb":          "orb_v2.log",
         "strategy.scalper_v7":   "scalper_v7.log",
         "strategy.bb_stoch":     "bb_stoch.log",
         "strategy.hedged_sell":  "hedged_sell.log",
-        "strategy.smart_hedge":  "smart_hedge.log",   # ← new
+        "strategy.smart_hedge":  "smart_hedge.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -171,6 +182,9 @@ def setup_logging():
         lg.propagate = False          # ← stays OUT of core.log
         lg.addHandler(_file(fname))
         lg.addHandler(_console())
+
+    # Emit the dated log directory so it is easy to find in output
+    logging.getLogger("t").info("Logs for today → %s/", dated_dir)
 
 
 setup_logging()
