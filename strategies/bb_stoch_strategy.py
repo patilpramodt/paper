@@ -1163,13 +1163,15 @@ class BBStochStrategy(BaseStrategy):
         if reason == "SL":
             self._last_sl_time = time_module.time()
 
-        sell_order_id = self._place_sell(trade.symbol, trade.token, trade.qty, ltp)
-        if LIVE_MODE and sell_order_id is None:
-            log.error(
-                f"[BB_STOCH] SELL order FAILED for {trade.symbol} on {reason} -- "
-                f"square off manually in Zerodha!"
-            )
-
+        # Use retry-aware sell: checks position status before each retry so we
+        # never fire a phantom sell against an already-closed position, and never
+        # silently drop a real open position after a transient exchange rejection.
+        sell_order_id = self._place_sell_with_retry(
+            trade.symbol, trade.token, trade.qty, ltp,
+            max_retries=3,
+        )
+        # Release slot AFTER retry loop so no other strategy can enter while we
+        # are still trying to close this position.
         self._release_slot()
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
