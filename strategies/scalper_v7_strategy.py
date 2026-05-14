@@ -252,9 +252,10 @@ class ScalperV7Strategy(BaseStrategy):
 
         reason = self._engine.manage_trade(price)
         if reason:
-            # Place SELL order (paper: simulated, live: MARKET)
+            # Place SELL order with retry — checks position before each retry
             sym = self._active_sym or ""
-            sell_order_id = self._place_sell(sym, token, self._engine.active_trade.qty if self._engine.active_trade else 0, price)
+            sell_order_id = self._place_sell_with_retry(sym, token, self._engine.active_trade.qty if self._engine.active_trade else 0, price,
+                                                        max_retries=3)
             if LIVE_MODE and sell_order_id is None:
                 log.error(f"[ScalperV7] SELL order FAILED for {sym} on {reason} — "
                           f"position may still be open in Zerodha!")
@@ -463,8 +464,9 @@ class ScalperV7Strategy(BaseStrategy):
             sym      = self._active_sym or ""
             qty      = self._engine.active_trade.qty
 
-            # Place SELL order before PaperEngine nulls active_trade
-            sell_order_id = self._place_sell(sym, token, qty, ltp)
+            # Place SELL order with retry before PaperEngine nulls active_trade
+            sell_order_id = self._place_sell_with_retry(sym, token, qty, ltp,
+                                                        max_retries=3)
             if LIVE_MODE and sell_order_id is None:
                 log.error(f"[ScalperV7] EOD SELL FAILED for {sym} — "
                           f"position may still be open in Zerodha! Square off manually.")
@@ -505,8 +507,10 @@ class ScalperV7Strategy(BaseStrategy):
         sym      = self._active_sym or ""
         qty      = self._engine.active_trade.qty
 
-        # Place SELL order before PaperEngine nulls active_trade
-        sell_order_id = self._place_sell(sym, token, qty, ltp)
+        # Place SELL order with retry so a transient rejection is retried
+        # before releasing the slot and marking the position closed.
+        sell_order_id = self._place_sell_with_retry(sym, token, qty, ltp,
+                                                    max_retries=3)
         if LIVE_MODE and sell_order_id is None:
             log.error(f"[ScalperV7] AUTO-SQUAREOFF SELL FAILED for {sym} — "
                       f"position may still be open in Zerodha! Square off manually.")
