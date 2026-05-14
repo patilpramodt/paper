@@ -153,6 +153,31 @@ class BaseStrategy(ABC):
             self.name, symbol, token, qty, ltp, self.LIVE_MODE
         )
 
+    def _place_sell_with_retry(
+        self,
+        symbol:      str,
+        token:       int,
+        qty:         int,
+        ltp:         float,
+        max_retries: int = 3,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Place a SELL (SL / trigger exit) order with automatic retry.
+
+        On each failed attempt the router will:
+          1. Call kite.positions() to verify the trade is truly still open.
+             This network round-trip is the only pacing — no sleep added.
+          2. If position already closed → stop immediately (no phantom sell).
+          3. If position still open     → refresh LTP and retry immediately.
+          4. After max_retries failures → log a loud MANUAL SQUARE-OFF alert.
+
+        Paper mode: first attempt always succeeds; retry loop is a no-op.
+        """
+        return self._hub.order_router.place_sell_with_retry(
+            self.name, symbol, token, qty, ltp, self.LIVE_MODE,
+            max_retries=max_retries,
+        )
+
     def _place_sell(self, symbol: str, token: int, qty: int, ltp: float) -> Optional[Tuple[str, float]]:
         """
         Place a SELL (exit) order.
