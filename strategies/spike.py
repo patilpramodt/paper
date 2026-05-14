@@ -576,8 +576,9 @@ class SpikeStrategy(BaseStrategy):
             return
         t["state"] = "CLOSED"
 
-        # ── Place SELL and unpack confirmed fill price ────────────────────────
-        result = self._place_sell(t["symbol"], t["token"], t["qty"], exit_price)
+        # ── Place SELL with retry — checks position status before each retry ──
+        result = self._place_sell_with_retry(t["symbol"], t["token"], t["qty"], exit_price,
+                                             max_retries=3)
         if result is None:
             if LIVE_MODE:
                 log.error(f"[{self.name}] SELL order FAILED for {t['symbol']} — "
@@ -662,3 +663,4 @@ class SpikeStrategy(BaseStrategy):
                      f"entry={t['entry']:.0f} exit={t['exit_price']:.0f} PnL={t['pnl']:.0f}")
         log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
