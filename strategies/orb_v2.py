@@ -519,12 +519,14 @@ class ORBStrategy(BaseStrategy):
 
         ep_eff  = round(max(exit_prem - CFG["slippage_pts"], 0), 2)
 
-        # Place SELL order (paper: simulated, live: MARKET)
-        sell_order_id = self._place_sell(
+        # Place SELL order with retry — checks position before each retry so a
+        # transient rejection never leaves the position unmanaged silently.
+        sell_order_id = self._place_sell_with_retry(
             t.get("opt_sym", ""),
             t.get("opt_token", 0),
             t.get("qty", CFG["lot_size"]),
             exit_prem,
+            max_retries=3,
         )
         if LIVE_MODE and sell_order_id is None:
             log.error(f"[{self.name}] SELL order FAILED for {t.get('opt_sym')} — "
