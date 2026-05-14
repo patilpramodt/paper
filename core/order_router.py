@@ -532,6 +532,174 @@ class OrderRouter:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
+    #  Sell with retry (SL / trigger exit safety net)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _is_position_open(self, symbol: str) -> bool:
+        """
+        Query kite.positions() and return True if a non-zero net position
+        exists for `symbol`.
+
+        Called between SELL retries to avoid hammering the exchange when
+        the position has already been closed (e.g., auto squared-off by
+        Zerodha, or a previous attempt actually filled despite returning
+        an error).
+
+        On any API error we conservatively return True (assume still open)
+        so the retry loop keeps trying rather than silently giving up on
+        a real open position.
+        """
+        try:
+            kite = self._hub.kite
+            if kite is None:
+                log.warning("[Router] _is_position_open: kite is None — assuming open")
+                return True
+
+            positions = kite.positions()
+            net = positions.get("net", [])
+            for pos in net:
+                if pos.get("tradingsymbol") == symbol:
+                    # Zerodha returns 'quantity' for intraday net; fall back to
+                    # 'net_quantity' in case the field name differs.
+                    qty = pos.get("quantity") or pos.get("net_quantity", 0)
+                    if qty and int(qty) != 0:
+                        log.debug(
+                            f"[Router] Position check: {symbol} qty={qty} → OPEN"
+                        )
+                        return True
+            log.info(
+                f"[Router] Position check: {symbol} not found or qty=0 → CLOSED"
+            )
+            return False
+
+        except Exception as exc:
+            if self._is_token_exception(exc):
+                log.error(
+                    f"[Router] _is_position_open: TOKEN EXPIRED while checking {symbol}. "
+                    f"Assuming open — CHECK ZERODHA CONSOLE."
+                )
+            else:
+                log.warning(
+                    f"[Router] _is_position_open API error for {symbol}: {exc} "
+                    f"— assuming open (safe default)"
+                )
+            return True  # conservative: keep retrying
+
+    def place_sell_with_retry(
+        self,
+        strategy_name: str,
+        symbol:        str,
+        token:         int,
+        qty:           int,
+        ltp:           float,
+        live_mode:     bool,
+        max_retries:   int = 3,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        Place a SELL (exit) order with automatic retry when the trade is
+        confirmed still live after a failure.
+
+        Flow for each attempt (1 … max_retries):
+          1. Call place_sell() — returns (order_id, fill_price) on success.
+          2. On success → return immediately.
+          3. On failure:
+             a. Call kite.positions() to check if position is still open.
+                This network round-trip (~100–300 ms) is the only pacing
+                between retries — no artificial sleep is added.
+                MARKET orders fill or reject instantly; sleeping only costs
+                extra loss while the position moves against you.
+             b. If position CLOSED  → stop (already closed, no phantom sell).
+             c. If position OPEN    → refresh LTP from WebSocket, retry.
+          4. After max_retries failures with position still open → log a
+             loud MANUAL SQUARE-OFF alert and return None.
+
+        Paper mode: place_sell() in paper mode never returns None, so the
+        retry loop is a no-op — first attempt always succeeds.
+
+        Args:
+            strategy_name : strategy identifier for log context
+            symbol        : NSE tradingsymbol (e.g. "NIFTY2550524500CE")
+            token         : instrument token for live LTP refresh
+            qty           : number of lots / shares
+            ltp           : last known price (used as ref on first attempt)
+            live_mode     : False → paper simulation, True → live Kite order
+            max_retries   : total attempts including the first (default 3)
+
+        Returns:
+            (order_id, fill_price)  — sell confirmed
+            None                    — all retries exhausted OR position already closed
+        """
+        for attempt in range(1, max_retries + 1):
+
+            log.info(
+                f"[Router] SELL attempt {attempt}/{max_retries} | "
+                f"{strategy_name} | {symbol} | qty={qty} | ltp={ltp:.2f}"
+            )
+
+            result = self.place_sell(
+                strategy_name, symbol, token, qty, ltp, live_mode
+            )
+
+            if result is not None:
+                if attempt > 1:
+                    log.info(
+                        f"[Router] SELL succeeded on attempt {attempt}/{max_retries} ✓ | "
+                        f"{strategy_name} | {symbol}"
+                    )
+                return result
+
+            # ── Sell failed ───────────────────────────────────────────────────
+            if not live_mode:
+                return None
+
+            log.warning(
+                f"[Router] SELL attempt {attempt}/{max_retries} FAILED | "
+                f"{strategy_name} | {symbol} — checking live position status..."
+            )
+
+            # ── Check position status (this network call is the only pacing) ──
+            still_open = self._is_position_open(symbol)
+
+            if not still_open:
+                log.warning(
+                    f"\n{'='*60}\n"
+                    f"[Router] {symbol} position is ALREADY CLOSED.\n"
+                    f"  Closed by a prior attempt, auto square-off, or the exchange.\n"
+                    f"  No further SELL retries needed.\n"
+                    f"{'='*60}"
+                )
+                return None
+
+            if attempt < max_retries:
+                # Refresh LTP from the WebSocket cache — free, no network call
+                fresh = self._hub.last_price(token)
+                if fresh and fresh != ltp:
+                    log.info(
+                        f"[Router] LTP refreshed for retry: {ltp:.2f} → {fresh:.2f}"
+                    )
+                    ltp = fresh
+                log.warning(
+                    f"[Router] Position STILL OPEN — "
+                    f"retrying immediately "
+                    f"(attempt {attempt + 1}/{max_retries}) | "
+                    f"{strategy_name} | {symbol}"
+                )
+            else:
+                log.error(
+                    f"\n{'!'*60}\n"
+                    f"[Router][CRITICAL] SELL FAILED after {max_retries} attempts "
+                    f"— position STILL OPEN!\n"
+                    f"  Strategy  : {strategy_name}\n"
+                    f"  Symbol    : {symbol}  qty={qty}\n"
+                    f"  Last LTP  : {ltp:.2f}\n"
+                    f"  → *** SQUARE OFF MANUALLY IN ZERODHA CONSOLE NOW! ***\n"
+                    f"  → Navigate to Positions → {symbol} → Exit\n"
+                    f"{'!'*60}"
+                )
+
+        return None
+
+    # ─────────────────────────────────────────────────────────────────────────
     #  Internal — paper simulation
     # ─────────────────────────────────────────────────────────────────────────
 
