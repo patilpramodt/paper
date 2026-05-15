@@ -5,8 +5,9 @@ BBStochStrategy -- BankNifty options scalper using:
   * Bollinger Bands  (BB)   -- identifies breakout / volatility expansion
   * Volume Filter           -- confirms genuine institutional participation
   * EMA trend filter        -- prevents counter-trend entries
-  * EMA Seeding             -- yesterday's 5-min candles loaded at pre-market
-                               so EMA20 / EMA50 are accurate from bar 1
+  * EMA Seeding             -- previous 10 trading days of 5-min candles
+                               loaded at pre-market so EMA20 / EMA50 are
+                               accurate from bar 1
 
 SIGNAL LOGIC (all filters must agree before entry):
 --------------------------------------------------------------
@@ -18,7 +19,7 @@ SIGNAL LOGIC (all filters must agree before entry):
     3. VWAP       : close above session VWAP
     4. EMA        : EMA20 > EMA50 (uptrend context) -- accurate from bar 1
                     because seeds are fetched from Zerodha historical API
-                    (yesterday's 5-min candles) in pre_market()
+                    (previous 10 trading days of 5-min candles) in pre_market()
     5. Session    : only between SESSION_START and ENTRY_CUTOFF
 
   PE entry (buy put):
@@ -27,31 +28,39 @@ SIGNAL LOGIC (all filters must agree before entry):
 
 EMA SEEDING:
 --------------------------------------------------------------
-  pre_market() calls _fetch_ema_seeds() which fetches yesterday's full
-  5-min session (75 candles) from Zerodha's historical_data API:
+  pre_market() calls _fetch_ema_seeds() which fetches the previous
+  EMA_SEED_DAYS (default 10) trading days of 5-min candles from
+  Zerodha's historical_data API in a single call:
 
       kite.historical_data(
           instrument_token = 260105,     # NSE:NIFTY BANK index
-          from_date        = "YYYY-MM-DD 09:15:00",
-          to_date          = "YYYY-MM-DD 15:30:00",
+          from_date        = "YYYY-MM-DD 09:15:00",   # 10 trading days ago
+          to_date          = "YYYY-MM-DD 15:30:00",   # yesterday
           interval         = "5minute"
       )
 
-  EMA20 and EMA50 are computed on those candles. The last values are
-  stored as self._ema20_seed / self._ema50_seed.
+  10 trading days × ~75 candles/day ≈ 750 candles total.
+  This gives EMA50 a fully-converged seed with zero warmup
+  period, compared to the old single-day (75-candle) approach
+  which still required ~5 days of warmup for EMA50.
 
-  In evaluate_signal(), compute_ema() uses these seeds as the starting
-  point and applies today's candles incrementally:
+  EMA20 and EMA50 are computed on those candles. The last values
+  are stored as self._ema20_seed / self._ema50_seed.
+
+  In evaluate_signal(), compute_ema() uses these seeds as the
+  starting point and applies today's candles incrementally:
 
       result = seed
       for each today_candle_close:
           result = alpha * close + (1 - alpha) * result
 
-  This is mathematically exact -- EMA is recursive so a correct seed
-  produces correct values on every subsequent bar without warmup.
+  This is mathematically exact -- EMA is recursive so a correct
+  seed produces correct values on every subsequent bar without
+  warmup.
 
-  Fallback: if the API call fails (holiday, auth error, etc.) seeds
-  default to None and EMA falls back to the old candle-only behaviour.
+  Fallback: if the API call fails (holiday, auth error, etc.)
+  seeds default to None and EMA falls back to the old
+  candle-only behaviour.
 
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
@@ -168,6 +177,13 @@ CFG = {
     # NSE:NIFTY BANK index token (constant, not expiry-specific)
     "ema_seed_token"     : 260105,
 
+    # Number of previous trading days to fetch for EMA seeding.
+    # 10 days × ~75 candles/day ≈ 750 candles -- gives EMA50 a
+    # fully-converged starting value with zero intraday warmup.
+    # Previously this was 1 day (75 candles); increase to 10 for
+    # a significantly more accurate seed, especially for EMA50.
+    "ema_seed_days"      : 10,
+
     # CSV paths
     "entry_csv"          : "logs/bb_stoch_entry.csv",
     "exit_csv"           : "logs/bb_stoch_exit.csv",
@@ -254,7 +270,7 @@ def compute_ema(df: pd.DataFrame, period: int,
     """
     Exponential Moving Average on 'close'.
 
-    With seed (EMA seeding from yesterday's 5-min candles):
+    With seed (EMA seeding from previous 10 trading days of 5-min candles):
         Starts from yesterday's closing EMA value and applies today's
         candles one by one using:
             result = alpha * price + (1 - alpha) * result
@@ -296,8 +312,9 @@ def evaluate_signal(df: pd.DataFrame,
         blocked_by : reason string if HOLD
         bb, vol_ratio, atr, ema20, ema50, close : snapshots for logging
 
-    ema20_seed / ema50_seed: yesterday's closing EMA values loaded by
-    _fetch_ema_seeds(). When provided, EMA is exact from bar 1.
+    ema20_seed / ema50_seed: closing EMA values computed from the previous
+    10 trading days of 5-min candles, loaded by _fetch_ema_seeds().
+    When provided, EMA is exact from bar 1.
     When None, falls back to today's candles only (less accurate early).
     """
     empty = {"action": "HOLD", "blocked_by": "no_data",
@@ -466,8 +483,9 @@ class BBStochStrategy(BaseStrategy):
     """
     BankNifty options strategy: Bollinger Bands + Volume + EMA trend filter.
 
-    EMA is seeded from yesterday's 5-min candles (Zerodha historical API)
-    in pre_market(), making EMA20 and EMA50 accurate from bar 1.
+    EMA is seeded from the previous 10 trading days of 5-min candles
+    (Zerodha historical API) in pre_market(), making EMA20 and EMA50
+    fully converged and accurate from bar 1.
     All filters are live and working from the very first candle.
     """
 
@@ -547,8 +565,9 @@ class BBStochStrategy(BaseStrategy):
         )
 
         # ── EMA SEEDING ──────────────────────────────────────────────────────
-        # Fetch yesterday's 5-min candles from Zerodha historical API and
-        # compute EMA20/50 seeds. Makes EMA accurate from bar 1 of today.
+        # Fetch previous 10 trading days of 5-min candles from Zerodha
+        # historical API and compute EMA20/50 seeds. Makes EMA accurate
+        # from bar 1 of today with full EMA50 convergence (no warmup).
         self._ema20_seed, self._ema50_seed = self._fetch_ema_seeds()
 
         # ── PRE-SUBSCRIBE STRIKES ─────────────────────────────────────────────
@@ -579,42 +598,56 @@ class BBStochStrategy(BaseStrategy):
         return True
 
     # ----------------------------------------------------------
-    # EMA SEEDING
+    # EMA SEEDING  (10 trading days)
     # ----------------------------------------------------------
 
     def _fetch_ema_seeds(self) -> Tuple[Optional[float], Optional[float]]:
         """
-        Fetch yesterday's full 5-min session from Zerodha historical_data API
-        and compute EMA20 / EMA50 seeds.
+        Fetch the previous EMA_SEED_DAYS (default 10) trading days of
+        5-min candles from Zerodha historical_data API in a single call,
+        then compute EMA20 / EMA50 seeds.
 
         API call used:
             kite.historical_data(
-                instrument_token = 260105,          # NSE:NIFTY BANK index
-                from_date        = "YYYY-MM-DD 09:15:00",
-                to_date          = "YYYY-MM-DD 15:30:00",
+                instrument_token = 260105,              # NSE:NIFTY BANK index
+                from_date        = "YYYY-MM-DD 09:15:00",  # 10 trading days ago
+                to_date          = "YYYY-MM-DD 15:30:00",  # yesterday
                 interval         = "5minute"
             )
+
+        10 days × ~75 candles/day ≈ 750 candles.
+        This gives EMA50 a fully-converged seed value, eliminating the
+        ~30-bar intraday warmup that the old single-day fetch required.
 
         Returns (ema20, ema50) on success, (None, None) on any failure.
         On failure the strategy logs a warning and falls back to computing
         EMA from today's candles only.
         """
         try:
-            today = _now_ist().date()
+            today      = _now_ist().date()
+            seed_days  = CFG["ema_seed_days"]   # default 10
 
-            # Walk back to last trading day (skip weekends).
-            # Zerodha handles NSE holidays -- if prev weekday was a holiday
-            # it returns fewer candles and we fall back gracefully.
-            prev_day = today - timedelta(days=1)
-            while prev_day.weekday() >= 5:   # 5=Sat, 6=Sun
-                prev_day -= timedelta(days=1)
+            # Collect the last `seed_days` weekdays going backwards from
+            # today. Zerodha handles NSE holidays gracefully (returns fewer
+            # candles on partial/holiday days; we only need >= 50 total).
+            trading_days = []
+            d = today - timedelta(days=1)
+            while len(trading_days) < seed_days:
+                if d.weekday() < 5:          # 0=Mon … 4=Fri
+                    trading_days.append(d)
+                d -= timedelta(days=1)
 
-            from_dt = f"{prev_day} 09:15:00"
-            to_dt   = f"{prev_day} 15:30:00"
+            from_day = trading_days[-1]      # oldest day in the window
+            to_day   = trading_days[0]       # most recent (= yesterday)
+
+            from_dt  = f"{from_day} 09:15:00"
+            to_dt    = f"{to_day} 15:30:00"
 
             log.info(
-                f"[BB_STOCH] EMA seed: fetching 5-min candles for {prev_day} "
-                f"(token={CFG['ema_seed_token']}) ..."
+                f"[BB_STOCH] EMA seed: fetching 5-min candles "
+                f"from {from_day} to {to_day} "
+                f"({seed_days} trading days, ~{seed_days * 75} candles expected, "
+                f"token={CFG['ema_seed_token']}) ..."
             )
 
             candles = self._hub.kite.historical_data(
@@ -624,11 +657,15 @@ class BBStochStrategy(BaseStrategy):
                 interval         = "5minute"
             )
 
-            if not candles or len(candles) < 20:
+            # Require at least 50 candles (covers EMA50 minimum).
+            # Full 10-day window normally yields ~750 but holidays reduce it.
+            min_required = 50
+            if not candles or len(candles) < min_required:
                 log.warning(
-                    f"[BB_STOCH] EMA seed: only {len(candles) if candles else 0} candles "
-                    f"returned for {prev_day} (need >= 20). "
-                    f"Possible holiday or auth issue. "
+                    f"[BB_STOCH] EMA seed: only "
+                    f"{len(candles) if candles else 0} candles returned "
+                    f"for {from_day} → {to_day} (need >= {min_required}). "
+                    f"Possible holidays / auth issue. "
                     f"Falling back to today-candles-only EMA."
                 )
                 return None, None
@@ -638,11 +675,12 @@ class BBStochStrategy(BaseStrategy):
             ema50  = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
 
             log.info(
-                f"[BB_STOCH] EMA seeds ready | prev_day={prev_day} | "
+                f"[BB_STOCH] EMA seeds ready | "
+                f"{from_day} → {to_day} ({seed_days} days) | "
                 f"bars={len(candles)} | "
                 f"EMA20={ema20:.2f}  EMA50={ema50:.2f} | "
                 f"Trend={'BULL (EMA20>EMA50)' if ema20 > ema50 else 'BEAR (EMA20<EMA50)'} | "
-                f"EMA filter is LIVE from bar 1 today"
+                f"EMA filter is LIVE and fully converged from bar 1 today"
             )
             return ema20, ema50
 
@@ -1313,7 +1351,8 @@ class BBStochStrategy(BaseStrategy):
             f"WinRate={win_pct*100:.1f}% Expect={exp:+.3f}pts "
             f"DayPnL={self._daily_pnl:+.2f}Rs | "
             f"5m-bars={len(self._buf_5m)} | "
-            f"EMA-seeded={self._ema20_seed is not None}"
+            f"EMA-seeded={self._ema20_seed is not None} | "
+            f"EMA-seed-days={CFG['ema_seed_days']}"
         )
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
