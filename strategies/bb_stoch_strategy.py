@@ -2,12 +2,11 @@
 strategies/bb_stoch_strategy.py
 -------------------------------------------------------------
 BBStochStrategy -- BankNifty options scalper using:
-  * Bollinger Bands  (BB)   -- identifies breakout / volatility expansion
-  * Volume Filter           -- confirms genuine institutional participation
-  * EMA trend filter        -- prevents counter-trend entries
-  * EMA Seeding             -- previous 10 trading days of 5-min candles
-                               loaded at pre-market so EMA20 / EMA50 are
-                               accurate from bar 1
+  * Bollinger Bands  (BB)       -- identifies breakout / volatility expansion
+  * Volume Filter               -- confirms genuine institutional participation
+  * Supertrend trend filter     -- prevents counter-trend entries
+                                   Supertrend(10, 3) computed on the live
+                                   5-min candle buffer; no seeding required.
 
 SIGNAL LOGIC (all filters must agree before entry):
 --------------------------------------------------------------
@@ -17,50 +16,14 @@ SIGNAL LOGIC (all filters must agree before entry):
        OR BB Middle : last close crosses ABOVE the BB middle band
     2. Volume     : current bar volume >= VOL_MULT * rolling avg vol
     3. VWAP       : close above session VWAP
-    4. EMA        : EMA20 > EMA50 (uptrend context) -- accurate from bar 1
-                    because seeds are fetched from Zerodha historical API
-                    (previous 10 trading days of 5-min candles) in pre_market()
+    4. Supertrend : direction == 1 (bullish) -- ST(10,3) computed from
+                    live 5-min candle buffer, accurate once >= ST_PERIOD+2
+                    bars are available.
     5. Session    : only between SESSION_START and ENTRY_CUTOFF
 
   PE entry (buy put):
     Mirror of the above -- BB break below lower band, bounce below upper
-    band, or middle band cross DOWN.
-
-EMA SEEDING:
---------------------------------------------------------------
-  pre_market() calls _fetch_ema_seeds() which fetches the previous
-  EMA_SEED_DAYS (default 10) trading days of 5-min candles from
-  Zerodha's historical_data API in a single call:
-
-      kite.historical_data(
-          instrument_token = 260105,     # NSE:NIFTY BANK index
-          from_date        = "YYYY-MM-DD 09:15:00",   # 10 trading days ago
-          to_date          = "YYYY-MM-DD 15:30:00",   # yesterday
-          interval         = "5minute"
-      )
-
-  10 trading days × ~75 candles/day ≈ 750 candles total.
-  This gives EMA50 a fully-converged seed with zero warmup
-  period, compared to the old single-day (75-candle) approach
-  which still required ~5 days of warmup for EMA50.
-
-  EMA20 and EMA50 are computed on those candles. The last values
-  are stored as self._ema20_seed / self._ema50_seed.
-
-  In evaluate_signal(), compute_ema() uses these seeds as the
-  starting point and applies today's candles incrementally:
-
-      result = seed
-      for each today_candle_close:
-          result = alpha * close + (1 - alpha) * result
-
-  This is mathematically exact -- EMA is recursive so a correct
-  seed produces correct values on every subsequent bar without
-  warmup.
-
-  Fallback: if the API call fails (holiday, auth error, etc.)
-  seeds default to None and EMA falls back to the old
-  candle-only behaviour.
+    band, or middle band cross DOWN; Supertrend direction == -1 (bearish).
 
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
@@ -164,25 +127,21 @@ CFG = {
     "persistence"        : 1,
 
     # Minimum 5-min bars before first signal.
-    # With EMA seeding active, EMA20/50 are accurate from bar 1.
-    # Remaining constraints: BB needs 7 bars, ATR needs 15 (falls
-    # back to sl_min if not ready), Volume needs 11 (bypasses if
-    # not ready). 14 bars = 70 min from 9:15 → first signal ~10:25 AM.
-    "min_bars"           : 7,
+    # Supertrend(10,3) needs period+2 = 12 bars minimum.
+    # BB needs 7 bars, ATR needs 15 (falls back to sl_min if not ready),
+    # Volume needs 11 (bypasses if not ready).
+    # 12 bars = 60 min from 9:15 → first signal ~10:15 AM.
+    "min_bars"           : 12,
+
+    # Supertrend trend filter -- replaces EMA20/50
+    # Supertrend(period=10, multiplier=3.0) on 5-min candles.
+    # direction == 1  → bullish (CE entries allowed)
+    # direction == -1 → bearish (PE entries allowed)
+    "st_period"          : 10,
+    "st_multiplier"      : 3.0,
 
     # Spot-based strike offsets for Bug 6 subscription
     "spot_atm_offsets"   : [0, 200, -200, 400, -400],
-
-    # EMA Seeding -- Zerodha historical API
-    # NSE:NIFTY BANK index token (constant, not expiry-specific)
-    "ema_seed_token"     : 260105,
-
-    # Number of previous trading days to fetch for EMA seeding.
-    # 10 days × ~75 candles/day ≈ 750 candles -- gives EMA50 a
-    # fully-converged starting value with zero intraday warmup.
-    # Previously this was 1 day (75 candles); increase to 10 for
-    # a significantly more accurate seed, especially for EMA50.
-    "ema_seed_days"      : 10,
 
     # CSV paths
     "entry_csv"          : "logs/bb_stoch_entry.csv",
@@ -265,37 +224,88 @@ def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
     return round(current / avg, 3)
 
 
-def compute_ema(df: pd.DataFrame, period: int,
-                seed: Optional[float] = None) -> float:
+def compute_supertrend(df: pd.DataFrame,
+                       period: int = 10,
+                       multiplier: float = 3.0) -> dict:
     """
-    Exponential Moving Average on 'close'.
+    Supertrend(period, multiplier) on OHLC data.
 
-    With seed (EMA seeding from previous 10 trading days of 5-min candles):
-        Starts from yesterday's closing EMA value and applies today's
-        candles one by one using:
-            result = alpha * price + (1 - alpha) * result
-        where alpha = 2 / (period + 1).
-        Mathematically exact from bar 1 -- zero warmup needed.
+    Algorithm:
+      1. ATR(period) via Wilder smoothing (alpha = 1/period).
+      2. Basic Upper = HL2 + multiplier * ATR
+         Basic Lower = HL2 - multiplier * ATR
+      3. Final Upper Band (FUB):
+           FUB[i] = Basic_Upper[i]  if  Basic_Upper[i] < FUB[i-1]
+                                     or  Close[i-1] > FUB[i-1]
+                  else FUB[i-1]
+      4. Final Lower Band (FLB):
+           FLB[i] = Basic_Lower[i]  if  Basic_Lower[i] > FLB[i-1]
+                                     or  Close[i-1] < FLB[i-1]
+                  else FLB[i-1]
+      5. Direction:
+           prev bearish (-1): flip to bullish (1) if Close > FUB, else stay -1
+           prev bullish  (1): flip to bearish (-1) if Close < FLB, else stay 1
 
-    Without seed (fallback -- today's candles only):
-        Standard pandas ewm(). Needs ~30-50 bars to converge.
+    Returns dict:
+      direction      : 1 (bullish) | -1 (bearish) | 0 (insufficient data)
+      value          : Supertrend line value (FLB when bullish, FUB when bearish)
+      prev_direction : direction of the previous bar
     """
-    if len(df) < 1:
-        return seed if seed is not None else 0.0
+    insufficient = {"direction": 0, "value": 0.0, "prev_direction": 0}
+    if len(df) < period + 2:
+        return insufficient
 
+    high  = df["high"].astype(float)
+    low   = df["low"].astype(float)
     close = df["close"].astype(float)
 
-    if seed is not None:
-        alpha  = 2.0 / (period + 1)
-        result = float(seed)
-        for price in close:
-            result = alpha * float(price) + (1.0 - alpha) * result
-        return round(result, 2)
-    else:
-        if len(df) < 2:
-            return 0.0
-        ema = close.ewm(span=period, adjust=False).mean()
-        return float(round(ema.iloc[-1], 2))
+    # ATR (Wilder / EWM, same method as _compute_atr)
+    prev_c = close.shift(1)
+    tr     = pd.concat([
+                 high - low,
+                 (high - prev_c).abs(),
+                 (low  - prev_c).abs(),
+             ], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+    hl2         = (high + low) / 2.0
+    basic_upper = (hl2 + multiplier * atr).values
+    basic_lower = (hl2 - multiplier * atr).values
+    close_v     = close.values
+
+    n           = len(df)
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+    direction   = np.ones(n, dtype=int)   # start all bullish
+
+    for i in range(1, n):
+        # Final Upper Band
+        if basic_upper[i] < final_upper[i - 1] or close_v[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
+        else:
+            final_upper[i] = final_upper[i - 1]
+
+        # Final Lower Band
+        if basic_lower[i] > final_lower[i - 1] or close_v[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
+
+        # Direction
+        if direction[i - 1] == -1:
+            direction[i] = 1 if close_v[i] > final_upper[i] else -1
+        else:
+            direction[i] = -1 if close_v[i] < final_lower[i] else 1
+
+    cur_dir  = int(direction[-1])
+    prev_dir = int(direction[-2])
+    st_value = float(final_lower[-1]) if cur_dir == 1 else float(final_upper[-1])
+
+    return {
+        "direction"      : cur_dir,
+        "value"          : round(st_value, 2),
+        "prev_direction" : prev_dir,
+    }
 
 
 # ============================================================
@@ -303,19 +313,12 @@ def compute_ema(df: pd.DataFrame, period: int,
 # ============================================================
 
 def evaluate_signal(df: pd.DataFrame,
-                    vwap: Optional[float],
-                    ema20_seed: Optional[float] = None,
-                    ema50_seed: Optional[float] = None) -> dict:
+                    vwap: Optional[float]) -> dict:
     """
     Run all filters. Returns:
         action     : "BUY_CE" | "BUY_PE" | "HOLD"
         blocked_by : reason string if HOLD
-        bb, vol_ratio, atr, ema20, ema50, close : snapshots for logging
-
-    ema20_seed / ema50_seed: closing EMA values computed from the previous
-    10 trading days of 5-min candles, loaded by _fetch_ema_seeds().
-    When provided, EMA is exact from bar 1.
-    When None, falls back to today's candles only (less accurate early).
+        bb, vol_ratio, atr, st_direction, st_value, close : snapshots for logging
     """
     empty = {"action": "HOLD", "blocked_by": "no_data",
              "bb": {}, "vol_ratio": 0, "atr": 0}
@@ -329,16 +332,19 @@ def evaluate_signal(df: pd.DataFrame,
     atr       = _compute_atr(df, CFG["atr_period"])
     close     = float(df["close"].iloc[-1])
 
-    # EMA trend filter -- seeded so accurate from bar 1
-    ema20    = compute_ema(df, 20, seed=ema20_seed)
-    ema50    = compute_ema(df, 50, seed=ema50_seed)
-    ema_bull = ema20 > ema50
-    ema_bear = ema20 < ema50
+    # Supertrend trend filter
+    st      = compute_supertrend(df, CFG["st_period"], CFG["st_multiplier"])
+    st_bull = st["direction"] == 1
+    st_bear = st["direction"] == -1
 
     base = {
         "bb": bb, "vol_ratio": vol_ratio, "atr": atr,
-        "close": close, "ema20": ema20, "ema50": ema50,
+        "close": close, "st_direction": st["direction"], "st_value": st["value"],
     }
+
+    # Gate 0: Supertrend not yet converged
+    if st["direction"] == 0:
+        return {"action": "HOLD", "blocked_by": "st_warmup", **base}
 
     # Gate 1: BB squeeze
     if bb["squeeze"]:
@@ -375,8 +381,8 @@ def evaluate_signal(df: pd.DataFrame,
     ce_bb_trigger = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
 
     if ce_bb_trigger and above_vwap:
-        if not ema_bull:
-            return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
+        if not st_bull:
+            return {"action": "HOLD", "blocked_by": "st_trend_ce", **base}
         if bb_breakout_up:
             mode = "breakout"
         elif bb_bounce_up:
@@ -400,8 +406,8 @@ def evaluate_signal(df: pd.DataFrame,
     pe_bb_trigger = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
 
     if pe_bb_trigger and below_vwap:
-        if not ema_bear:
-            return {"action": "HOLD", "blocked_by": "ema_trend_pe", **base}
+        if not st_bear:
+            return {"action": "HOLD", "blocked_by": "st_trend_pe", **base}
         if bb_breakout_dn:
             mode = "breakout"
         elif bb_bounce_dn:
@@ -416,13 +422,13 @@ def evaluate_signal(df: pd.DataFrame,
     if ce_bb_trigger:
         if not above_vwap:
             return {"action": "HOLD", "blocked_by": "below_vwap", **base}
-        if not ema_bull:
-            return {"action": "HOLD", "blocked_by": "ema_trend_ce", **base}
+        if not st_bull:
+            return {"action": "HOLD", "blocked_by": "st_trend_ce", **base}
     if pe_bb_trigger:
         if not below_vwap:
             return {"action": "HOLD", "blocked_by": "above_vwap", **base}
-        if not ema_bear:
-            return {"action": "HOLD", "blocked_by": "ema_trend_pe", **base}
+        if not st_bear:
+            return {"action": "HOLD", "blocked_by": "st_trend_pe", **base}
 
     return {"action": "HOLD", "blocked_by": "no_setup", **base}
 
@@ -481,12 +487,10 @@ def _csv_append(filepath: str, row: dict):
 
 class BBStochStrategy(BaseStrategy):
     """
-    BankNifty options strategy: Bollinger Bands + Volume + EMA trend filter.
+    BankNifty options strategy: Bollinger Bands + Volume + Supertrend trend filter.
 
-    EMA is seeded from the previous 10 trading days of 5-min candles
-    (Zerodha historical API) in pre_market(), making EMA20 and EMA50
-    fully converged and accurate from bar 1.
-    All filters are live and working from the very first candle.
+    Supertrend(10, 3) is computed live from the 5-min candle buffer.
+    No pre-market seeding is required.
     """
 
     LIVE_MODE = LIVE_MODE
@@ -498,8 +502,8 @@ class BBStochStrategy(BaseStrategy):
     def __init__(self, market_hub):
         super().__init__(market_hub)
 
-        # 5-min candle buffer -- size covers EMA50 lookback + headroom
-        buf_size = max(CFG["bb_period"], 50) + 20
+        # 5-min candle buffer -- size covers BB and Supertrend lookbacks + headroom
+        buf_size = max(CFG["bb_period"], CFG["st_period"]) + 20
         self._buf_5m: deque = deque(maxlen=buf_size)
 
         # Trade state
@@ -523,12 +527,6 @@ class BBStochStrategy(BaseStrategy):
         self._expiry_date  = None
         self._dte          = 0
         self._session_date = None
-
-        # EMA seeds -- set by _fetch_ema_seeds() in pre_market().
-        # None = seeds unavailable, compute_ema() falls back to
-        # today's candles only.
-        self._ema20_seed: Optional[float] = None
-        self._ema50_seed: Optional[float] = None
 
         # Bug 10 fix
         self._squareoff_done: bool = False
@@ -564,12 +562,6 @@ class BBStochStrategy(BaseStrategy):
             f"PCR={premarket_data.pcr} Expiry={self._expiry_date} DTE={self._dte}"
         )
 
-        # ── EMA SEEDING ──────────────────────────────────────────────────────
-        # Fetch previous 10 trading days of 5-min candles from Zerodha
-        # historical API and compute EMA20/50 seeds. Makes EMA accurate
-        # from bar 1 of today with full EMA50 convergence (no warmup).
-        self._ema20_seed, self._ema50_seed = self._fetch_ema_seeds()
-
         # ── PRE-SUBSCRIBE STRIKES ─────────────────────────────────────────────
         # Bug 4+5 fix: warm up ATM and ATM+-200 tokens before signal fires.
         ref_price = premarket_data.prev_close or premarket_data.prev_last5m_close
@@ -597,101 +589,6 @@ class BBStochStrategy(BaseStrategy):
 
         return True
 
-    # ----------------------------------------------------------
-    # EMA SEEDING  (10 trading days)
-    # ----------------------------------------------------------
-
-    def _fetch_ema_seeds(self) -> Tuple[Optional[float], Optional[float]]:
-        """
-        Fetch the previous EMA_SEED_DAYS (default 10) trading days of
-        5-min candles from Zerodha historical_data API in a single call,
-        then compute EMA20 / EMA50 seeds.
-
-        API call used:
-            kite.historical_data(
-                instrument_token = 260105,              # NSE:NIFTY BANK index
-                from_date        = "YYYY-MM-DD 09:15:00",  # 10 trading days ago
-                to_date          = "YYYY-MM-DD 15:30:00",  # yesterday
-                interval         = "5minute"
-            )
-
-        10 days × ~75 candles/day ≈ 750 candles.
-        This gives EMA50 a fully-converged seed value, eliminating the
-        ~30-bar intraday warmup that the old single-day fetch required.
-
-        Returns (ema20, ema50) on success, (None, None) on any failure.
-        On failure the strategy logs a warning and falls back to computing
-        EMA from today's candles only.
-        """
-        try:
-            today      = _now_ist().date()
-            seed_days  = CFG["ema_seed_days"]   # default 10
-
-            # Collect the last `seed_days` weekdays going backwards from
-            # today. Zerodha handles NSE holidays gracefully (returns fewer
-            # candles on partial/holiday days; we only need >= 50 total).
-            trading_days = []
-            d = today - timedelta(days=1)
-            while len(trading_days) < seed_days:
-                if d.weekday() < 5:          # 0=Mon … 4=Fri
-                    trading_days.append(d)
-                d -= timedelta(days=1)
-
-            from_day = trading_days[-1]      # oldest day in the window
-            to_day   = trading_days[0]       # most recent (= yesterday)
-
-            from_dt  = f"{from_day} 09:15:00"
-            to_dt    = f"{to_day} 15:30:00"
-
-            log.info(
-                f"[BB_STOCH] EMA seed: fetching 5-min candles "
-                f"from {from_day} to {to_day} "
-                f"({seed_days} trading days, ~{seed_days * 75} candles expected, "
-                f"token={CFG['ema_seed_token']}) ..."
-            )
-
-            candles = self._hub.kite.historical_data(
-                instrument_token = CFG["ema_seed_token"],
-                from_date        = from_dt,
-                to_date          = to_dt,
-                interval         = "5minute"
-            )
-
-            # Require at least 50 candles (covers EMA50 minimum).
-            # Full 10-day window normally yields ~750 but holidays reduce it.
-            min_required = 50
-            if not candles or len(candles) < min_required:
-                log.warning(
-                    f"[BB_STOCH] EMA seed: only "
-                    f"{len(candles) if candles else 0} candles returned "
-                    f"for {from_day} → {to_day} (need >= {min_required}). "
-                    f"Possible holidays / auth issue. "
-                    f"Falling back to today-candles-only EMA."
-                )
-                return None, None
-
-            closes = pd.Series([float(c["close"]) for c in candles])
-            ema20  = float(closes.ewm(span=20, adjust=False).mean().iloc[-1])
-            ema50  = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
-
-            log.info(
-                f"[BB_STOCH] EMA seeds ready | "
-                f"{from_day} → {to_day} ({seed_days} days) | "
-                f"bars={len(candles)} | "
-                f"EMA20={ema20:.2f}  EMA50={ema50:.2f} | "
-                f"Trend={'BULL (EMA20>EMA50)' if ema20 > ema50 else 'BEAR (EMA20<EMA50)'} | "
-                f"EMA filter is LIVE and fully converged from bar 1 today"
-            )
-            return ema20, ema50
-
-        except Exception as e:
-            log.warning(
-                f"[BB_STOCH] EMA seed fetch failed: {e}. "
-                f"EMA will warm up from today's candles only "
-                f"(less accurate for first ~30 bars)."
-            )
-            return None, None
-
     def _reset_day(self):
         self._daily_pnl           = 0.0
         self._trades_today        = 0
@@ -704,11 +601,6 @@ class BBStochStrategy(BaseStrategy):
         self._open_atm_subscribed = False
         self._pending_entry       = None
         self._entry_delay_pending = None
-        # Reset seeds so stale previous-day values are never used if
-        # _fetch_ema_seeds() is not called (e.g. on a reconnect reset).
-        # They are set again immediately after this by pre_market().
-        self._ema20_seed = None
-        self._ema50_seed = None
 
     # ----------------------------------------------------------
     # Bug 6: Dynamic spot-based subscription on first candle
@@ -880,13 +772,7 @@ class BBStochStrategy(BaseStrategy):
 
         vwap = self._hub.session_vwap.value
 
-        # Pass EMA seeds -- compute_ema() produces accurate EMA from bar 1
-        # when seeds are available, or falls back to today-only EMA.
-        sig    = evaluate_signal(
-            df, vwap,
-            ema20_seed=self._ema20_seed,
-            ema50_seed=self._ema50_seed,
-        )
+        sig    = evaluate_signal(df, vwap)
         action = sig["action"]
 
         self._log_signal(ts, sig)
@@ -902,7 +788,12 @@ class BBStochStrategy(BaseStrategy):
         vwap_str      = f"{vwap:.2f}" if vwap is not None else "N/A"
         vol_ratio_val = sig.get("vol_ratio", -1)
         vol_str       = f"{vol_ratio_val:.2f}x" if vol_ratio_val >= 0 else "N/A(no-data)"
-        seed_tag      = "seeded" if self._ema20_seed is not None else "warming-up"
+        st_dir        = sig.get("st_direction", 0)
+        st_val        = sig.get("st_value", 0)
+        st_str        = (
+            f"{'BULL' if st_dir == 1 else ('BEAR' if st_dir == -1 else 'WAIT')} "
+            f"val={st_val:.2f}"
+        )
 
         log.info(
             f"[BB_STOCH] {action:8s} | "
@@ -910,7 +801,7 @@ class BBStochStrategy(BaseStrategy):
             f"BB=[{bb.get('lower', 0):.1f}~{bb.get('upper', 0):.1f}] "
             f"BW={bb.get('bw_pct', 0)*100:.2f}% | "
             f"Vol={vol_str} | VWAP={vwap_str} | "
-            f"EMA20={sig.get('ema20', 0):.2f} EMA50={sig.get('ema50', 0):.2f} [{seed_tag}] | "
+            f"ST={st_str} | "
             f"Block={sig.get('blocked_by') or 'none'} | Persist={confirmed} | "
             f"PnL={self._daily_pnl:+.1f}Rs T={self._trades_today}/{CFG['max_trades_day']}"
         )
@@ -1084,9 +975,8 @@ class BBStochStrategy(BaseStrategy):
             "bb_mid"           : bb.get("mid", ""),
             "bb_lower"         : bb.get("lower", ""),
             "bb_bw_pct"        : bb.get("bw_pct", ""),
-            "ema20"            : sig.get("ema20", ""),
-            "ema50"            : sig.get("ema50", ""),
-            "ema_seeded"       : self._ema20_seed is not None,
+            "st_direction"     : sig.get("st_direction", ""),
+            "st_value"         : sig.get("st_value", ""),
             "vol_ratio"        : sig.get("vol_ratio", ""),
             "vwap"             : (self._hub.session_vwap.value
                                   if self._hub.session_vwap.value is not None else "N/A"),
@@ -1310,23 +1200,22 @@ class BBStochStrategy(BaseStrategy):
     def _log_signal(self, ts: datetime, sig: dict):
         bb = sig.get("bb", {})
         _csv_append(CFG["signal_csv"], {
-            "timestamp"  : ts.isoformat(),
-            "action"     : sig.get("action", "HOLD"),
-            "mode"       : sig.get("mode", ""),
-            "blocked_by" : sig.get("blocked_by", ""),
-            "close"      : sig.get("close", ""),
-            "bb_upper"   : bb.get("upper", ""),
-            "bb_mid"     : bb.get("mid", ""),
-            "bb_lower"   : bb.get("lower", ""),
-            "bb_bw_pct"  : bb.get("bw_pct", ""),
-            "bb_squeeze" : bb.get("squeeze", ""),
-            "ema20"      : sig.get("ema20", ""),
-            "ema50"      : sig.get("ema50", ""),
-            "ema_seeded" : self._ema20_seed is not None,
-            "vol_ratio"  : sig.get("vol_ratio", ""),
-            "atr"        : sig.get("atr", ""),
-            "vwap"       : (self._hub.session_vwap.value
-                            if self._hub.session_vwap.value is not None else "N/A"),
+            "timestamp"    : ts.isoformat(),
+            "action"       : sig.get("action", "HOLD"),
+            "mode"         : sig.get("mode", ""),
+            "blocked_by"   : sig.get("blocked_by", ""),
+            "close"        : sig.get("close", ""),
+            "bb_upper"     : bb.get("upper", ""),
+            "bb_mid"       : bb.get("mid", ""),
+            "bb_lower"     : bb.get("lower", ""),
+            "bb_bw_pct"    : bb.get("bw_pct", ""),
+            "bb_squeeze"   : bb.get("squeeze", ""),
+            "st_direction" : sig.get("st_direction", ""),
+            "st_value"     : sig.get("st_value", ""),
+            "vol_ratio"    : sig.get("vol_ratio", ""),
+            "atr"          : sig.get("atr", ""),
+            "vwap"         : (self._hub.session_vwap.value
+                              if self._hub.session_vwap.value is not None else "N/A"),
         })
 
     # ----------------------------------------------------------
@@ -1351,8 +1240,7 @@ class BBStochStrategy(BaseStrategy):
             f"WinRate={win_pct*100:.1f}% Expect={exp:+.3f}pts "
             f"DayPnL={self._daily_pnl:+.2f}Rs | "
             f"5m-bars={len(self._buf_5m)} | "
-            f"EMA-seeded={self._ema20_seed is not None} | "
-            f"EMA-seed-days={CFG['ema_seed_days']}"
+            f"ST({CFG['st_period']},{CFG['st_multiplier']})-trend-filter=ACTIVE"
         )
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
