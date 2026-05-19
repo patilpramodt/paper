@@ -64,6 +64,13 @@ import numpy as np
 import pandas as pd
 
 from core.base_strategy import BaseStrategy
+
+# IST helper — same pattern as market_hub / premarket
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    """Current wall-clock time in IST.  Works on GitHub Actions (UTC runner)."""
+    return datetime.now(tz=_IST).replace(tzinfo=None)
 from core.instruments import get_atm_strike
 from core.pricer import option_premium, pick_iv
 
@@ -157,8 +164,13 @@ class ORBStrategy(BaseStrategy):
         self._open_price    = None
 
         # Pre-market data (set in pre_market())
-        self._vix       = None
-        self._pcr       = None
+        # NOTE: self._pm is kept as a live reference so that _check_entry()
+        # always reads self._pm.pcr and self._pm.vix — the live-refresh thread
+        # updates these every few minutes.  Do NOT cache pm.pcr at init time;
+        # pm.pcr is always None at 9:08 (WsPCR only warms up after 9:16).
+        self._pm        = None   # full PreMarketData reference (live)
+        self._vix       = None   # cached for VIX-too-high day-pause check (once)
+        self._pcr       = None   # kept only for EOD CSV logging snapshot
         self._prev_close= None
         self._ema200    = None
         self._expiry    = None
@@ -173,8 +185,12 @@ class ORBStrategy(BaseStrategy):
 
     def pre_market(self, pm, instruments) -> bool:
         self._instruments = instruments
-        self._vix         = pm.vix
-        self._pcr         = pm.pcr
+        # FIX (PCR live-read): store the full PreMarketData object so
+        # _check_entry() always reads pm.pcr at signal time, not the stale
+        # snapshot captured here at 9:08 when pm.pcr is always None.
+        self._pm          = pm
+        self._vix         = pm.vix         # used once here for day-pause decision
+        self._pcr         = pm.pcr         # snapshot for EOD CSV only
         self._prev_close  = pm.prev_close
         self._ema200      = pm.ema200_daily
         self._expiry      = pm.expiry_date
@@ -226,11 +242,23 @@ class ORBStrategy(BaseStrategy):
         Now indicators receive real high/low for ATR, Supertrend, ADX.
         Appending BEFORE _check_entry() also fixes the one-bar lag (Bug 6):
         the breakout bar itself is now included in indicator computation.
+
+        FIX (backfill guard): during late-start historical replay, on_candle()
+        is called with past timestamps.  Without this guard a backfill candle
+        inside 9:40-10:30 would fire _check_entry() and place a trade at the
+        current option price for a breakout that happened hours ago.
+        Guard: skip entry if the candle is more than 10 minutes old vs IST wall-clock.
         """
         # FIX: append full candle dict (not just close) — preserves real OHLCV
         self._candle_buf.append(candle)
 
-        if (not self._day_paused and
+        # Backfill guard — candles replayed from history are always stale;
+        # _now_ist() returns the real wall-clock so the gap is large during replay
+        # but < 1 s for live candles.
+        stale = (_now_ist() - ts).total_seconds() > 600   # > 10 min old
+
+        if (not stale and
+                not self._day_paused and
                 self._or_locked and self._or_width and
                 CFG["min_range"] <= self._or_width <= CFG["max_range"] and
                 (self._trade is None or self._trade["state"] == "CLOSED") and
@@ -323,13 +351,17 @@ class ORBStrategy(BaseStrategy):
                 log.info(f"[{self.name}]  PE above 200EMA={self._ema200:.0f}")
                 return
 
-        # PCR gate
-        if self._pcr:
-            if direction == "CE" and self._pcr < CFG["pcr_min"]:
-                log.info(f"[{self.name}]  PCR={self._pcr:.2f} < min={CFG['pcr_min']}  skip CE")
+        # PCR gate — always read live value from pm so we see WsPCR updates.
+        # self._pcr was None at 9:08 (pre_market time); the live-refresh thread
+        # populates pm.pcr starting at 9:16 AM.  Using self._pcr directly means
+        # the filter is permanently skipped every day (PCR never checked).
+        live_pcr = self._pm.pcr if self._pm is not None else self._pcr
+        if live_pcr:
+            if direction == "CE" and live_pcr < CFG["pcr_min"]:
+                log.info(f"[{self.name}]  PCR={live_pcr:.2f} < min={CFG['pcr_min']}  skip CE")
                 return
-            if direction == "PE" and self._pcr > CFG["pcr_max"]:
-                log.info(f"[{self.name}]  PCR={self._pcr:.2f} > max={CFG['pcr_max']}  skip PE")
+            if direction == "PE" and live_pcr > CFG["pcr_max"]:
+                log.info(f"[{self.name}]  PCR={live_pcr:.2f} > max={CFG['pcr_max']}  skip PE")
                 return
         else:
             log.info(f"[{self.name}]  PCR unavailable — skipping PCR filter")
@@ -415,14 +447,18 @@ class ORBStrategy(BaseStrategy):
             return
 
         # Place BUY order (paper: simulated, live: MARKET)
-        order_id = self._place_buy(
+        # FIX: _place_buy() returns Optional[Tuple[str, float]] — must unpack.
+        # Old code stored the raw tuple in self._trade["order_id"] and the
+        # None check worked by accident, but fill_price was never captured.
+        buy_result = self._place_buy(
             opt_sym or f"{strike}{direction}", opt_token or 0,
             CFG["lot_size"], ep,
         )
-        if LIVE_MODE and order_id is None:
+        if LIVE_MODE and buy_result is None:
             self._release_slot()
             log.error(f"[{self.name}] BUY order FAILED — entry aborted")
             return
+        order_id, entry_fill = buy_result if buy_result else ("PAPER-SIM", ep)
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
 
@@ -433,6 +469,7 @@ class ORBStrategy(BaseStrategy):
             "entry_time"     : ts,
             "entry_prem"     : round(ep, 2),
             "entry_prem_eff" : round(ep_eff, 2),
+            "entry_fill"     : round(entry_fill, 2),   # actual fill from OrderRouter
             "strike"         : strike,
             "expiry"         : expiry,
             "expiry_dt"      : expiry_dt,
@@ -449,7 +486,7 @@ class ORBStrategy(BaseStrategy):
             "orh"            : orh,
             "orl"            : orl,
             "range_width"    : rng,
-            "order_id"       : order_id,
+            "order_id"       : order_id,   # now a plain str, not the raw tuple
             "qty"            : CFG["lot_size"],
         }
         self._trades_taken += 1
@@ -459,7 +496,7 @@ class ORBStrategy(BaseStrategy):
 
         log.info(f"[{self.name}] [{mode_tag}] TRADE #{self._trades_taken} ENTERED")
         log.info(f"[{self.name}]   {direction} {strike} {expiry}  DTE={dte}")
-        log.info(f"[{self.name}]   Prem {ep:.0f}+slip{ep_eff:.0f} | "
+        log.info(f"[{self.name}]   Prem {ep:.0f}+slip{ep_eff:.0f} fill={entry_fill:.0f} | "
                  f"Tgt={target_s:.0f} | SL={sl_s:.0f} | PremSL={psl_pct*100:.0f}% | "
                  f"order_id={order_id}")
 
@@ -521,16 +558,23 @@ class ORBStrategy(BaseStrategy):
 
         # Place SELL order with retry — checks position before each retry so a
         # transient rejection never leaves the position unmanaged silently.
-        sell_order_id = self._place_sell_with_retry(
+        # FIX: _place_sell_with_retry() returns Optional[Tuple[str, float]].
+        # Old code stored the raw tuple in sell_order_id (wrong type in CSV).
+        sell_result = self._place_sell_with_retry(
             t.get("opt_sym", ""),
             t.get("opt_token", 0),
             t.get("qty", CFG["lot_size"]),
             exit_prem,
             max_retries=3,
         )
-        if LIVE_MODE and sell_order_id is None:
+        if LIVE_MODE and sell_result is None:
             log.error(f"[{self.name}] SELL order FAILED for {t.get('opt_sym')} — "
                       f"position may still be open in Zerodha! Check and square off manually.")
+        sell_order_id = sell_result[0] if sell_result else None
+        exit_fill     = sell_result[1] if sell_result else exit_prem
+
+        # Snapshot live PCR at close time for the CSV (pm.pcr is the live value)
+        pcr_at_close = (self._pm.pcr if self._pm is not None else self._pcr)
 
         # Release global trade slot
         self._release_slot()
@@ -545,23 +589,25 @@ class ORBStrategy(BaseStrategy):
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         result = {**t,
-                  "exit_time"   : ts,
-                  "exit_spot"   : round(spot, 2),
-                  "exit_reason" : reason,
-                  "exit_prem"   : round(exit_prem, 2),
+                  "exit_time"    : ts,
+                  "exit_spot"    : round(spot, 2),
+                  "exit_reason"  : reason,
+                  "exit_prem"    : round(exit_prem, 2),
                   "exit_prem_eff": ep_eff,
-                  "pnl_total"   : pnl_n,
-                  "trade_num"   : self._trades_taken,
-                  "vix"         : self._vix,
-                  "pcr"         : self._pcr,
-                  "mode"        : mode_tag,
-                  "sell_order_id": sell_order_id,
+                  "exit_fill"    : round(exit_fill, 2),   # actual fill price
+                  "pnl_total"    : pnl_n,
+                  "trade_num"    : self._trades_taken,
+                  "vix"          : self._vix,
+                  "pcr"          : pcr_at_close,           # live PCR at exit time
+                  "mode"         : mode_tag,
+                  "sell_order_id": sell_order_id,          # now a plain str, not tuple
         }
         self._completed.append(result)
         self._log_csv(result)
 
         log.info(f"[{self.name}] [{mode_tag}] CLOSED #{self._trades_taken}  {reason} "
-                 f"{pnl_n:,.0f}  |  Today: {self._today_pnl:,.0f} | sell_order={sell_order_id}")
+                 f"{pnl_n:,.0f}  |  Today: {self._today_pnl:,.0f} | "
+                 f"sell_order={sell_order_id} fill={exit_fill:.0f} pcr={pcr_at_close}")
 
         if t["opt_token"]:
             self.unsubscribe_option(t["opt_token"])
