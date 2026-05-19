@@ -95,6 +95,10 @@ class MarketHub:
 
         # Shared market state
         self._index_token  = 260105      # BankNifty — fixed Zerodha token
+        # Extra index tokens registered by strategies with INDEX_TOKEN != None.
+        # Each token here is subscribed to WebSocket and routed exclusively to
+        # strategies whose INDEX_TOKEN matches it (e.g. 256265 for Nifty 50).
+        self._extra_index_tokens: set[int] = set()
         self._last_price   : dict[int, float]    = {}
         self._last_price_ts: dict[int, datetime] = {}   # FIX: track when price arrived
         self._subscribed   : set[int]   = set()
@@ -144,6 +148,31 @@ class MarketHub:
         """Register a strategy to receive tick and candle events."""
         self._strategies.append(strategy)
         log.info(f" Strategy registered: {strategy.name}")
+
+    def add_index_token(self, token: int):
+        """
+        Register an additional index token (e.g. 256265 for Nifty 50).
+
+        Ticks for this token are routed exclusively to strategies whose class
+        attribute INDEX_TOKEN equals this token — not to all strategies.
+        The token is added to _subscribed so it is included when the WebSocket
+        connects. Call this before hub.run() so _on_connect picks it up.
+
+        Strategies signal their index by declaring:
+            INDEX_TOKEN = 256265  # class-level attribute
+        Strategies without INDEX_TOKEN (or INDEX_TOKEN = None) receive the
+        main BankNifty ticks as before.
+        """
+        self._extra_index_tokens.add(token)
+        with self._lock:
+            self._subscribed.add(token)
+        if self._ws:
+            try:
+                self._ws.subscribe([token])
+                self._ws.set_mode(self._ws.MODE_FULL, [token])
+            except Exception as e:
+                log.warning(f"  add_index_token subscribe error for {token}: {e}")
+        log.info(f" Extra index token registered: {token}")
 
     # ── Token subscription ────────────────────────────────────────────────────
 
@@ -227,15 +256,18 @@ class MarketHub:
 
                 # OI FIX: store open interest from MODE_FULL tick.
                 # Zerodha sends oi for options/futures in every full-mode tick.
-                # Index token has no OI (it's a computed index) — skip it.
+                # Index tokens (main + extra) have no OI — skip them.
                 # WsPCR reads this to compute PCR without any HTTP calls.
-                if token != self._index_token:
+                if token != self._index_token and token not in self._extra_index_tokens:
                     oi = tick.get("oi", 0)
                     if oi:
                         self._last_oi[token] = oi
 
             if token == self._index_token:
                 self._handle_index_tick(price, qty, now, tick_ts)
+            elif token in self._extra_index_tokens:
+                # Extra index (e.g. Nifty 50) — route only to matching strategies
+                self._handle_extra_index_tick(token, price, now, tick_ts)
             else:
                 # Option tick — broadcast to all strategies
                 for strat in self._strategies:
@@ -262,8 +294,13 @@ class MarketHub:
         # Update session VWAP (tick-weighted with proxy_weight)
         self.session_vwap.update(price, price, price, volume=qty, proxy_weight=1)
 
-        # Broadcast raw tick to all strategies (both wall-clock ts and exchange tick_ts)
+        # Broadcast raw tick to all strategies that use the main BankNifty index.
+        # Strategies with a class-level INDEX_TOKEN attribute (e.g. SpikeNiftyStrategy)
+        # receive ticks from _handle_extra_index_tick() instead — not here.
         for strat in self._strategies:
+            strat_index = getattr(strat, "INDEX_TOKEN", None)
+            if strat_index is not None:
+                continue   # this strategy tracks a different index
             try:
                 strat.on_tick(price, now, tick_ts)
             except Exception as e:
@@ -278,6 +315,23 @@ class MarketHub:
                     strat.on_candle(closed, now)
                 except Exception as e:
                     log.error(f"[{strat.name}] on_candle error: {e}")
+
+    def _handle_extra_index_tick(self, token: int, price: float, now: datetime, tick_ts: datetime):
+        """
+        Route an extra index tick (e.g. Nifty 50, token=256265) exclusively to
+        strategies whose INDEX_TOKEN class attribute matches this token.
+
+        No candle building is done here — extra-index strategies build their own
+        candles internally (e.g. SpikeNiftyStrategy builds 8-second candles).
+        """
+        for strat in self._strategies:
+            strat_index = getattr(strat, "INDEX_TOKEN", None)
+            if strat_index != token:
+                continue
+            try:
+                strat.on_tick(price, now, tick_ts)
+            except Exception as e:
+                log.error(f"[{strat.name}] on_tick error (extra index {token}): {e}")
 
     def _on_connect(self, ws, response):
         log.info(" WebSocket connected")
@@ -419,8 +473,14 @@ class MarketHub:
                     except Exception as e:
                         log.error(f"[{strat.name}] backfill on_tick error: {e}")
 
-            # Replay candle into ALL strategies.
+            # Replay candle into strategies that track this index.
+            # Strategies with INDEX_TOKEN = None track the main BankNifty index.
+            # Strategies with INDEX_TOKEN set (e.g. 256265) track a different index
+            # and must not receive candles from this backfill run.
             for strat in self._strategies:
+                strat_idx = getattr(strat, "INDEX_TOKEN", None)
+                if strat_idx is not None and strat_idx != index_token:
+                    continue   # wrong index — skip
                 try:
                     strat.on_candle(candle, candle_ts)
                 except Exception as e:
