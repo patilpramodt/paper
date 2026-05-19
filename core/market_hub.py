@@ -554,3 +554,4 @@ class MarketHub:
         ticker.close()
         log.info("MarketHub shutdown complete")
 
+
