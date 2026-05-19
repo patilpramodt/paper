@@ -95,7 +95,8 @@ from strategies.spike                import SpikeStrategy
 from strategies.spike_nifty          import SpikeNiftyStrategy
 from strategies.orb_v2               import ORBStrategy
 from strategies.scalper_v7_strategy  import ScalperV7Strategy
-from strategies.bb_stoch_strategy    import BBStochStrategy
+from strategies.bb_stoch_strategy         import BBStochStrategy
+from strategies.bb_stoch_nifty_strategy  import BBStochNiftyStrategy
 from strategies.hedged_sell_strategy import HedgedSellStrategy
 from strategies.smart_hedge_strategy import SmartHedgeStrategy
 
@@ -108,7 +109,8 @@ ACTIVE_STRATEGIES = [
     SpikeNiftyStrategy,  # Spike Nifty:  9:15-9:30   gap/spike trade (Nifty 50)
     ORBStrategy,         # ORB v2:       9:40-10:15  breakout trade
     ScalperV7Strategy,   # Scalper V7:   all-day,    11-filter momentum scalper
-    BBStochStrategy,     # BB+Stoch:     all-day,    Bollinger+Stochastic+Volume
+    BBStochStrategy,       # BB+Stoch BankNifty: all-day, Bollinger+Stochastic+Volume
+    BBStochNiftyStrategy,  # BB+Stoch Nifty:     all-day, Bollinger+Stochastic+Volume (Nifty 50)
     HedgedSellStrategy,  # Hedged Sell:  9:30-10:15  Iron Condor (classic, no direction filter)
     SmartHedgeStrategy,  # Smart Hedge:  9:35-10:15  Auto-directional: Bull Put / Bear Call / Condor
 ]
@@ -175,7 +177,8 @@ def setup_logging():
         "strategy.spike_nifty":  "spike_nifty.log",
         "strategy.orb":          "orb_v2.log",
         "strategy.scalper_v7":   "scalper_v7.log",
-        "strategy.bb_stoch":     "bb_stoch.log",
+        "strategy.bb_stoch":         "bb_stoch.log",
+        "strategy.bb_stoch_nifty":   "bb_stoch_nifty.log",
         "strategy.hedged_sell":  "hedged_sell.log",
         "strategy.smart_hedge":  "smart_hedge.log",
     }
@@ -351,6 +354,13 @@ def main():
 
     # ── Backfill historical candles (warm up indicators for late starts) ──────
     hub.backfill(hub.kite, index_token=260105)
+
+    # ── Backfill Nifty 5-min candles for BBStochNiftyStrategy ─────────────────
+    # MarketHub's backfill filtering (INDEX_TOKEN routing) ensures only
+    # strategies with INDEX_TOKEN==256265 receive these candles.
+    # SpikeNiftyStrategy.on_candle is a no-op, so this only warms up
+    # BBStochNiftyStrategy's internal _buf_5m indicator buffer.
+    hub.backfill(hub.kite, index_token=256265)
 
     # ── Sleep until WebSocket start time (9:14 AM IST) ───────────────────────
     now = now_ist()
