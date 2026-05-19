@@ -92,6 +92,7 @@ from core.order_router import OrderRouter
 
 # ── Strategies — ADD/REMOVE here to enable/disable ──────────────────────────
 from strategies.spike                import SpikeStrategy
+from strategies.spike_nifty          import SpikeNiftyStrategy
 from strategies.orb_v2               import ORBStrategy
 from strategies.scalper_v7_strategy  import ScalperV7Strategy
 from strategies.bb_stoch_strategy    import BBStochStrategy
@@ -103,7 +104,8 @@ from strategies.smart_hedge_strategy import SmartHedgeStrategy
 #  Order matters: first in list = first to receive ticks
 # ─────────────────────────────────────────────────────────────────────────────
 ACTIVE_STRATEGIES = [
-    SpikeStrategy,       # Spike:        9:15-9:30   gap/spike trade
+    SpikeStrategy,       # Spike:        9:15-9:30   gap/spike trade (BankNifty)
+    SpikeNiftyStrategy,  # Spike Nifty:  9:15-9:30   gap/spike trade (Nifty 50)
     ORBStrategy,         # ORB v2:       9:40-10:15  breakout trade
     ScalperV7Strategy,   # Scalper V7:   all-day,    11-filter momentum scalper
     BBStochStrategy,     # BB+Stoch:     all-day,    Bollinger+Stochastic+Volume
@@ -170,6 +172,7 @@ def setup_logging():
     # ── Per-strategy loggers → own dated file, propagate=False ───────────────
     _STRAT = {
         "strategy.spike":        "spike.log",
+        "strategy.spike_nifty":  "spike_nifty.log",
         "strategy.orb":          "orb_v2.log",
         "strategy.scalper_v7":   "scalper_v7.log",
         "strategy.bb_stoch":     "bb_stoch.log",
@@ -247,6 +250,19 @@ def main():
     instruments = InstrumentStore()
     instruments.load(hub.kite, option_root="BANKNIFTY")
 
+    # ── Load Nifty instruments for SpikeNiftyStrategy ─────────────────────────
+    # SpikeNiftyStrategy uses option_root="NIFTY" (50-pt strike intervals).
+    # A separate InstrumentStore is needed because BANKNIFTY and NIFTY have
+    # different strike names, steps, and expiry calendars in NFO.
+    nifty_instruments = InstrumentStore()
+    nifty_instruments.load(hub.kite, option_root="NIFTY")
+
+    # ── Register Nifty 50 index token with MarketHub ───────────────────────────
+    # MarketHub routes ticks for this token exclusively to strategies whose
+    # INDEX_TOKEN class attribute == 256265 (i.e. SpikeNiftyStrategy).
+    # Must be called before hub.run() so _on_connect subscribes it.
+    hub.add_index_token(256265)   # NSE:NIFTY 50 — fixed Zerodha instrument token
+
     # ── Instantiate strategies and register with hub ──────────────────────────
     strategies = []
     for StratClass in ACTIVE_STRATEGIES:
@@ -269,6 +285,14 @@ def main():
     log.info("=" * 60)
     pm = PreMarketData()
     pm.fetch_all(hub.kite, index_token=260105, instruments=instruments)
+
+    # ── Fetch Nifty pre-market data for SpikeNiftyStrategy ───────────────────
+    # Separate PreMarketData instance: Nifty 50 index token (256265),
+    # Nifty instruments. SpikeNiftyStrategy.pre_market() receives this instead
+    # of the shared BankNifty pm.
+    log.info("=== Nifty Pre-Market Fetch ===")
+    nifty_pm = PreMarketData()
+    nifty_pm.fetch_all(hub.kite, index_token=256265, instruments=nifty_instruments)
 
     # ── WsPCR setup ───────────────────────────────────────────────────────────
     log.info("=" * 60)
@@ -306,7 +330,13 @@ def main():
     active_strategies = []
     for strat in strategies:
         try:
-            ok = strat.pre_market(pm, instruments)
+            # SpikeNiftyStrategy needs Nifty-specific PreMarketData and instruments.
+            # All other strategies use the shared BankNifty pm and instruments.
+            strat_index = getattr(strat, "INDEX_TOKEN", None)
+            if strat_index == 256265:
+                ok = strat.pre_market(nifty_pm, nifty_instruments)
+            else:
+                ok = strat.pre_market(pm, instruments)
             if ok:
                 active_strategies.append(strat)
                 log.info(f"  [{strat.name}] ready for today")
@@ -343,6 +373,9 @@ def main():
     if ws_pcr:
         log.info(f"  WsPCR cfg : range=±{PCR_SPOT_RANGE}pt step={PCR_STRIKE_STEP}pt")
     log.info(f"  Strategies: {[s.name for s in active_strategies]}")
+    log.info(f"  --- Nifty 50 (SPIKE_NIFTY) ---")
+    log.info(f"  Nifty Expiry  : {nifty_pm.expiry_date}  (DTE={nifty_pm.dte_days})")
+    log.info(f"  Nifty Prev Cls: {nifty_pm.prev_close}")
     log.info("=" * 60)
 
     # ── Start MarketHub (WebSocket) — runs until 3:31 PM IST ─────────────────
@@ -357,4 +390,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
