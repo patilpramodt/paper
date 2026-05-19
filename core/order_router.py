@@ -58,16 +58,11 @@ Central order execution layer — single point for all live order placement.
    would wait 15s for a stuck LIMIT order, then log TIMEOUT and abort —
    wasting the signal and leaving the slot locked.
 
-   Fix: immediately after place_order(), poll for QUICK_CHECK_SEC (3 seconds).
+   Fix: immediately after place_order(), poll for QUICK_CHECK_SEC (8 seconds).
      • COMPLETE / REJECTED / CANCELLED reached → handle normally.
      • Still stuck (OPEN / OPEN PENDING) after QUICK_CHECK_SEC:
          1. Cancel the stuck order.
-         2. Place ONE fresh replacement order with the latest LTP from WebSocket.
-         3. Run the full 15s _confirm_order() on the replacement.
-         4. If replacement also fails → log "signal skipped" and return None.
-
-   Only ONE retry is allowed. This prevents infinite loops if the market is
-   genuinely illiquid or the session is in a bad state.
+         2. Return None — signal is skipped (no retry placed).
 
 5. Return value: (order_id, fill_price) tuple
 
@@ -133,8 +128,8 @@ MARKET_PROTECTION = 20
 
 # ── Quick placement check timeout ────────────────────────────────────────────
 # Seconds to poll for COMPLETE before declaring the order "stuck" and cancelling.
-# Keep short: MARKET→LIMIT fills in < 1s when liquid. 3s is generous.
-QUICK_CHECK_SEC = 3.0
+# Set to 8s to allow time for the LIMIT order to fill during large market moves.
+QUICK_CHECK_SEC = 8.0
 
 # ── Quick check poll interval ─────────────────────────────────────────────────
 QUICK_POLL_SEC = 0.5
@@ -247,7 +242,7 @@ class OrderRouter:
 
         live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
         live_mode=True  → MARKET MIS order via Kite with market protection;
-                          uses quick-check → cancel → one-retry logic;
+                          uses quick-check → cancel → return None if stuck;
                           returns (order_id, fill_price) ONLY when COMPLETE.
 
         Returns (order_id, fill_price) on success, None on failure.
@@ -273,7 +268,7 @@ class OrderRouter:
 
         live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
         live_mode=True  → MARKET MIS order via Kite with market protection;
-                          uses quick-check → cancel → one-retry logic;
+                          uses quick-check → cancel → return None if stuck;
                           returns (order_id, fill_price) ONLY when COMPLETE.
 
         Returns (order_id, fill_price) on success, None on failure.
@@ -286,7 +281,7 @@ class OrderRouter:
         return self._paper_fill("SELL", strategy_name, symbol, ltp)
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Internal — live execution (quick-check + cancel + one retry)
+    #  Internal — live execution (quick-check + cancel)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _live_order(
@@ -300,28 +295,19 @@ class OrderRouter:
     ) -> Optional[Tuple[str, float]]:
         """
         Place a MARKET MIS order (Zerodha converts to LIMIT with market_protection)
-        and confirm it filled, with a cancel + one-retry if it gets stuck.
+        and confirm it filled within QUICK_CHECK_SEC seconds.
 
         Flow
         ────
-        Attempt 1:
           1. _place_raw_order() → order_id (or None on API error).
-          2. _quick_check_order() polls for QUICK_CHECK_SEC (3s):
-               • COMPLETE  → fetch fill price → return ✓
-               • REJECTED / CANCELLED → log and return None (no retry worthwhile)
-               • TOKEN_EXPIRED → log and return None
-               • Still non-terminal (OPEN / OPEN PENDING / VALIDATION PENDING):
-                   → Zerodha's LIMIT conversion is stuck (stale price). Go to step 3.
-          3. _cancel_order() — cancels the stuck order.
+          2. _quick_check_order() polls for QUICK_CHECK_SEC (8s):
+               • COMPLETE                    → fetch fill price → return ✓
+               • REJECTED / CANCELLED        → log and return None
+               • TOKEN_EXPIRED               → log and return None
+               • Still non-terminal after 8s → cancel stuck order → return None
+                 (stuck because Zerodha's LIMIT price is stale after a large move)
 
-        Attempt 2 (ONE retry):
-          4. Refresh LTP from WebSocket (free, no network) for a fresher limit price.
-          5. _place_raw_order() → order_id2 (or None on API error → skip signal).
-          6. _confirm_order() full 15s poll:
-               • COMPLETE  → fetch fill price → return ✓
-               • Anything else → log "signal skipped" → return None.
-
-        Only ONE retry is attempted. If both attempts fail the signal is skipped.
+        No retry is placed after a cancel — the signal is simply skipped.
         """
         kite = self._hub.kite
         if kite is None:
@@ -331,9 +317,8 @@ class OrderRouter:
             )
             return None
 
-        # ── Attempt 1 ─────────────────────────────────────────────────────────
         log.info(
-            f"[Router][LIVE] {transaction_type} attempt 1/2 | "
+            f"[Router][LIVE] {transaction_type} | "
             f"{strategy_name} | {symbol} | qty={qty} | ref_ltp={ltp:.2f}"
         )
 
@@ -341,12 +326,12 @@ class OrderRouter:
         if order_id is None:
             return None   # API call itself failed; error already logged
 
-        # Quick check: did the order fill (or fail) within QUICK_CHECK_SEC?
+        # Poll for up to QUICK_CHECK_SEC seconds for a terminal state
         quick_status = self._quick_check_order(order_id)
 
         if quick_status == "COMPLETE":
             log.info(
-                f"[Router][LIVE] {transaction_type} filled on attempt 1 ✓ | "
+                f"[Router][LIVE] {transaction_type} filled ✓ | "
                 f"{strategy_name} | {symbol} | order_id={order_id}"
             )
             return self._fetch_fill_price(order_id, ltp, strategy_name, symbol, transaction_type)
@@ -356,11 +341,11 @@ class OrderRouter:
                                     order_id, quick_status, attempt=1)
             return None
 
-        # ── Order is stuck (OPEN / OPEN PENDING) → cancel it ─────────────────
+        # ── Order is stuck (OPEN / OPEN PENDING) after QUICK_CHECK_SEC → cancel ──
         log.warning(
             f"\n{'─'*60}\n"
             f"[Router][LIVE] {transaction_type} order STUCK after {QUICK_CHECK_SEC}s "
-            f"(status={quick_status!r}) — cancelling and retrying once\n"
+            f"(status={quick_status!r}) — cancelling, signal SKIPPED\n"
             f"  Strategy : {strategy_name}\n"
             f"  Symbol   : {symbol}  qty={qty}\n"
             f"  order_id : {order_id}\n"
@@ -368,58 +353,6 @@ class OrderRouter:
             f"{'─'*60}"
         )
         self._cancel_order(order_id, strategy_name, symbol)
-
-        # ── Attempt 2 (ONE retry) ──────────────────────────────────────────────
-        # Refresh LTP from WebSocket cache — free, no network call.
-        fresh_ltp = self._hub.last_price(token) or ltp
-        if fresh_ltp != ltp:
-            log.info(
-                f"[Router][LIVE] LTP refreshed for retry: {ltp:.2f} → {fresh_ltp:.2f}"
-            )
-
-        log.info(
-            f"[Router][LIVE] {transaction_type} attempt 2/2 (retry) | "
-            f"{strategy_name} | {symbol} | qty={qty} | ref_ltp={fresh_ltp:.2f}"
-        )
-
-        order_id2 = self._place_raw_order(kite, symbol, qty, fresh_ltp, transaction_type,
-                                          strategy_name)
-        if order_id2 is None:
-            log.error(
-                f"[Router][LIVE] Retry placement FAILED — "
-                f"signal SKIPPED for {strategy_name} | {symbol}"
-            )
-            return None
-
-        # Full confirm on the retry order
-        status2 = self._confirm_order(str(order_id2))
-
-        if status2 == "COMPLETE":
-            log.info(
-                f"[Router][LIVE] {transaction_type} filled on attempt 2 ✓ | "
-                f"{strategy_name} | {symbol} | order_id={order_id2}"
-            )
-            return self._fetch_fill_price(order_id2, fresh_ltp, strategy_name, symbol,
-                                          transaction_type)
-
-        # Both attempts exhausted → skip signal
-        log.error(
-            f"\n{'!'*60}\n"
-            f"[Router][LIVE] {transaction_type} FAILED after 2 attempts — "
-            f"SIGNAL SKIPPED\n"
-            f"  Strategy  : {strategy_name}\n"
-            f"  Symbol    : {symbol}  qty={qty}\n"
-            f"  Attempt 1 : order_id={order_id}  status={quick_status!r}\n"
-            f"  Attempt 2 : order_id={order_id2}  status={status2!r}\n"
-            f"  ref_ltp   : {ltp:.2f}  retry_ltp={fresh_ltp:.2f}\n"
-            + (
-                f"  → *** SELL FAILED — CHECK ZERODHA CONSOLE AND "
-                f"SQUARE OFF MANUALLY IF POSITION IS OPEN! ***\n"
-                if transaction_type == "SELL" else
-                f"  → Signal skipped. No position opened.\n"
-            )
-            + f"{'!'*60}"
-        )
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -576,7 +509,7 @@ class OrderRouter:
                 f"{strategy_name} | {symbol} | order_id={order_id}"
             )
             # Brief pause: give the exchange a moment to process the cancel
-            # before we place the retry order.
+            # before the caller continues.
             time.sleep(0.5)
             return True
 
@@ -656,7 +589,7 @@ class OrderRouter:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Internal — full order status confirmation (used for retry attempt)
+    #  Internal — full order status confirmation
     # ─────────────────────────────────────────────────────────────────────────
 
     def _confirm_order(
