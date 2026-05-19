@@ -74,7 +74,7 @@ CFG = {
     "start_time"             : dtime(9, 15),
     "spike_exit_time"        : dtime(9, 30),
     "close_time"             : dtime(15, 15),
-    "initial_sl_buffer"      : 120,
+    "initial_sl_buffer"      : 90,
     "trail_trigger_pts"      : 50,
     "trail_distance"         : 25,
     "doji_threshold"         : 0.10,
