@@ -20,12 +20,6 @@ Central order execution layer — single point for all live order placement.
      • If the limit price is stale (gap-open) → the order sits OPEN, never fills
      • If rejected outright → exchange returns REJECTED immediately
 
-   This is why we need the quick-check logic (design point 4 below).
-
-   market_protection values:
-     -1         → Auto protection applied by Zerodha/NSE (recommended)
-     1..100     → Custom protection percentage (e.g., 10 = ±10% band)
-
 2. One-live-trade-at-a-time slot
 
    Only one strategy can hold a live position at a time. This prevents:
@@ -46,7 +40,7 @@ Central order execution layer — single point for all live order placement.
 
    Default: ALL strategies are paper. Change only the one you want to go live.
 
-4. Quick placement check + cancel + ONE retry
+4. Quick placement check + cancel (no retry)
 
    Zerodha converts our MARKET order to a LIMIT order internally. That LIMIT
    order may:
@@ -62,7 +56,7 @@ Central order execution layer — single point for all live order placement.
      • COMPLETE / REJECTED / CANCELLED reached → handle normally.
      • Still stuck (OPEN / OPEN PENDING) after QUICK_CHECK_SEC:
          1. Cancel the stuck order.
-         2. Return None — signal is skipped (no retry placed).
+         2. Return None — signal is skipped.
 
 5. Return value: (order_id, fill_price) tuple
 
@@ -88,7 +82,6 @@ Central order execution layer — single point for all live order placement.
    When detected:
      • A loud, actionable error is logged with exact remediation steps.
      • None is returned so the caller aborts the trade / releases the slot.
-     • No further Kite calls are attempted for that order.
 
 7. Order status confirmation
 
@@ -106,6 +99,33 @@ Central order execution layer — single point for all live order placement.
      "CANCELLED"     → order was cancelled (rare for MARKET orders)
      "TIMEOUT"       → did not reach terminal state in time; caller treats as failed
      "TOKEN_EXPIRED" → access token invalid mid-session; caller must abort + alert
+
+═══════════════════════════════════════════════════════════════════
+  BUG FIXES IN THIS VERSION
+═══════════════════════════════════════════════════════════════════
+
+BUG FIX 1 — Zero-fill detection in _fetch_fill_price():
+  Previously: status=COMPLETE with average_price=0 (zero-fill, rare exchange
+  edge case at 9:15 AM when options have no market maker) caused the bot to
+  return (order_id, ref_ltp) — treating it as a successful fill. The bot then
+  managed a phantom position with trailing SL for minutes before the SELL
+  inevitably failed because no real position existed in Zerodha.
+
+  Fix: After fetching order_history for a COMPLETE order, verify
+  filled_quantity > 0. If filled_quantity is 0, log a CRITICAL zero-fill
+  alert and return None so the caller aborts the entry.
+
+BUG FIX 2 — place_sell_with_retry() position check on first attempt:
+  Previously: After SELL attempt 1 failed, _is_position_open() was called
+  immediately. If the position had been auto-squared by the exchange (e.g.,
+  option value near zero → Zerodha risk manager closes it) or was a phantom
+  fill, _is_position_open() returned False → all remaining retries (2 and 3)
+  were skipped immediately. The SELL "failed" but the position was already
+  closed, so no real harm — but the early stop prevented genuine retry
+  opportunities on transient network/exchange blips.
+
+  Fix: Skip the position check on attempt 1. Only check from attempt 2 onward.
+  This gives the first failure a free retry before checking position status.
 
 ═══════════════════════════════════════════════════════════════════
 """
@@ -243,7 +263,8 @@ class OrderRouter:
         live_mode=False → paper fill logged; returns ("PAPER-{ms}", ltp)
         live_mode=True  → MARKET MIS order via Kite with market protection;
                           uses quick-check → cancel → return None if stuck;
-                          returns (order_id, fill_price) ONLY when COMPLETE.
+                          returns (order_id, fill_price) ONLY when COMPLETE
+                          AND filled_quantity > 0 (zero-fill detection).
 
         Returns (order_id, fill_price) on success, None on failure.
         """
@@ -301,13 +322,10 @@ class OrderRouter:
         ────
           1. _place_raw_order() → order_id (or None on API error).
           2. _quick_check_order() polls for QUICK_CHECK_SEC (8s):
-               • COMPLETE                    → fetch fill price → return ✓
+               • COMPLETE                    → fetch fill price → verify filled_qty → return ✓
                • REJECTED / CANCELLED        → log and return None
                • TOKEN_EXPIRED               → log and return None
                • Still non-terminal after 8s → cancel stuck order → return None
-                 (stuck because Zerodha's LIMIT price is stale after a large move)
-
-        No retry is placed after a cancel — the signal is simply skipped.
         """
         kite = self._hub.kite
         if kite is None:
@@ -334,7 +352,7 @@ class OrderRouter:
                 f"[Router][LIVE] {transaction_type} filled ✓ | "
                 f"{strategy_name} | {symbol} | order_id={order_id}"
             )
-            return self._fetch_fill_price(order_id, ltp, strategy_name, symbol, transaction_type)
+            return self._fetch_fill_price(order_id, ltp, qty, strategy_name, symbol, transaction_type)
 
         if quick_status in ("REJECTED", "CANCELLED", "TOKEN_EXPIRED"):
             self._log_order_failure(transaction_type, strategy_name, symbol, qty, ltp,
@@ -429,7 +447,7 @@ class OrderRouter:
           Terminal   : "COMPLETE", "REJECTED", "CANCELLED", "TOKEN_EXPIRED"
           Non-terminal (still open after timeout): last observed status string
             e.g. "OPEN", "OPEN PENDING", "VALIDATION PENDING"
-            — caller interprets these as "stuck" → cancel + retry.
+            — caller interprets these as "stuck" → cancel.
         """
         TERMINAL = {"COMPLETE", "REJECTED", "CANCELLED"}
         deadline    = time.monotonic() + QUICK_CHECK_SEC
@@ -478,7 +496,7 @@ class OrderRouter:
             f"[Router] quick_check({order_id}) timed out after {QUICK_CHECK_SEC}s "
             f"({attempt} polls) — last status={last_status!r} → treating as STUCK"
         )
-        return last_status   # non-terminal → caller cancels + retries
+        return last_status   # non-terminal → caller cancels
 
     # ─────────────────────────────────────────────────────────────────────────
     #  Internal — cancel a stuck order
@@ -492,10 +510,7 @@ class OrderRouter:
     ) -> bool:
         """
         Attempt to cancel an open order via kite.cancel_order().
-
         Returns True if the API call succeeded.
-        Returns False on error — caller proceeds to retry regardless, since
-        the cancel may still go through asynchronously.
         """
         kite = self._hub.kite
         if kite is None:
@@ -508,14 +523,10 @@ class OrderRouter:
                 f"[Router] CANCEL sent for stuck order | "
                 f"{strategy_name} | {symbol} | order_id={order_id}"
             )
-            # Brief pause: give the exchange a moment to process the cancel
-            # before the caller continues.
             time.sleep(0.5)
             return True
 
         except Exception as exc:
-            # If order already filled or was already cancelled, the API throws.
-            # Log it but don't block the retry.
             log.warning(
                 f"[Router] _cancel_order({order_id}) error "
                 f"(may already be filled/cancelled): {exc}"
@@ -530,32 +541,73 @@ class OrderRouter:
         self,
         order_id:         str,
         ref_ltp:          float,
+        expected_qty:     int,
         strategy_name:    str,
         symbol:           str,
         transaction_type: str,
-    ) -> Tuple[str, float]:
+    ) -> Optional[Tuple[str, float]]:
         """
-        Fetch the actual average_price from order_history for a COMPLETE order.
-        Falls back to ref_ltp if history is unavailable.
+        Fetch the actual average_price and filled_quantity from order_history
+        for a COMPLETE order.
+
+        BUG FIX: Zero-fill detection.
+        Previously this always returned (order_id, ref_ltp) even if
+        average_price=0 and filled_quantity=0. This caused the bot to treat
+        a phantom fill as a real position. Now:
+          • If filled_quantity == 0 after COMPLETE → ZERO-FILL alert → return None.
+          • If average_price missing → fall back to ref_ltp (safe for SELL).
+
+        Returns (order_id, fill_price) on success.
+        Returns None if filled_quantity is 0 (zero-fill — phantom position risk).
         """
-        fill_price = ref_ltp  # safe fallback
+        fill_price    = ref_ltp   # safe fallback
+        filled_qty    = 0
+        found_complete = False
+
         try:
             history = self._hub.kite.order_history(order_id)
             for h in reversed(history):
-                ap = h.get("average_price")
-                if h.get("status", "").upper() == "COMPLETE" and ap:
-                    fill_price = float(ap)
+                if h.get("status", "").upper() == "COMPLETE":
+                    found_complete = True
+                    ap  = h.get("average_price")
+                    fq  = h.get("filled_quantity", 0) or 0
+                    filled_qty = int(fq)
+
+                    if ap and float(ap) > 0:
+                        fill_price = float(ap)
                     break
+
         except Exception as exc:
             log.warning(
                 f"[Router][LIVE] Could not fetch fill price for {order_id}: {exc} "
                 f"— falling back to ref_ltp={ref_ltp:.2f}"
             )
 
+        # ── BUG FIX: Zero-fill detection ─────────────────────────────────────
+        # Exchange can return COMPLETE with filled_quantity=0 at 9:15 AM when
+        # options have no active market maker (immediate circuit or no quotes).
+        # If we proceed, the bot manages a phantom position for minutes before
+        # the SELL fails because no real position exists in Zerodha.
+        if found_complete and filled_qty == 0:
+            log.error(
+                f"\n{'!'*60}\n"
+                f"[Router][ZERO-FILL] {transaction_type} order COMPLETE but filled_quantity=0!\n"
+                f"  Strategy : {strategy_name}\n"
+                f"  Symbol   : {symbol}  expected_qty={expected_qty}\n"
+                f"  order_id : {order_id}  fill_price={fill_price:.2f}\n"
+                f"  → This is a phantom fill. No real position exists in Zerodha.\n"
+                f"  → Treating as FAILED to prevent phantom position management.\n"
+                f"  → Likely cause: option had no active market maker at 9:15 AM.\n"
+                f"  → Entry will be retried on the next valid signal.\n"
+                f"{'!'*60}"
+            )
+            return None   # caller aborts entry — no phantom position created
+
         log.info(
             f"[Router][LIVE] {transaction_type} CONFIRMED ✓ | "
             f"{strategy_name} | {symbol} | order_id={order_id} | "
-            f"fill_price={fill_price:.2f} (ref_ltp={ref_ltp:.2f})"
+            f"fill_price={fill_price:.2f} (ref_ltp={ref_ltp:.2f}) | "
+            f"filled_qty={filled_qty}/{expected_qty}"
         )
         return order_id, fill_price
 
@@ -573,7 +625,7 @@ class OrderRouter:
         """Log a structured error for an order in a bad terminal state."""
         log.error(
             f"\n{'!'*60}\n"
-            f"[Router][LIVE] {transaction_type} {status} on attempt {attempt}/2\n"
+            f"[Router][LIVE] {transaction_type} {status} on attempt {attempt}\n"
             f"  Strategy  : {strategy_name}\n"
             f"  Symbol    : {symbol}  qty={qty}\n"
             f"  ref_ltp   : {ltp:.2f}  market_protection={MARKET_PROTECTION}\n"
@@ -589,7 +641,7 @@ class OrderRouter:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Internal — full order status confirmation
+    #  Internal — full order status confirmation (used by legacy code)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _confirm_order(
@@ -601,15 +653,6 @@ class OrderRouter:
         """
         Poll kite.order_history(order_id) until the order reaches a terminal state
         or the timeout expires.
-
-        Terminal states returned by NSE via Zerodha:
-          "COMPLETE"  → exchange filled the order
-          "REJECTED"  → exchange rejected
-          "CANCELLED" → order was cancelled
-
-        Non-terminal states (keep polling):
-          "PUT ORDER REQ RECEIVED", "VALIDATION PENDING", "OPEN PENDING",
-          "OPEN", "TRIGGER PENDING", "MODIFY PENDING", "CANCEL PENDING"
 
         Returns one of:
           "COMPLETE", "REJECTED", "CANCELLED", "TIMEOUT", "TOKEN_EXPIRED"
@@ -657,7 +700,6 @@ class OrderRouter:
                         f"  → Access token expired mid-session during order confirmation.\n"
                         f"  → The order may or may not have been filled.\n"
                         f"  → CHECK ZERODHA CONSOLE IMMEDIATELY for open positions.\n"
-                        f"  → Restart the bot with a fresh token before next trade.\n"
                         f"{'!'*60}"
                     )
                     return "TOKEN_EXPIRED"
@@ -673,9 +715,7 @@ class OrderRouter:
             f"\n{'!'*60}\n"
             f"[Router][LIVE] Order {order_id} status poll TIMED OUT after {timeout_sec}s\n"
             f"  Polled {attempt} time(s). Order did not reach COMPLETE/REJECTED.\n"
-            f"  → The order may be pending, partially filled, or stuck.\n"
             f"  → CHECK ZERODHA CONSOLE for this order_id and act manually.\n"
-            f"  → Bot treats this as FAILED to prevent phantom position management.\n"
             f"{'!'*60}"
         )
         return "TIMEOUT"
@@ -701,7 +741,7 @@ class OrderRouter:
         )
 
     # ─────────────────────────────────────────────────────────────────────────
-    #  Sell with retry (SL / trigger exit safety net)
+    #  Position check (public — used by strategies for exit safety)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _is_position_open(self, symbol: str) -> bool:
@@ -743,6 +783,10 @@ class OrderRouter:
                 )
             return True
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  Sell with retry (SL / trigger exit safety net)
+    # ─────────────────────────────────────────────────────────────────────────
+
     def place_sell_with_retry(
         self,
         strategy_name: str,
@@ -757,17 +801,24 @@ class OrderRouter:
         Place a SELL (exit) order with automatic outer retry when the position
         is confirmed still open after an inner failure.
 
-        Note: place_sell() itself already does one internal quick-check→cancel→retry
-        cycle (design point 4). This outer retry is a separate safety net for
-        cases where both internal attempts failed and the position is still open.
+        BUG FIX: Position check skipped on attempt 1.
+        Previously, _is_position_open() was called after every failed attempt
+        including the first. If the position was auto-squared by the exchange
+        (or was a phantom fill), _is_position_open() returned False on attempt 1
+        and all remaining retries (2 and 3) were skipped immediately.
+
+        Fix: only call _is_position_open() from attempt 2 onward. This gives
+        the first failure a free retry before checking position status —
+        handling transient network/exchange blips without false early stops.
 
         Flow for each attempt (1 … max_retries):
           1. Call place_sell() — returns (order_id, fill_price) on success.
           2. On success → return immediately.
           3. On failure:
-             a. Call kite.positions() to check if position is still open.
-             b. If CLOSED → stop (closed by a prior attempt or auto square-off).
-             c. If OPEN   → refresh LTP from WebSocket and retry.
+             a. Attempt 1 only: retry immediately without position check.
+             b. Attempt 2+: call kite.positions() to verify position still open.
+                - If CLOSED → stop (closed by prior attempt or auto square-off).
+                - If OPEN   → refresh LTP from WebSocket and retry.
           4. After max_retries failures with position still open → MANUAL alert.
         """
         for attempt in range(1, max_retries + 1):
@@ -794,9 +845,28 @@ class OrderRouter:
 
             log.warning(
                 f"[Router] SELL attempt {attempt}/{max_retries} FAILED | "
-                f"{strategy_name} | {symbol} — checking live position status..."
+                f"{strategy_name} | {symbol}"
             )
 
+            # ── BUG FIX: Skip position check on attempt 1 ─────────────────────
+            # Attempt 1 failure could be a transient blip (exchange busy at 9:15,
+            # network timeout, stuck order cancelled). Give it a free retry before
+            # checking if the position actually exists.
+            if attempt == 1:
+                fresh = self._hub.last_price(token)
+                if fresh and fresh != ltp:
+                    log.info(
+                        f"[Router] LTP refreshed for retry: {ltp:.2f} → {fresh:.2f}"
+                    )
+                    ltp = fresh
+                log.info(
+                    f"[Router] Attempt 1 failed — free retry (no position check yet) | "
+                    f"{strategy_name} | {symbol}"
+                )
+                continue
+
+            # ── Position check from attempt 2 onward ──────────────────────────
+            log.info(f"[Router] Checking position status for {symbol}...")
             still_open = self._is_position_open(symbol)
 
             if not still_open:
