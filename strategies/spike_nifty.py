@@ -15,7 +15,7 @@ INDEX
 
 SL / TRAILING
 ──────────────
-  Initial SL     : entry − 50 pts
+  Initial SL     : entry − 25 pts
   Trail trigger  : profit >= +25 pts  → trailing activates
   Trail SL       : highest_seen − 12 pts  (i.e. CMP − 12)
 
@@ -116,7 +116,7 @@ CFG = {
     "close_time"             : dtime(15, 15),
 
     # ── SL / trailing parameters ──────────────────────────────────────────────
-    # initial_sl_buffer : initial SL = fill_price − 50 pts
+    # initial_sl_buffer : initial SL = fill_price − 25 pts
     # trail_trigger_pts : trail activates when profit >= +25 pts
     # trail_distance    : SL = highest_seen − 12 pts  ("CMP − 12")
     "initial_sl_buffer"      : 25,
@@ -521,7 +521,7 @@ class SpikeNiftyStrategy(BaseStrategy):
         pending entry and return — on_option_tick() resolves it on first tick.
 
         SL is set from the actual exchange fill price (not pre-order LTP), so
-        it's exactly initial_sl_buffer (50 pts) below the confirmed fill.
+        it's exactly initial_sl_buffer (25 pts) below the confirmed fill.
 
         Market protection (20%) is handled globally by order_router.py.
 
