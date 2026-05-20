@@ -228,7 +228,7 @@ def main():
     print("""
 
         ══ MULTI-STRATEGY TRADER ══ python t.py ══
-  SPIKE + ORB v2 + SCALPER V7 + BB STOCH + HEDGED SELL + SMART HEDGE  (paper mode)
+  SPIKE + SPIKE_NIFTY + ORB v2 + SCALPER V7 + BB STOCH + BB STOCH NIFTY + HEDGED SELL + SMART HEDGE  (paper mode)
 
 """)
 
@@ -400,5 +400,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
