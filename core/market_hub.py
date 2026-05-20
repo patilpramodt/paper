@@ -49,6 +49,28 @@ OI FIX (WsPCR support):
    _on_ticks() now stores tick["oi"] for each token so WsPCR can read
    it without any extra API calls or subscriptions.
    3 lines of change: dict init in __init__, store in _on_ticks, getter method.
+
+MULTI-INDEX FIX (Nifty strategies added):
+   Bug A — backfill() strategy filter:
+     Old filter: `if strat_idx is not None and strat_idx != index_token: continue`
+     Problem:    strat_idx=None (BankNifty strategies) always passed the filter,
+                 so ALL BankNifty strategies received Nifty 50 backfill candles
+                 when hub.backfill(index_token=256265) was called.  Their
+                 _buf_5m buffers were corrupted with mixed BN+Nifty price data,
+                 and ORB's opening range was overwritten with Nifty ~24,500 levels.
+     Fix:        Treat INDEX_TOKEN=None as "tracks main BankNifty index (260105)".
+                 A strategy only receives backfill candles for its own index.
+                 The canonical index for a strategy is:
+                   strat_idx if strat_idx is not None else 260105 (BankNifty)
+
+   Bug B — _handle_index_tick() on_candle broadcast:
+     Old code:   Broadcast closed BankNifty candle to ALL strategies with no filter.
+     Problem:    BBStochNiftyStrategy (INDEX_TOKEN=256265) received every closed
+                 BankNifty candle, appended it to _buf_5m, and ran _evaluate_entry()
+                 on BankNifty data.  Live candles via on_tick() also fed Nifty candles
+                 into _buf_5m → buffer had two candles per period (one BN, one Nifty).
+     Fix:        Skip strategies whose INDEX_TOKEN is not None — they track a
+                 different index and build their own candles internally.
 """
 
 import json
@@ -79,6 +101,9 @@ def _now_ist() -> datetime:
 MARKET_OPEN  = dtime(9, 14)
 MARKET_CLOSE = dtime(15, 31)
 
+# ── Main BankNifty index token (fixed Zerodha instrument token) ───────────────
+_BANKNIFTY_TOKEN = 260105
+
 
 class MarketHub:
     """
@@ -94,7 +119,7 @@ class MarketHub:
         self._ws           = None
 
         # Shared market state
-        self._index_token  = 260105      # BankNifty — fixed Zerodha token
+        self._index_token  = _BANKNIFTY_TOKEN   # BankNifty — fixed Zerodha token
         # Extra index tokens registered by strategies with INDEX_TOKEN != None.
         # Each token here is subscribed to WebSocket and routed exclusively to
         # strategies whose INDEX_TOKEN matches it (e.g. 256265 for Nifty 50).
@@ -277,7 +302,7 @@ class MarketHub:
                         log.error(f"[{strat.name}] on_option_tick error: {e}")
 
     def _handle_index_tick(self, price: float, qty: int, now: datetime, tick_ts: datetime):
-        """Process index tick: update VWAP, build candles, broadcast.
+        """Process BankNifty index tick: update VWAP, build candles, broadcast.
 
         FIX (Bug 3 + Bug 7):
         BankNifty INDEX token always has qty=0 (it's a computed index, not a
@@ -286,6 +311,13 @@ class MarketHub:
         Same fix for candles: use max(qty, 1) so candle volume is never zero.
         Volume filters in BB_STOCH, ORB, and ScalperV7 all depend on non-zero
         candle volumes — without this fix they permanently bypass volume checks.
+
+        MULTI-INDEX FIX (Bug B):
+        on_candle broadcast now skips strategies with INDEX_TOKEN set.
+        Those strategies (e.g. BBStochNiftyStrategy) track a different index
+        and build their own candles internally from on_tick(). Broadcasting
+        BankNifty candles to them would corrupt their _buf_5m indicator buffers
+        with BankNifty price data interleaved with their own Nifty candles.
         """
         # FIX: use tick count (1) as proxy when qty==0 (index token)
         # This ensures VWAP is computed and candle volumes are non-zero.
@@ -306,11 +338,17 @@ class MarketHub:
             except Exception as e:
                 log.error(f"[{strat.name}] on_tick error: {e}")
 
-        # Build 5-min candle using IST wall-clock time and proxy volume
+        # Build 5-min BankNifty candle using IST wall-clock time and proxy volume
         closed = self.index_candles.feed_tick(price, proxy_vol, now)
         if closed is not None:
-            # Broadcast closed candle to all strategies
+            # MULTI-INDEX FIX (Bug B): only broadcast to strategies that track the
+            # main BankNifty index (INDEX_TOKEN = None).  Extra-index strategies
+            # (e.g. BBStochNiftyStrategy with INDEX_TOKEN=256265) build their own
+            # 5-min candles internally inside on_tick() — sending them BankNifty
+            # candles here would inject wrong price data into their _buf_5m buffers.
             for strat in self._strategies:
+                if getattr(strat, "INDEX_TOKEN", None) is not None:
+                    continue   # tracks a different index — skip BankNifty candles
                 try:
                     strat.on_candle(closed, now)
                 except Exception as e:
@@ -322,7 +360,8 @@ class MarketHub:
         strategies whose INDEX_TOKEN class attribute matches this token.
 
         No candle building is done here — extra-index strategies build their own
-        candles internally (e.g. SpikeNiftyStrategy builds 8-second candles).
+        candles internally (e.g. BBStochNiftyStrategy uses an internal CandleBuilder
+        in on_tick(); SpikeNiftyStrategy builds 8-second candles).
         """
         for strat in self._strategies:
             strat_index = getattr(strat, "INDEX_TOKEN", None)
@@ -374,13 +413,32 @@ class MarketHub:
           Strategies are fully warmed up from the first live tick onward.
 
         Special handling per strategy:
-          SPIKE      -- on_candle is a no-op in SPIKE, harmless to call.
-                        on_tick is NOT called to avoid touching gap detection.
-          ORB        -- on_tick IS called for 9:15-9:30 candles only, using
-                        candle H and L, so the opening range is reconstructed.
-          ScalperV7  -- on_candle fills _buf_5m (5-min indicators). The 1-min
-                        candle buffer warms up from the first live tick (fast).
-          BB_STOCH   -- on_candle fills _buf_5m (5-min BB/Stoch buffer).
+          SPIKE/SPIKE_NIFTY  -- on_candle is a no-op, harmless to call.
+                                on_tick is NOT called to avoid touching gap
+                                detection.
+          ORB                -- on_tick IS called for 9:15-9:30 BankNifty candles
+                                only, so the opening range is reconstructed.
+          ScalperV7          -- on_candle fills _buf_5m (5-min indicators).
+          BB_STOCH           -- on_candle fills _buf_5m (5-min BB/Stoch buffer).
+          BB_STOCH_NIFTY     -- on_candle fills _buf_5m with Nifty candles
+                                (only when index_token=256265 is passed).
+
+        MULTI-INDEX FIX (Bug A):
+          Strategy filter now uses the strategy's canonical index:
+            - strat_idx = None   → strategy tracks BankNifty (260105)
+            - strat_idx = 256265 → strategy tracks Nifty 50
+          A strategy only receives backfill candles for its own index.
+
+          Old filter: `if strat_idx is not None and strat_idx != index_token`
+            Problem: INDEX_TOKEN=None strategies always passed the filter,
+            so ALL BankNifty strategies received Nifty backfill candles,
+            corrupting their _buf_5m with Nifty price levels.
+
+          New filter: canonical_idx = strat_idx or _BANKNIFTY_TOKEN
+                      skip if canonical_idx != index_token
+
+          ORB on_tick feeding and the shared index_candles pre-seed are
+          both guarded to run only on the BankNifty (260105) backfill pass.
         """
         from datetime import date, timedelta, time as dtime
 
@@ -402,8 +460,9 @@ class MarketHub:
             log.info(" Backfill: less than one 5-min bar completed -- nothing to replay")
             return
 
+        index_label = "BankNifty" if index_token == _BANKNIFTY_TOKEN else f"Nifty({index_token})"
         log.info("=" * 60)
-        log.info("  HISTORICAL BACKFILL — warming up all strategies")
+        log.info(f"  HISTORICAL BACKFILL [{index_label}] — warming up strategies")
         log.info("=" * 60)
         log.info(f"  Fetching 5-min candles: 09:15 → {to_dt.strftime('%H:%M')}")
 
@@ -425,25 +484,28 @@ class MarketHub:
 
         log.info(f"  {len(raw)} candles received — replaying now...")
 
-        # OR window: 9:15 to 9:30 -- candles in this range feed ORB's opening range
+        # OR window: 9:15 to 9:30 — BankNifty-only; used to reconstruct ORB opening range
         or_start = dtime(9, 15)
         or_end   = dtime(9, 30)
 
-        # Pre-seed the hub's shared CandleBuilder so any code reading
-        # index_candles.get_closed() sees the full history from 9:15
-        for bar in raw:
-            raw_ts = bar["date"]
-            candle_ts = raw_ts.replace(tzinfo=None) if hasattr(raw_ts, "tzinfo") else raw_ts
-            candle = {
-                "ts"    : candle_ts,
-                "open"  : float(bar["open"]),
-                "high"  : float(bar["high"]),
-                "low"   : float(bar["low"]),
-                "close" : float(bar["close"]),
-                "volume": int(bar["volume"]),
-            }
-            with self._lock:
-                self.index_candles.closed_candles.append(candle)
+        # MULTI-INDEX FIX (Bug A): Only pre-seed the shared BankNifty CandleBuilder
+        # when this is the BankNifty backfill pass.  The shared index_candles store
+        # is keyed to BankNifty prices — appending Nifty candles here would pollute
+        # any code that reads index_candles.get_closed() expecting BankNifty levels.
+        if index_token == _BANKNIFTY_TOKEN:
+            for bar in raw:
+                raw_ts = bar["date"]
+                candle_ts = raw_ts.replace(tzinfo=None) if hasattr(raw_ts, "tzinfo") else raw_ts
+                candle = {
+                    "ts"    : candle_ts,
+                    "open"  : float(bar["open"]),
+                    "high"  : float(bar["high"]),
+                    "low"   : float(bar["low"]),
+                    "close" : float(bar["close"]),
+                    "volume": int(bar["volume"]),
+                }
+                with self._lock:
+                    self.index_candles.closed_candles.append(candle)
 
         # Replay each candle into strategies
         n_replayed = 0
@@ -461,9 +523,11 @@ class MarketHub:
             }
             bar_time = candle_ts.time() if hasattr(candle_ts, "time") else candle_ts
 
-            # For the opening range window: feed candle H and L into ORB's on_tick
-            # so it reconstructs its opening range exactly as if it had seen every tick.
-            if or_start <= bar_time < or_end:
+            # MULTI-INDEX FIX (Bug A): Only feed ORB's opening range from BankNifty
+            # candles.  If this guard were absent, the Nifty backfill pass would
+            # overwrite ORB's high/low with Nifty ~24,500 levels, making ORB
+            # trade on a completely wrong opening range.
+            if index_token == _BANKNIFTY_TOKEN and or_start <= bar_time < or_end:
                 for strat in self._strategies:
                     if strat.name != "ORB_v2":
                         continue
@@ -473,13 +537,22 @@ class MarketHub:
                     except Exception as e:
                         log.error(f"[{strat.name}] backfill on_tick error: {e}")
 
-            # Replay candle into strategies that track this index.
-            # Strategies with INDEX_TOKEN = None track the main BankNifty index.
-            # Strategies with INDEX_TOKEN set (e.g. 256265) track a different index
-            # and must not receive candles from this backfill run.
+            # MULTI-INDEX FIX (Bug A): Strategy routing — each strategy only
+            # receives candles from its own index.
+            #
+            # Old filter: `if strat_idx is not None and strat_idx != index_token`
+            #   Bug: INDEX_TOKEN=None (BankNifty strategies) always passed the
+            #   filter and received Nifty backfill candles too.
+            #
+            # New filter: derive each strategy's canonical index token.
+            #   INDEX_TOKEN=None  → tracks BankNifty (260105)
+            #   INDEX_TOKEN=X     → tracks index X (e.g. Nifty 50 = 256265)
+            # Only send the candle if the strategy's canonical index matches
+            # the index_token this backfill run is fetching.
             for strat in self._strategies:
-                strat_idx = getattr(strat, "INDEX_TOKEN", None)
-                if strat_idx is not None and strat_idx != index_token:
+                strat_idx    = getattr(strat, "INDEX_TOKEN", None)
+                canonical    = strat_idx if strat_idx is not None else _BANKNIFTY_TOKEN
+                if canonical != index_token:
                     continue   # wrong index — skip
                 try:
                     strat.on_candle(candle, candle_ts)
@@ -488,8 +561,9 @@ class MarketHub:
 
             n_replayed += 1
 
-        # Check if OR window is completely in the past -- if so, tell ORB to lock now
-        if now.time() >= or_end and candle is not None:
+        # MULTI-INDEX FIX (Bug A): OR-lock tick is BankNifty-specific.
+        # Only run this for the BankNifty backfill pass.
+        if index_token == _BANKNIFTY_TOKEN and now.time() >= or_end and candle is not None:
             for strat in self._strategies:
                 if strat.name == "ORB_v2":
                     try:
@@ -498,7 +572,7 @@ class MarketHub:
                     except Exception as e:
                         log.error(f"[ORB_v2] backfill OR-lock tick error: {e}")
 
-        log.info(f"  Backfill complete: {n_replayed} candles replayed into all strategies")
+        log.info(f"  Backfill complete: {n_replayed} candles replayed [{index_label}]")
         log.info(f"  Strategies are now warmed up from 09:15 data")
         log.info("=" * 60 + "\n")
 
@@ -553,5 +627,3 @@ class MarketHub:
 
         ticker.close()
         log.info("MarketHub shutdown complete")
-
-
