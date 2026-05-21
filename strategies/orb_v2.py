@@ -58,7 +58,7 @@ import logging
 import os
 import threading
 from collections import deque
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import datetime, date, time as dtime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
