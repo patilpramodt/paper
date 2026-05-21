@@ -50,6 +50,18 @@ FIXES APPLIED:
   Bug 10 -- _force_close fired on every tick after 15:15. Fixed with
              _squareoff_done flag.
   Bug 11 -- BBTrade __slots__ missing "order_id". Fixed.
+  Bug 12 -- Stale cached price used for entry when token was previously
+             unsubscribed by another strategy (e.g. HEDGED_SELL closes and
+             unsubscribes 53300PE; price freezes at 348.90; BB_STOCH
+             re-subscribes 104 min later, get_price() returns 348.90 while
+             actual market is 524.50; first live tick hits TP instantly).
+             Fix: check get_price_ts(); treat price as unavailable when
+             age > 30 s, forcing _pending_entry path for first live tick.
+  Bug 13 -- _place_buy() returns Tuple[str, float] (order_id, fill_price)
+             but _execute_fill stored the whole tuple as trade.order_id and
+             ignored the actual exchange fill price, anchoring SL/TP to the
+             ref ltp instead.  Fix: unpack the tuple; use fill_price for
+             BBTrade construction in live mode.
 """
 
 import csv
@@ -871,13 +883,32 @@ class BBStochStrategy(BaseStrategy):
             return
 
         self.subscribe_option(token)
-        ltp = self.get_price(token)
+        ltp      = self.get_price(token)
+        price_ts = self.get_price_ts(token)
 
-        if not ltp or ltp < 5:
-            log.warning(
-                f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) -- "
-                f"storing pending entry, will fill on first tick"
-            )
+        # Bug 12 fix: treat cached price as unavailable when it is stale.
+        # Another strategy may have unsubscribed this token earlier, freezing
+        # the hub's cached price while the market moved.  If we use that stale
+        # price for entry, the first real tick (Zerodha's re-subscription
+        # snapshot) arrives in the same _on_ticks batch and instantly triggers
+        # SL or TP — producing a phantom fill.
+        # 30 s threshold: anything older than one WebSocket heartbeat interval
+        # is unreliable.
+        price_age   = (_now_ist() - price_ts).total_seconds() if price_ts else None
+        price_stale = (price_ts is None) or (price_age is not None and price_age > 30)
+
+        if not ltp or ltp < 5 or price_stale:
+            if price_stale and ltp and ltp >= 5:
+                log.warning(
+                    f"[BB_STOCH] LTP stale for {tsym} (token={token}, "
+                    f"age={price_age:.0f}s) -- storing pending entry, "
+                    f"will fill on first live tick"
+                )
+            else:
+                log.warning(
+                    f"[BB_STOCH] LTP unavailable for {tsym} (token={token}) -- "
+                    f"storing pending entry, will fill on first tick"
+                )
             self._pending_entry = {
                 "action" : action,
                 "opt"    : opt,
@@ -913,25 +944,42 @@ class BBStochStrategy(BaseStrategy):
             self.unsubscribe_option(token)
             return
 
-        buy_order_id = self._place_buy(tsym, token, CFG["quantity"], ltp)
-        if LIVE_MODE and buy_order_id is None:
+        buy_result = self._place_buy(tsym, token, CFG["quantity"], ltp)
+        if LIVE_MODE and buy_result is None:
             self._release_slot()
             log.error(f"[BB_STOCH] BUY order FAILED for {tsym} -- entry aborted")
             self.unsubscribe_option(token)
             return
 
+        # Bug 13 fix: _place_buy returns (order_id_str, fill_price).
+        # Unpack and use the actual exchange fill price in live mode so that
+        # SL/TP are anchored to the real fill, not the ref ltp.
+        # Paper mode: fill_price == ltp (paper fill is always at ref ltp).
+        order_id_str: Optional[str]
+        if buy_result is not None:
+            order_id_str, fill_price = buy_result
+        else:
+            order_id_str, fill_price = None, ltp   # paper-only safety fallback
+
+        # In live mode use actual exchange fill; paper fill already equals ltp.
+        entry_ltp = fill_price if LIVE_MODE else ltp
+
+        # Recompute sl/tp from actual fill (live fill may differ from ref ltp)
+        if LIVE_MODE and abs(entry_ltp - ltp) > 0.5:
+            sl_pts, tp_pts = self._compute_sl_tp(entry_ltp, atr)
+
         trade = BBTrade(
             symbol   = tsym,
             token    = token,
             opt_type = opt,
-            ltp      = ltp,
+            ltp      = entry_ltp,
             qty      = CFG["quantity"],
             spot     = spot,
             sl_pts   = sl_pts,
             tp_pts   = tp_pts,
             atr      = atr,
         )
-        trade.order_id = buy_order_id
+        trade.order_id = order_id_str
 
         with self._lock:
             self._trade        = trade
@@ -949,7 +997,7 @@ class BBStochStrategy(BaseStrategy):
             f"[BB_STOCH] [{mode_tag}] ENTRY {opt} | {tsym} | "
             f"Fill={trade.entry:.2f} LTP={ltp:.2f}{delay_str} | "
             f"SL={trade.sl:.2f}(-{sl_pts:.1f}) TP={trade.target:.2f}(+{tp_pts:.1f}) | "
-            f"RR=1:{rr} ATR={atr:.1f} | buy_order={buy_order_id} | "
+            f"RR=1:{rr} ATR={atr:.1f} | buy_order={order_id_str} | "
             f"Mode={sig.get('mode', '?')} BB-BW={sig['bb'].get('bw_pct', 0)*100:.2f}%"
         )
 
@@ -969,7 +1017,7 @@ class BBStochStrategy(BaseStrategy):
             "spot"             : spot,
             "atr"              : atr,
             "exec_mode"        : mode_tag,
-            "order_id"         : buy_order_id,
+            "order_id"         : order_id_str,
             "mode"             : sig.get("mode", "pending" if pending_delay_ms else ""),
             "bb_upper"         : bb.get("upper", ""),
             "bb_mid"           : bb.get("mid", ""),
