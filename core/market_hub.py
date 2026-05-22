@@ -43,7 +43,29 @@ FIX (Bug 3 + Bug 7):
         pass volume=1 to CandleBuilder when qty==0 so candles have
         non-zero volume and the rolling volume average is meaningful.
 
-OI FIX (WsPCR support):
+REFCOUNT FIX (subscription reference counting):
+   Old subscribe/unsubscribe used a bare set[int] (_subscribed).
+   hub.unsubscribe(token) removed the token from the WebSocket for ALL
+   strategies, regardless of how many other strategies were still using it.
+   Observed cross-strategy interference in production:
+     • SPIKE unsubscribes BNF53400PE at 9:15 (entering CE leg) →
+       BB_STOCH silently loses ATM PE ticks for the rest of the session.
+     • SPIKE_NIFTY unsubscribes NF23650PE at 9:15 →
+       BB_STOCH_NIFTY loses ATM PE ticks.
+     • HEDGED_SELL / SMART_HEDGE unsubscribe BNF53600CE and BNF53200PE
+       (their short-leg tokens) when positions close → BB_STOCH's ATM+200
+       and ATM-200 pre-subscribed tokens go dark.
+     • WsPCR subscribes the same ATM range for OI → any strategy
+       unsubscribing a shared strike would kill PCR OI data for that strike.
+   Fix: replaced _subscribed: set[int] with _sub_refcount: dict[int, int].
+     subscribe():   if refcount 0→1: actually subscribe WS; else just bump.
+     unsubscribe(): if refcount N→N-1 and N>1: just decrement; else also
+                    unsubscribe WS (only when LAST holder releases).
+   Bonus: subscribe() now clears _last_price_ts on true re-subscribe
+   (count was 0) so the stale-price detection fires immediately instead
+   of triggering the 30-second age threshold on intra-session re-entries.
+
+
    Added _last_oi dict and last_oi(token) method.
    Zerodha sends oi field in every MODE_FULL tick for options/futures.
    _on_ticks() now stores tick["oi"] for each token so WsPCR can read
@@ -126,7 +148,20 @@ class MarketHub:
         self._extra_index_tokens: set[int] = set()
         self._last_price   : dict[int, float]    = {}
         self._last_price_ts: dict[int, datetime] = {}   # FIX: track when price arrived
-        self._subscribed   : set[int]   = set()
+        # REFCOUNT FIX: replaced bare set with per-token subscriber count.
+        # _subscribed (set) was a global on/off switch — any strategy calling
+        # hub.unsubscribe(token) removed it from the WebSocket for EVERYONE,
+        # silently starving other strategies that still needed that token.
+        # Common victims observed in production:
+        #   • SPIKE unsubscribes BNF53400PE at 9:15 → BB_STOCH loses ATM PE ticks
+        #   • SPIKE_NIFTY unsubscribes NF23650PE at 9:15 → BB_STOCH_NIFTY loses ATM PE
+        #   • HEDGED_SELL / SMART_HEDGE unsubscribe shared BNF53600CE / BNF53200PE
+        #     that BB_STOCH relies on for signal evaluation
+        #   • WsPCR subscribes the same ATM tokens for OI — any strategy unsubscribing
+        #     a shared strike would silently kill PCR data for that strike
+        # With refcounting the WebSocket unsubscribe only fires when the count
+        # drops to 0 (i.e. every subscriber has released the token).
+        self._sub_refcount : dict[int, int]      = {}   # token → active holder count
         self._lock         = threading.Lock()
 
         # OI cache — populated from MODE_FULL ticks (for WsPCR)
@@ -180,8 +215,8 @@ class MarketHub:
 
         Ticks for this token are routed exclusively to strategies whose class
         attribute INDEX_TOKEN equals this token — not to all strategies.
-        The token is added to _subscribed so it is included when the WebSocket
-        connects. Call this before hub.run() so _on_connect picks it up.
+        The token is pinned in _sub_refcount at count=1 so it is included when
+        the WebSocket connects. Call this before hub.run() so _on_connect picks it up.
 
         Strategies signal their index by declaring:
             INDEX_TOKEN = 256265  # class-level attribute
@@ -190,7 +225,10 @@ class MarketHub:
         """
         self._extra_index_tokens.add(token)
         with self._lock:
-            self._subscribed.add(token)
+            # Pin at refcount=1 so it is never accidentally unsubscribed by a
+            # strategy calling unsubscribe_option() on an index-range token.
+            if self._sub_refcount.get(token, 0) == 0:
+                self._sub_refcount[token] = 1
         if self._ws:
             try:
                 self._ws.subscribe([token])
@@ -204,13 +242,38 @@ class MarketHub:
     def subscribe(self, token: int):
         """
         Subscribe token to WebSocket (called by strategies for their options).
-        Thread-safe. Deduplicates — no double subscriptions.
+        Thread-safe.  Uses reference counting — the actual WebSocket subscribe
+        fires only when the first holder requests the token; subsequent callers
+        just increment the count.
+
+        REFCOUNT FIX: previously this used a bare set, so
+          hub.subscribe(token)   → no-op if already in set (good)
+          hub.unsubscribe(token) → removed from set AND from WS for everyone
+        Now:
+          subscribe:   refcount 0→1 → actually subscribe WS
+                       refcount N→N+1 (N>0) → no WS call, already active
+          unsubscribe: refcount N→N-1 (N>1) → no WS call, others still need it
+                       refcount 1→0 → actually unsubscribe WS
+
+        Side-effect on re-subscribe (count was 0, now 1): clears the cached
+        _last_price_ts so the strategy immediately sees the price as unknown
+        and takes the pending-entry path on the next live tick, rather than
+        using a stale cached price that may be minutes out of date.
         """
+        do_subscribe = False
         with self._lock:
-            if token in self._subscribed:
-                return
-            self._subscribed.add(token)
-        if self._ws:
+            prev = self._sub_refcount.get(token, 0)
+            self._sub_refcount[token] = prev + 1
+            if prev == 0:
+                do_subscribe = True
+                # Clear stale timestamp so next tick is treated as fresh.
+                # Without this, a re-subscribed token's age check sees the
+                # timestamp from minutes ago and (correctly) goes to pending-
+                # entry — but clearing here makes the "price unknown" path
+                # trigger immediately rather than waiting for the 30-s check.
+                self._last_price_ts.pop(token, None)
+
+        if do_subscribe and self._ws:
             try:
                 self._ws.subscribe([token])
                 self._ws.set_mode(self._ws.MODE_FULL, [token])
@@ -219,10 +282,30 @@ class MarketHub:
                 log.warning(f"  Subscribe error for {token}: {e}")
 
     def unsubscribe(self, token: int):
-        """Unsubscribe token when a strategy no longer needs it."""
+        """
+        Release one strategy's hold on a token.
+        The WebSocket unsubscribe only fires when the last holder releases.
+
+        REFCOUNT FIX: old code called ws.unsubscribe() immediately, which
+        silently cut off every other strategy that still needed that token.
+        Now we only remove from the WebSocket when refcount hits 0.
+
+        Defensive: if a strategy calls unsubscribe() for a token it never
+        subscribed (or already released), we clamp at 0 and skip the WS call.
+        """
+        do_unsubscribe = False
         with self._lock:
-            self._subscribed.discard(token)
-        if self._ws:
+            prev = self._sub_refcount.get(token, 0)
+            if prev <= 0:
+                # Guard against double-unsubscribe or unsubscribing a token
+                # that was never registered — just ignore silently.
+                return
+            new_count = prev - 1
+            self._sub_refcount[token] = new_count
+            if new_count == 0:
+                do_unsubscribe = True
+
+        if do_unsubscribe and self._ws:
             try:
                 self._ws.unsubscribe([token])
             except Exception as e:
@@ -374,9 +457,10 @@ class MarketHub:
 
     def _on_connect(self, ws, response):
         log.info(" WebSocket connected")
-        # Subscribe all pending tokens
+        # Collect all tokens that have at least one active subscriber.
+        # REFCOUNT FIX: was list(self._subscribed) — now derived from refcount.
         with self._lock:
-            tokens = list(self._subscribed)
+            tokens = [t for t, c in self._sub_refcount.items() if c > 0]
         if tokens:
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
@@ -585,8 +669,12 @@ class MarketHub:
         """
         from kiteconnect import KiteTicker
 
-        # Pre-subscribe index token
-        self._subscribed.add(self._index_token)
+        # Pre-subscribe main index token — pinned at count=1 so it can never
+        # be accidentally released by a strategy calling unsubscribe_option().
+        # REFCOUNT FIX: was self._subscribed.add(self._index_token)
+        with self._lock:
+            if self._sub_refcount.get(self._index_token, 0) == 0:
+                self._sub_refcount[self._index_token] = 1
 
         ticker = KiteTicker(self.api_key, self.access_token)
         ticker.on_ticks       = self._on_ticks
