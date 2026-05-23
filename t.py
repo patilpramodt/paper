@@ -99,20 +99,24 @@ from strategies.bb_stoch_strategy         import BBStochStrategy
 from strategies.bb_stoch_nifty_strategy  import BBStochNiftyStrategy
 from strategies.hedged_sell_strategy import HedgedSellStrategy
 from strategies.smart_hedge_strategy import SmartHedgeStrategy
+from strategies.nifty_expiry_straddle_strategy     import NiftyExpiryStraddleStrategy
+from strategies.banknifty_expiry_momentum_strategy  import BankNiftyExpiryMomentumStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
 #  Order matters: first in list = first to receive ticks
 # ─────────────────────────────────────────────────────────────────────────────
 ACTIVE_STRATEGIES = [
-    SpikeStrategy,       # Spike:        9:15-9:30   gap/spike trade (BankNifty)
-    SpikeNiftyStrategy,  # Spike Nifty:  9:15-9:30   gap/spike trade (Nifty 50)
-    ORBStrategy,         # ORB v2:       9:40-10:15  breakout trade
-    ScalperV7Strategy,   # Scalper V7:   all-day,    11-filter momentum scalper
-    BBStochStrategy,       # BB+Stoch BankNifty: all-day, Bollinger+Stochastic+Volume
-    BBStochNiftyStrategy,  # BB+Stoch Nifty:     all-day, Bollinger+Stochastic+Volume (Nifty 50)
-    HedgedSellStrategy,  # Hedged Sell:  9:30-10:15  Iron Condor (classic, no direction filter)
-    SmartHedgeStrategy,  # Smart Hedge:  9:35-10:15  Auto-directional: Bull Put / Bear Call / Condor
+    SpikeStrategy,                    # Spike:                    9:15-9:30   BankNifty gap/spike
+    SpikeNiftyStrategy,               # Spike Nifty:              9:15-9:30   Nifty 50 gap/spike
+    ORBStrategy,                      # ORB v2:                   9:40-10:15  breakout trade
+    ScalperV7Strategy,                # Scalper V7:               all-day     11-filter momentum scalper
+    BBStochStrategy,                  # BB+Stoch BankNifty:       all-day     Bollinger+Stoch+Volume
+    BBStochNiftyStrategy,             # BB+Stoch Nifty:           all-day     Bollinger+Stoch+Volume (Nifty)
+    HedgedSellStrategy,               # Hedged Sell:              9:30-10:15  Iron Condor classic
+    SmartHedgeStrategy,               # Smart Hedge:              9:35-10:15  directional spread auto-pick
+    NiftyExpiryStraddleStrategy,      # Nifty Expiry Straddle:    9:20-11:30  SHORT straddle, Nifty WEEKLY expiry only
+    BankNiftyExpiryMomentumStrategy,  # BankNifty Expiry Momentum: 14:00-15:20 directional buy, BankNifty MONTHLY expiry only
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,14 +178,16 @@ def setup_logging():
 
     # ── Per-strategy loggers → own dated file, propagate=False ───────────────
     _STRAT = {
-        "strategy.spike":        "spike.log",
-        "strategy.spike_nifty":  "spike_nifty.log",
-        "strategy.orb":          "orb_v2.log",
-        "strategy.scalper_v7":   "scalper_v7.log",
-        "strategy.bb_stoch":         "bb_stoch.log",
-        "strategy.bb_stoch_nifty":   "bb_stoch_nifty.log",
-        "strategy.hedged_sell":  "hedged_sell.log",
-        "strategy.smart_hedge":  "smart_hedge.log",
+        "strategy.spike":                       "spike.log",
+        "strategy.spike_nifty":                 "spike_nifty.log",
+        "strategy.orb":                         "orb_v2.log",
+        "strategy.scalper_v7":                  "scalper_v7.log",
+        "strategy.bb_stoch":                    "bb_stoch.log",
+        "strategy.bb_stoch_nifty":              "bb_stoch_nifty.log",
+        "strategy.hedged_sell":                 "hedged_sell.log",
+        "strategy.smart_hedge":                 "smart_hedge.log",
+        "strategy.nifty_expiry_straddle":       "nifty_expiry_straddle.log",
+        "strategy.banknifty_expiry_momentum":   "banknifty_expiry_momentum.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -229,7 +235,11 @@ def main():
     print("""
 
         ══ MULTI-STRATEGY TRADER ══ python t.py ══
-  SPIKE + SPIKE_NIFTY + ORB v2 + SCALPER V7 + BB STOCH + BB STOCH NIFTY + HEDGED SELL + SMART HEDGE  (paper mode)
+  SPIKE + SPIKE_NIFTY + ORB v2 + SCALPER V7 + BB STOCH + BB STOCH NIFTY
+  + HEDGED SELL + SMART HEDGE
+  + NIFTY EXPIRY STRADDLE  (Nifty weekly expiry only, 9:20–11:30)
+  + BANKNIFTY EXPIRY MOMENTUM  (BankNifty monthly expiry only, 14:00–15:20)
+  (paper mode)
 
 """)
 
