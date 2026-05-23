@@ -556,6 +556,15 @@ class BBStochStrategy(BaseStrategy):
         # Change B: entry delay (next-candle breakout confirmation)
         self._entry_delay_pending: Optional[dict] = None
 
+        # Bug A fix: track every token subscribed as part of the ambient range
+        # (pre_market + spot_atm) so we never call hub.subscribe() twice for the
+        # same token from this strategy.  pre_market subscribes [ATM, ATM±200];
+        # _subscribe_spot_atm later subscribes [ATM, ATM±200, ATM±400].
+        # The overlapping tokens (ATM, ATM±200) would get refcount=2 without this
+        # guard, causing the hub to never reach refcount=0 on those tokens from
+        # BB_STOCH's side and silently blocking cross-strategy cleanup.
+        self._subscribed_range: set[int] = set()
+
         log.info("[BB_STOCH] Strategy initialized")
 
     # ----------------------------------------------------------
@@ -586,7 +595,12 @@ class BBStochStrategy(BaseStrategy):
                         strike = atm - 100 if opt_type == "CE" else atm + 100
                     tok, sym = instruments.get_option_token(strike, opt_type, self._expiry_date)
                     if tok:
-                        self.subscribe_option(tok)
+                        # Bug A fix: guard with _subscribed_range to prevent
+                        # double-subscribe when _subscribe_spot_atm() later
+                        # covers the same [ATM, ATM±200] offsets.
+                        if tok not in self._subscribed_range:
+                            self.subscribe_option(tok)
+                            self._subscribed_range.add(tok)
                         if offset == 0:
                             if opt_type == "CE":
                                 self._pre_ce_token = tok
@@ -613,6 +627,8 @@ class BBStochStrategy(BaseStrategy):
         self._open_atm_subscribed = False
         self._pending_entry       = None
         self._entry_delay_pending = None
+        # Bug A fix: clear range-subscription tracking on each new session
+        self._subscribed_range.clear()
 
     # ----------------------------------------------------------
     # Bug 6: Dynamic spot-based subscription on first candle
@@ -637,15 +653,25 @@ class BBStochStrategy(BaseStrategy):
                     atm + offset, opt_type, self._expiry_date
                 )
                 if tok:
-                    self.subscribe_option(tok)
-                    subscribed += 1
-                    log.info(
-                        f"[BB_STOCH] Spot-sub {sym} ({tok}) "
-                        f"[spot-ATM{offset:+d}]"
-                    )
+                    # Bug A fix: skip if already subscribed by pre_market()
+                    # (offsets [0, ±200] overlap between pre_market and spot_atm).
+                    if tok not in self._subscribed_range:
+                        self.subscribe_option(tok)
+                        self._subscribed_range.add(tok)
+                        subscribed += 1
+                        log.info(
+                            f"[BB_STOCH] Spot-sub {sym} ({tok}) "
+                            f"[spot-ATM{offset:+d}]"
+                        )
+                    else:
+                        log.debug(
+                            f"[BB_STOCH] Spot-sub skip (already held) {sym} ({tok}) "
+                            f"[spot-ATM{offset:+d}]"
+                        )
         log.info(
             f"[BB_STOCH] Spot subscription done: "
-            f"{subscribed} tokens around ATM={atm} (spot={spot:.0f})"
+            f"{subscribed} new tokens around ATM={atm} (spot={spot:.0f}); "
+            f"{len(self._subscribed_range)} total range tokens held"
         )
 
     # ----------------------------------------------------------
@@ -656,6 +682,11 @@ class BBStochStrategy(BaseStrategy):
         """
         Index price tick.
         Bug 10 fix: _force_close fires exactly once via _squareoff_done.
+        Bug D  fix: subscribe spot ATM range on the very first BankNifty tick
+                    at or after 9:15, not waiting for the first 5-min candle
+                    to close at ~9:20.  SPIKE may unsubscribe a shared BankNifty
+                    ATM option at 9:15 (after entering its CE/PE leg); subscribing
+                    the full ATM range immediately keeps those tokens live.
         Change B: confirms or expires the entry delay trigger level.
         """
         # Bug 10 fix
@@ -663,6 +694,14 @@ class BBStochStrategy(BaseStrategy):
             self._squareoff_done = True
             self._force_close("AUTO-SQUAREOFF")
             return
+
+        # Bug D fix: subscribe spot range on first tick at/after market open.
+        # _open_atm_subscribed is also checked in on_candle() — whichever fires
+        # first wins; the flag ensures only one call goes through.
+        if not self._open_atm_subscribed and ts.time() >= dtime(9, 15):
+            if price and price > 0:
+                self._subscribe_spot_atm(price)
+                self._open_atm_subscribed = True
 
         # Change B: entry delay confirmation
         confirm = self._entry_delay_pending
@@ -701,7 +740,10 @@ class BBStochStrategy(BaseStrategy):
         with self._lock:
             self._buf_5m.append(candle)
 
-        # Bug 6 fix: spot-based subscription on first candle of session
+        # Bug 6 / Bug D fix: spot-based subscription on first candle of session.
+        # In normal conditions on_tick() has already done this at 9:15.
+        # This path is a safety net for backfill / test scenarios where on_tick
+        # is not called before the first candle arrives.
         if not self._open_atm_subscribed:
             spot = candle.get("close", 0)
             if spot and spot > 0:
@@ -1272,6 +1314,20 @@ class BBStochStrategy(BaseStrategy):
 
     def eod_summary(self):
         self._force_close("EOD-SQUAREOFF")
+
+        # Bug A / Bug E fix: release all range-subscribed tokens (pre_market +
+        # spot_atm).  _unsubscribe_active() inside _force_close already handled
+        # the active trade token; the ambient range tokens are cleaned up here.
+        # This correctly handles the case where a range token == active token:
+        # _unsubscribe_active() decremented its refcount by 1 (from the trade
+        # subscribe in _enter_trade); this loop decrements it by 1 more (from
+        # the pre_market/spot_atm subscribe).  Net = 0 from BB_STOCH's side.
+        for tok in set(self._subscribed_range):
+            self.unsubscribe_option(tok)
+        n = len(self._subscribed_range)
+        self._subscribed_range.clear()
+        if n:
+            log.info(f"[BB_STOCH] EOD range cleanup: released {n} ambient tokens")
 
         results  = self._results
         total    = len(results)
