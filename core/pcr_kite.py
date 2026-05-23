@@ -65,6 +65,7 @@ class WsPCR:
         spot_range: int = 1000,
         step: int = 100,
         min_active: int = 5,
+        index_token: Optional[int] = None,
     ):
         self._hub         = hub
         self._instruments = instruments
@@ -73,9 +74,14 @@ class WsPCR:
         self._step        = step
         self._min_active  = min_active
 
-        # Lists of subscribed tokens by type
-        self._ce_tokens: list[int] = []
-        self._pe_tokens: list[int] = []
+        # Bug C fix: which index token to read spot from.
+        # None  → use hub._index_token (BankNifty, 260105)
+        # 256265 → Nifty 50 (pass for a Nifty-specific WsPCR instance)
+        self._index_token: Optional[int] = index_token
+
+        # Sets of subscribed tokens by type (changed from list to set for O(1) lookup)
+        self._ce_tokens: set[int] = set()
+        self._pe_tokens: set[int] = set()
 
         # ATM center used for last subscription batch
         # Used to detect when spot has moved enough to need fresh tokens
@@ -86,8 +92,15 @@ class WsPCR:
     # ── Reference spot ────────────────────────────────────────────────────────
 
     def _current_spot(self) -> float:
-        """Return live BankNifty spot from hub's WebSocket price cache."""
-        price = self._hub.last_price(self._hub._index_token)
+        """
+        Return live index spot from hub's WebSocket price cache.
+
+        Bug C fix: uses self._index_token when supplied (e.g. 256265 for a
+        Nifty-specific WsPCR instance).  Falls back to hub._index_token
+        (BankNifty, 260105) when index_token was not set at construction.
+        """
+        tok   = self._index_token if self._index_token is not None else self._hub._index_token
+        price = self._hub.last_price(tok)
         return float(price) if price else 0.0
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -124,41 +137,71 @@ class WsPCR:
 
     def _subscribe_around(self, spot: float):
         """
-        Subscribe CE + PE tokens for all strikes in ATM ± range.
+        Subscribe CE + PE tokens for all strikes in ATM ± range, then release
+        any tokens from a previous call that are no longer in the new range.
 
-        BankNifty has 100pt strike spacing. With default range=1000 and step=100:
-            offsets = [-1000, -900, ..., 0, ..., 900, 1000] = 21 strikes
-            tokens  = 21 CE + 21 PE = 42 total
-        Most of these overlap with BB_STOCH's ATM±400 subscriptions — zero
-        extra bandwidth since MarketHub.subscribe() deduplicates.
+        Bug B fix: old code only ever added tokens — it never removed the ones
+        that drifted out of range.  After a ±500pt intraday move this left 80+
+        dead tokens pinned in the hub's refcount, blocking other strategies from
+        cleanly releasing those same tokens via unsubscribe().
+
+        Bug C fix: ATM is now computed with step=self._step so a Nifty WsPCR
+        instance (step=50) rounds to the nearest Nifty strike instead of always
+        rounding to the nearest 100pt BankNifty strike.
+
+        Thread-safety: called only from setup() (pre-WS, single-thread) and
+        from compute_pcr() / _refresh_tokens_if_needed() (always from the
+        background refresh thread or the WS-callback thread, never concurrently).
         """
         from core.instruments import get_atm_strike
 
-        atm = get_atm_strike(spot)
+        # Bug C fix: use self._step for ATM rounding (not hardcoded 100)
+        atm = get_atm_strike(spot, step=self._step)
         self._last_subscribed_atm = atm
 
-        subscribed_new = 0
-        offsets = range(-self._range, self._range + self._step, self._step)
+        # Build the full set of tokens we want for this ATM center
+        target_ce: set[int] = set()
+        target_pe: set[int] = set()
 
+        offsets = range(-self._range, self._range + self._step, self._step)
         for offset in offsets:
             strike = atm + offset
-            for opt_type, token_list in (("CE", self._ce_tokens), ("PE", self._pe_tokens)):
+            for opt_type, target_set in (("CE", target_ce), ("PE", target_pe)):
                 tok, sym = self._instruments.get_option_token(
                     strike, opt_type, self._expiry
                 )
-                if not tok:
+                if tok:
+                    target_set.add(tok)
+                else:
                     log.debug(f"[WsPCR] Token not found: {strike}{opt_type} {self._expiry}")
-                    continue
-                if tok in token_list:
-                    continue   # already subscribed
-                token_list.append(tok)
-                self._hub.subscribe(tok)   # no-op if already subscribed by BB_STOCH etc.
-                subscribed_new += 1
+
+        # Subscribe tokens not yet held
+        newly_subscribed = 0
+        for tok in target_ce - self._ce_tokens:
+            self._hub.subscribe(tok)
+            newly_subscribed += 1
+        for tok in target_pe - self._pe_tokens:
+            self._hub.subscribe(tok)
+            newly_subscribed += 1
+
+        # Bug B fix: unsubscribe tokens that drifted out of the new range.
+        # hub.unsubscribe() only removes from the WebSocket when refcount
+        # hits 0 — other strategies that hold the same token are unaffected.
+        released = 0
+        for tok in self._ce_tokens - target_ce:
+            self._hub.unsubscribe(tok)
+            released += 1
+        for tok in self._pe_tokens - target_pe:
+            self._hub.unsubscribe(tok)
+            released += 1
+
+        self._ce_tokens = target_ce
+        self._pe_tokens = target_pe
 
         log.info(
-            f"[WsPCR] Subscribed {subscribed_new} new tokens around "
-            f"ATM={atm} (spot={spot:.0f}) | "
-            f"CE={len(self._ce_tokens)} PE={len(self._pe_tokens)} total"
+            f"[WsPCR] ATM={atm} (spot={spot:.0f}) | "
+            f"+{newly_subscribed} subscribed, -{released} released | "
+            f"CE={len(self._ce_tokens)} PE={len(self._pe_tokens)} tokens active"
         )
 
     # ── Compute PCR ───────────────────────────────────────────────────────────
@@ -247,7 +290,8 @@ class WsPCR:
             return
 
         from core.instruments import get_atm_strike
-        current_atm = get_atm_strike(spot)
+        # Bug C fix: use self._step so Nifty WsPCR rounds to 50pt boundaries
+        current_atm = get_atm_strike(spot, step=self._step)
         drift = abs(current_atm - self._last_subscribed_atm)
 
         if drift > self._range // 2:
@@ -278,6 +322,33 @@ class WsPCR:
             "setup_done" : self._setup_done,
             "atm_center" : self._last_subscribed_atm,
         }
+
+    def teardown(self):
+        """
+        Release all WebSocket subscriptions held by this WsPCR instance.
+
+        Bug B fix: called from t.py at EOD (after hub.run() returns) to
+        properly decrement hub refcounts for every CE and PE token this
+        instance subscribed.  hub.unsubscribe() only removes a token from
+        the WebSocket when the count reaches 0 — other strategies that
+        still hold the token are unaffected.
+
+        Safe to call multiple times (set ops are idempotent once cleared).
+        """
+        released = 0
+        for tok in self._ce_tokens:
+            self._hub.unsubscribe(tok)
+            released += 1
+        for tok in self._pe_tokens:
+            self._hub.unsubscribe(tok)
+            released += 1
+        self._ce_tokens.clear()
+        self._pe_tokens.clear()
+        self._setup_done = False
+        log.info(
+            f"[WsPCR] teardown: released {released} token subscriptions "
+            f"(ATM_center={self._last_subscribed_atm})"
+        )
 
     def log_summary(self):
         """Log a one-line diagnostic summary."""
