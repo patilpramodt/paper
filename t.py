@@ -126,7 +126,8 @@ MARKET_START   = dtime(9, 14)    # Start WebSocket at 9:14 AM IST
 MARKET_END     = dtime(15, 0)    # MarketHub forces WS close at 3:31 PM IST
 
 PCR_SPOT_RANGE  = 1000   # points either side of ATM
-PCR_STRIKE_STEP = 100    # strike interval for WsPCR subscriptions
+PCR_STRIKE_STEP       = 100    # strike interval for BankNifty WsPCR subscriptions
+NIFTY_PCR_STRIKE_STEP = 50     # strike interval for Nifty 50 WsPCR subscriptions
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -301,6 +302,8 @@ def main():
     log.info("=" * 60)
     log.info("  WsPCR SETUP — WebSocket OI-based PCR")
     log.info("=" * 60)
+
+    # ── BankNifty WsPCR ───────────────────────────────────────────────────────
     ws_pcr = None
     if pm.expiry_date is not None:
         ws_pcr = WsPCR(
@@ -309,21 +312,57 @@ def main():
             expiry_date = pm.expiry_date,
             spot_range  = PCR_SPOT_RANGE,
             step        = PCR_STRIKE_STEP,
+            # index_token omitted → defaults to hub._index_token (BankNifty 260105)
         )
         ws_pcr.setup()
         log.info(
-            f"  WsPCR ready | expiry={pm.expiry_date} | "
+            f"  BankNifty WsPCR ready | expiry={pm.expiry_date} | "
             f"range=±{PCR_SPOT_RANGE}pt | step={PCR_STRIKE_STEP}pt"
         )
     else:
-        log.warning("  WsPCR skipped — expiry_date not available (fetch_all failed?)")
+        log.warning("  BankNifty WsPCR skipped — expiry_date not available (fetch_all failed?)")
+
+    # ── Nifty 50 WsPCR (Bug C fix) ────────────────────────────────────────────
+    # BB_STOCH_NIFTY and SPIKE_NIFTY both use PCR as a directional filter.
+    # Before this fix they received BankNifty PCR, which diverges from Nifty
+    # PCR on days with sector-specific option flows.  A dedicated Nifty WsPCR
+    # instance uses nifty_instruments (Nifty 50 chain), 50pt strike step, and
+    # reads spot from Nifty index token 256265 — fully independent of the
+    # BankNifty ws_pcr above.
+    nifty_ws_pcr = None
+    if nifty_pm.expiry_date is not None:
+        nifty_ws_pcr = WsPCR(
+            hub         = hub,
+            instruments = nifty_instruments,
+            expiry_date = nifty_pm.expiry_date,
+            spot_range  = PCR_SPOT_RANGE,
+            step        = NIFTY_PCR_STRIKE_STEP,
+            index_token = 256265,          # Bug C fix: Nifty 50 spot, not BankNifty
+        )
+        nifty_ws_pcr.setup()
+        log.info(
+            f"  Nifty 50 WsPCR ready | expiry={nifty_pm.expiry_date} | "
+            f"range=±{PCR_SPOT_RANGE}pt | step={NIFTY_PCR_STRIKE_STEP}pt"
+        )
+    else:
+        log.warning("  Nifty 50 WsPCR skipped — nifty expiry_date not available")
 
     # ── Live refresh: VIX every 5 min, PCR every 10 min ──────────────────────
+    # BankNifty PreMarketData: uses BankNifty ws_pcr
     pm.start_live_refresh(
         hub._done,
         vix_interval=300,
         pcr_interval=600,
         ws_pcr=ws_pcr,
+    )
+    # Nifty 50 PreMarketData: uses dedicated Nifty ws_pcr (Bug C fix)
+    # BB_STOCH_NIFTY and SPIKE_NIFTY read pm.pcr via nifty_pm — they now
+    # get true Nifty 50 OI-based PCR instead of BankNifty PCR.
+    nifty_pm.start_live_refresh(
+        hub._done,
+        vix_interval=0,      # VIX already refreshed by BankNifty pm above; skip
+        pcr_interval=600,
+        ws_pcr=nifty_ws_pcr,
     )
 
     # ── Call each strategy's pre_market() with shared data ───────────────────
@@ -375,13 +414,17 @@ def main():
     log.info("=" * 60)
     log.info(f"  Login     : AUTO (TOTP) -> token.json")
     log.info(f"  VIX       : {pm.vix}")
-    log.info(f"  PCR       : {pm.pcr}  (live via {'WsPCR' if ws_pcr else 'NSE-HTTP'})")
+    log.info(f"  PCR (BNF) : {pm.pcr}  (live via {'BankNifty WsPCR' if ws_pcr else 'disabled'})")
+    log.info(f"  PCR (NF)  : {nifty_pm.pcr}  (live via {'Nifty WsPCR' if nifty_ws_pcr else 'disabled'})")
     log.info(f"  Expiry    : {pm.expiry_date}  (DTE={pm.dte_days})")
     log.info(f"  200EMA    : {pm.ema200_daily}")
     log.info(f"  Prev Close: {pm.prev_close}")
-    log.info(f"  WsPCR     : {'enabled' if ws_pcr else 'disabled (expiry missing)'}")
+    log.info(f"  BNF WsPCR : {'enabled' if ws_pcr else 'disabled (expiry missing)'}")
     if ws_pcr:
-        log.info(f"  WsPCR cfg : range=±{PCR_SPOT_RANGE}pt step={PCR_STRIKE_STEP}pt")
+        log.info(f"  BNF WsPCR cfg : range=±{PCR_SPOT_RANGE}pt step={PCR_STRIKE_STEP}pt")
+    log.info(f"  NF  WsPCR : {'enabled' if nifty_ws_pcr else 'disabled (expiry missing)'}")
+    if nifty_ws_pcr:
+        log.info(f"  NF  WsPCR cfg : range=±{PCR_SPOT_RANGE}pt step={NIFTY_PCR_STRIKE_STEP}pt")
     log.info(f"  Strategies: {[s.name for s in active_strategies]}")
     log.info(f"  --- Nifty 50 (SPIKE_NIFTY) ---")
     log.info(f"  Nifty Expiry  : {nifty_pm.expiry_date}  (DTE={nifty_pm.dte_days})")
@@ -391,15 +434,23 @@ def main():
     # ── Start MarketHub (WebSocket) — runs until 3:31 PM IST ─────────────────
     hub.run()
 
-    # ── Log WsPCR final summary ───────────────────────────────────────────────
+    # ── WsPCR EOD teardown (Bug B fix) ────────────────────────────────────────
+    # Properly release all hub refcounts held by WsPCR instances.
+    # hub.unsubscribe() only removes a token from the WebSocket when the
+    # refcount hits 0 — any other strategy still holding the token is unaffected.
     if ws_pcr:
+        ws_pcr.teardown()
         ws_pcr.log_summary()
+    if nifty_ws_pcr:
+        nifty_ws_pcr.teardown()
+        nifty_ws_pcr.log_summary()
 
     log.info("Trader session complete.")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
