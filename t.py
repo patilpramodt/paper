@@ -358,9 +358,15 @@ def main():
     # Nifty 50 PreMarketData: uses dedicated Nifty ws_pcr (Bug C fix)
     # BB_STOCH_NIFTY and SPIKE_NIFTY read pm.pcr via nifty_pm — they now
     # get true Nifty 50 OI-based PCR instead of BankNifty PCR.
+    # vix_interval=86400: VIX is India-wide (same for both indices) and is
+    # already being refreshed every 5 min by the BankNifty pm thread above.
+    # Setting a 24-hour interval here ensures the Nifty thread never fires
+    # an extra VIX HTTP call, while still allowing the refresh loop to run
+    # for PCR updates.  vix_interval=0 would call _fetch_vix() every 60 s
+    # (every loop iteration) — wasteful and potentially rate-limited by NSE.
     nifty_pm.start_live_refresh(
         hub._done,
-        vix_interval=0,      # VIX already refreshed by BankNifty pm above; skip
+        vix_interval=86400,      # effectively disabled — BankNifty pm handles VIX
         pcr_interval=600,
         ws_pcr=nifty_ws_pcr,
     )
