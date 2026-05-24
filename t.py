@@ -101,6 +101,7 @@ from strategies.hedged_sell_strategy import HedgedSellStrategy
 from strategies.smart_hedge_strategy import SmartHedgeStrategy
 from strategies.nifty_expiry_straddle_strategy     import NiftyExpiryStraddleStrategy
 from strategies.banknifty_expiry_momentum_strategy  import BankNiftyExpiryMomentumStrategy
+from strategies.nifty_directional_strategy          import NiftyDirectionalStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -117,6 +118,7 @@ ACTIVE_STRATEGIES = [
     SmartHedgeStrategy,               # Smart Hedge:              9:35-10:15  directional spread auto-pick
     NiftyExpiryStraddleStrategy,      # Nifty Expiry Straddle:    9:20-11:30  SHORT straddle, Nifty WEEKLY expiry only
     BankNiftyExpiryMomentumStrategy,  # BankNifty Expiry Momentum: 14:00-15:20 directional buy, BankNifty MONTHLY expiry only
+    NiftyDirectionalStrategy,         # Nifty Directional:         9:30-14:30  CE/PE buy on directional days, Mode A+B
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -188,6 +190,7 @@ def setup_logging():
         "strategy.smart_hedge":                 "smart_hedge.log",
         "strategy.nifty_expiry_straddle":       "nifty_expiry_straddle.log",
         "strategy.banknifty_expiry_momentum":   "banknifty_expiry_momentum.log",
+        "strategy.nifty_directional":            "nifty_directional.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -239,6 +242,7 @@ def main():
   + HEDGED SELL + SMART HEDGE
   + NIFTY EXPIRY STRADDLE  (Nifty weekly expiry only, 9:20–11:30)
   + BANKNIFTY EXPIRY MOMENTUM  (BankNifty monthly expiry only, 14:00–15:20)
+  + NIFTY DIRECTIONAL  (Nifty CE/PE buy, Mode A+B, 9:30–14:30)
   (paper mode)
 
 """)
@@ -466,6 +470,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
