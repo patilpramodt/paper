@@ -141,6 +141,7 @@ class BankNiftyExpiryMomentumStrategy(BaseStrategy):
         super().__init__(hub)
         self._lock = threading.Lock()
 
+        self._active            : bool  = False   # True only when DTE == 0
         self._trade             : Optional[_Trade] = None
         self._entry_attempted   : bool  = False
         self._squareoff_done    : bool  = False
@@ -182,6 +183,7 @@ class BankNiftyExpiryMomentumStrategy(BaseStrategy):
             )
             return False
 
+        self._active = True
         log.info(
             f"[BANKNIFTY_EXPIRY_MOMENTUM] ✓ EXPIRY DAY | "
             f"expiry={self._expiry_date} VIX={premarket_data.vix} "
@@ -196,6 +198,8 @@ class BankNiftyExpiryMomentumStrategy(BaseStrategy):
     # ─────────────────────────────────────────────────────────────────────────
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         """BankNifty spot tick — drives breakout detection and trade management."""
+        if not self._active:
+            return
         self._spot = price
 
         t           = ts.time()
@@ -244,6 +248,8 @@ class BankNiftyExpiryMomentumStrategy(BaseStrategy):
         BankNifty 5-min candle from MarketHub.
         Builds reference range from the 13:55 candle and feeds indicator buffer.
         """
+        if not self._active:
+            return
         self._candles.append(candle)
 
         candle_ts = candle.get("ts", ts)
