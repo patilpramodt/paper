@@ -124,6 +124,7 @@ class NiftyExpiryStraddleStrategy(BaseStrategy):
         self._daily_pnl         : float = 0.0
         self._trade_count       : int   = 0
 
+        self._active            : bool  = False   # True only when DTE == 0
         self._expiry_date       = None
         self._pm                = None
         self._instruments       = None
@@ -149,6 +150,7 @@ class NiftyExpiryStraddleStrategy(BaseStrategy):
             )
             return False
 
+        self._active = True
         log.info(
             f"[NIFTY_EXPIRY_STRADDLE] ✓ EXPIRY DAY | "
             f"expiry={self._expiry_date} VIX={premarket_data.vix} "
@@ -179,6 +181,8 @@ class NiftyExpiryStraddleStrategy(BaseStrategy):
     # ─────────────────────────────────────────────────────────────────────────
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         """Nifty 50 spot tick — routed exclusively here via INDEX_TOKEN."""
+        if not self._active:
+            return
         self._spot = price
 
         if self._entry_attempted or self._squareoff_done:
@@ -199,6 +203,8 @@ class NiftyExpiryStraddleStrategy(BaseStrategy):
     def on_option_tick(self, token: int, price: float,
                        ts: datetime, tick_ts: datetime = None):
         """All subscribed option ticks arrive here — drives trade management."""
+        if not self._active:
+            return
         if not self._position_open:
             return
 
