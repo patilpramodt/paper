@@ -737,6 +737,14 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
                                     reason="mode_b_consol_breakout_short")
                         return
 
+                # Tight bars exceeded max — zone too wide, reset and re-seek
+                if self._mb_consol_bars >= CFG["mode_b_consol_max_bars"]:
+                    log.info(
+                        f"[{self.name}] [ModeB] Consolidation expired (tight) after "
+                        f"{self._mb_consol_bars} bars — reset"
+                    )
+                    self._mb_state = "WATCHING"
+
             else:
                 # Wide bar — check for breakout first before resetting
                 if self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
