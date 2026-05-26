@@ -127,6 +127,7 @@ CFG = {
     "bb_std"             : 2.0,
     "bb_squeeze_pct"     : 0.002,   # band-width/close < this → squeeze, skip all entries
     "bb_mid_squeeze_pct" : 0.003,   # stricter threshold for middle-band cross only
+    "bb_min_bw_breakout" : 0.36,    # breakout entries only when BW/close >= this
 
     # Volume filter
     "vol_avg_period"     : 10,
@@ -387,6 +388,8 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         if not st_bull:
             return {"action": "HOLD", "blocked_by": "st_trend_ce", **base}
         if bb_breakout_up:
+            if bb["bw_pct"] < CFG["bb_min_bw_breakout"]:
+                return {"action": "HOLD", "blocked_by": "bw_squeeze", **base}
             mode = "breakout"
         elif bb_bounce_up:
             mode = "bounce"
@@ -405,6 +408,8 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         if not st_bear:
             return {"action": "HOLD", "blocked_by": "st_trend_pe", **base}
         if bb_breakout_dn:
+            if bb["bw_pct"] < CFG["bb_min_bw_breakout"]:
+                return {"action": "HOLD", "blocked_by": "bw_squeeze", **base}
             mode = "breakout"
         elif bb_bounce_dn:
             mode = "bounce"
