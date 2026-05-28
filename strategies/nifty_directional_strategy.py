@@ -303,6 +303,13 @@ class NiftyDirectionalStrategy(BaseStrategy):
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
+        # Hard exit: must be checked BEFORE the market-hours guard below,
+        # otherwise the guard returns early and this block is never reached.
+        if self._trade and self._trade["state"] == "OPEN" and t >= CFG["hard_exit_time"]:
+            opt_ltp = self.get_price(self._trade["token"]) or self._trade["entry"]
+            self._do_exit(opt_ltp, "HARD_EXIT_EOD", ts)
+            return
+
         # Ignore outside trading hours
         if t < CFG["market_open"] or t >= CFG["hard_exit_time"]:
             return
@@ -325,12 +332,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
                 self._or_high = price
             if self._or_low is None or price < self._or_low:
                 self._or_low = price
-
-        # Hard exit: close any open position
-        if self._trade and self._trade["state"] == "OPEN" and t >= CFG["hard_exit_time"]:
-            opt_ltp = self.get_price(self._trade["token"]) or self._trade["entry"]
-            self._do_exit(opt_ltp, "HARD_EXIT_EOD", ts)
-            return
 
         # Build 5-min candle from live ticks
         closed = self._candle_builder.feed_tick(price, 1, ts)
@@ -958,6 +959,18 @@ class NiftyDirectionalStrategy(BaseStrategy):
             w.writerow({k: row.get(k, "") for k in fields})
 
     def eod_summary(self):
+        # ── Safety net: force-close any position still open at EOD ───────────
+        # Normally HARD_EXIT_EOD fires at 15:00 via on_tick(). This handles
+        # the edge case where no index tick arrives at exactly 15:00 (e.g.
+        # WebSocket lag, last tick at 14:59:59).
+        if self._trade and self._trade["state"] == "OPEN":
+            token   = self._trade.get("token")
+            opt_ltp = (self.get_price(token) if token else None) or self._trade["entry"]
+            log.warning(
+                f"[{self.name}] EOD: trade still OPEN — force-closing at ltp={opt_ltp:.2f}"
+            )
+            self._do_exit(opt_ltp, "EOD_FORCE_CLOSE", _now_ist())
+
         log.info(f"\n[{self.name}] {'='*55}")
         log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
         log.info(f"[{self.name}] Market mode    : {self._mode or 'not set'}")
