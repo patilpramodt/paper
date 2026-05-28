@@ -376,6 +376,13 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
+        # Hard exit: must be checked BEFORE the market-hours guard below,
+        # otherwise the guard returns early and this block is never reached.
+        if self._trade and self._trade["state"] == "OPEN" and t >= CFG["hard_exit_time"]:
+            current_fut_price = self.get_price(self._fut_token) or price
+            self._do_exit(current_fut_price, price, "HARD_EXIT_EOD", ts)
+            return
+
         if t < CFG["market_open"] or t >= CFG["hard_exit_time"]:
             return
 
@@ -393,12 +400,6 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
                 self._or_high = price
             if self._or_low is None or price < self._or_low:
                 self._or_low = price
-
-        # Hard exit at 3:00 PM
-        if self._trade and self._trade["state"] == "OPEN" and t >= CFG["hard_exit_time"]:
-            current_fut_price = self.get_price(self._fut_token) or price
-            self._do_exit(current_fut_price, price, "HARD_EXIT_EOD", ts)
-            return
 
         # Build 5-min candles from index ticks
         closed = self._candle_builder.feed_tick(price, 1, ts)
@@ -629,11 +630,12 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
                 )
                 return
 
+        vwap_disp = f"{ind['vwap']:.0f}" if ind['vwap'] is not None else "N/A"
         log.info(
             f"[{self.name}] [ModeA] Signal: {direction} @ {ts.strftime('%H:%M')} | "
             f"EMA9={ind['ema9']:.0f} EMA20={ind['ema20']:.0f} "
             f"EMA50={ind['ema50']:.0f} RSI={ind['rsi']:.1f} "
-            f"VWAP={ind['vwap']:.0f if ind['vwap'] else 'N/A'} "
+            f"VWAP={vwap_disp} "
             f"close={candle['close']:.2f}"
         )
 
@@ -985,6 +987,20 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
     # ── EOD summary ───────────────────────────────────────────────────────────
 
     def eod_summary(self):
+        # ── Safety net: force-close any position still open at EOD ───────────
+        # Normally HARD_EXIT_EOD fires at 15:00 via on_tick(). This handles
+        # the edge case where no index tick arrives at exactly 15:00 (e.g.
+        # WebSocket lag, last tick at 14:59:59).
+        if self._trade and self._trade["state"] == "OPEN":
+            fut_ltp = (
+                self.get_price(self._fut_token) if self._fut_token else None
+            ) or self._trade["entry"]
+            log.warning(
+                f"[{self.name}] EOD: trade still OPEN — "
+                f"force-closing at fut_ltp={fut_ltp:.2f}"
+            )
+            self._do_exit(fut_ltp, fut_ltp, "EOD_FORCE_CLOSE", _now_ist())
+
         log.info(f"\n[{self.name}] {'═'*55}")
         log.info(
             f"[{self.name}] END OF DAY | "
@@ -1008,3 +1024,4 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         log.info(f"[{self.name}] Today PnL     : {self._today_pnl:+.0f}")
         log.info(f"[{self.name}] {'═'*55}\n")
+
