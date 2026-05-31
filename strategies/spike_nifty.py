@@ -1,8 +1,16 @@
 """
 strategies/spike_nifty.py
 
-SPIKE_NIFTY Strategy — 9:15 gap/spike trade on Nifty 50, exits by 9:30.
+SPIKE_NIFTY Strategy — 9:15 spike trade on Nifty 50, exits by 9:30.
 Mirrors SPIKE (BankNifty) but with Nifty-specific parameters.
+
+ENTRY LOGIC (updated):
+  No direct gap entry. Regardless of gap direction, wait for the first
+  closed 8-second (2-tick) candle after 9:15.
+    - Candle is RED   (close < open)  → take PE
+    - Candle is GREEN (close > open)  → take CE
+    - Doji (close ≈ open)             → skip, wait for next candle
+  Gap direction is still logged for reference but does NOT trigger entry.
 
 INDEX
 ──────
@@ -269,6 +277,14 @@ class SpikeNiftyStrategy(BaseStrategy):
         Receives Nifty 50 index ticks only.
         MarketHub routes ticks for INDEX_TOKEN=256265 exclusively here.
         BankNifty ticks (260105) are never delivered to this method.
+
+        Entry logic:
+          Gap direction is detected on the first tick and logged, but does NOT
+          trigger an immediate entry. All entries — gap or no gap — wait for
+          the first closed 8-second (2-tick) candle after 9:15.
+            GREEN candle → CE
+            RED   candle → PE
+            Doji         → skip, wait for next candle
         """
         t = ts.time()
 
@@ -284,16 +300,14 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         closed_8s = self._index_8s.feed_tick(price, tick_ts)
 
+        # Detect gap direction on first tick — for reference / logging only.
+        # No direct gap entry is taken.
         if not self._gap_filter_done and self._market_opened:
             self._determine_gap_direction(price)
             self._gap_filter_done = True
 
-            if self._gap_direction in ("CE", "PE"):
-                self._attempt_gap_entry(price, ts)
-            return
-
-        if (self._gap_direction == "BOTH" and
-                not self._trade_done and
+        # All entries (gap or no gap) go through the first 2-tick candle signal.
+        if (not self._trade_done and
                 self._trade is None and
                 closed_8s is not None):
             self._check_2candle_signal(closed_8s, price, ts)
@@ -324,7 +338,7 @@ class SpikeNiftyStrategy(BaseStrategy):
           SL checks are suppressed for sl_grace_seconds after entry fill to
           prevent stale buffered ticks from causing an immediate false exit.
         """
-        # ── Job 1: Resolve pending gap entry ──────────────────────────────────
+        # ── Job 1: Resolve pending entry ──────────────────────────────────────
         if self._pending_entry and token == self._pending_entry["token"] and not self._trade:
             p = self._pending_entry
             self._pending_entry = None
@@ -404,10 +418,14 @@ class SpikeNiftyStrategy(BaseStrategy):
             self._pre_pe_sym   = pe_sym
             log.info(f"[{self.name}] Late-subscribed PE: {pe_sym} ({pe_tok})")
 
-    # ── Gap direction ─────────────────────────────────────────────────────────
+    # ── Gap direction (reference only — does not trigger entry) ───────────────
 
     def _determine_gap_direction(self, open_price: float):
-        """Classify today's open vs prev day's last 5-min range (or body)."""
+        """
+        Classify today's open vs prev day's last 5-min range (or body).
+        Result is stored in self._gap_direction for logging/CSV reference only.
+        It no longer controls which option is entered — the 2-tick candle does.
+        """
         h5 = self._prev_last5m_high
         l5 = self._prev_last5m_low
 
@@ -418,13 +436,13 @@ class SpikeNiftyStrategy(BaseStrategy):
             )
             if open_price > h5:
                 self._gap_direction = "CE"
-                log.info(f"[{self.name}]  GAP UP: open={open_price:.0f} > last5m_high={h5:.0f}  → CE")
+                log.info(f"[{self.name}]  GAP UP: open={open_price:.0f} > last5m_high={h5:.0f}  (ref only)")
             elif open_price < l5:
                 self._gap_direction = "PE"
-                log.info(f"[{self.name}]  GAP DOWN: open={open_price:.0f} < last5m_low={l5:.0f}  → PE")
+                log.info(f"[{self.name}]  GAP DOWN: open={open_price:.0f} < last5m_low={l5:.0f}  (ref only)")
             else:
                 self._gap_direction = "BOTH"
-                log.info(f"[{self.name}]  NO GAP: open inside [{l5:.0f}–{h5:.0f}] → 2-candle signal")
+                log.info(f"[{self.name}]  NO GAP: open inside [{l5:.0f}–{h5:.0f}] (ref only)")
             return
 
         log.warning(f"[{self.name}] Last 5-min candle data unavailable — falling back to daily body")
@@ -437,58 +455,47 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         if open_price > bh:
             self._gap_direction = "CE"
-            log.info(f"[{self.name}]  GAP UP (fallback): open={open_price:.0f} > body_high={bh:.0f}")
+            log.info(f"[{self.name}]  GAP UP (fallback): open={open_price:.0f} > body_high={bh:.0f}  (ref only)")
         elif open_price < bl:
             self._gap_direction = "PE"
-            log.info(f"[{self.name}]  GAP DOWN (fallback): open={open_price:.0f} < body_low={bl:.0f}")
+            log.info(f"[{self.name}]  GAP DOWN (fallback): open={open_price:.0f} < body_low={bl:.0f}  (ref only)")
         else:
             self._gap_direction = "BOTH"
             log.info(f"[{self.name}]  NO GAP (fallback): open inside [{bl:.0f}–{bh:.0f}]")
 
-    def _attempt_gap_entry(self, index_price: float, ts: datetime):
-        """Enter immediately on first tick when a gap is detected."""
-        if self._trade_done or self._trade:
-            return
-
-        signal = self._gap_direction
-
-        if signal == "CE" and self._pre_ce_token:
-            sym, token = self._pre_ce_sym, self._pre_ce_token
-        elif signal == "PE" and self._pre_pe_token:
-            sym, token = self._pre_pe_sym, self._pre_pe_token
-        else:
-            from core.instruments import get_atm_strike
-            strike = get_atm_strike(index_price, step=NIFTY_STRIKE_STEP)
-            expiry = self._expiry_date
-            log.warning(
-                f"[{self.name}] Gap entry fallback lookup | signal={signal} "
-                f"strike={strike} expiry={expiry} spot={index_price:.2f}"
-            )
-            token, sym = self._instruments.get_option_token(strike, signal, expiry)
-
-        if not token or not sym:
-            log.error(
-                f"[{self.name}] No option token for gap {signal} entry | "
-                f"spot={index_price:.2f} expiry={self._expiry_date}"
-            )
-            return
-
-        self._build_entry(sym, token, signal, ts, reason=f"gap_{signal.lower()}")
-
-    # ── 2-candle signal ───────────────────────────────────────────────────────
+    # ── 2-tick candle signal ──────────────────────────────────────────────────
 
     def _check_2candle_signal(self, latest_closed: dict, index_price: float, ts: datetime):
-        """When no gap: wait for two consecutive bullish/bearish 8-sec candles."""
-        last_two = self._index_8s.last_n_closed(2)
-        if len(last_two) < 2:
+        """
+        Entry signal based on the FIRST closed 8-second (2-tick) candle after 9:15.
+          - Candle is GREEN (close > open) → take CE
+          - Candle is RED   (close < open) → take PE
+          - Doji (close ≈ open)            → skip, wait for next candle
+
+        This logic applies regardless of gap direction.
+        Gap direction is ignored for the entry decision.
+        """
+        c = latest_closed  # most recent closed 8s candle
+
+        if self._is_doji(c):
+            log.info(
+                f"[{self.name}] 8s candle is doji — skipping "
+                f"(o={c['open']:.1f} c={c['close']:.1f})"
+            )
             return
 
-        c1, c2 = last_two[-2], last_two[-1]
-        signal = self._check_signal(c1, c2)
-        if not signal:
-            return
+        if c["close"] > c["open"]:
+            signal = "CE"
+            color  = "GREEN"
+        else:
+            signal = "PE"
+            color  = "RED"
 
-        log.info(f"[{self.name}] 2-candle signal: {signal} at {ts.strftime('%H:%M:%S')}")
+        log.info(
+            f"[{self.name}] 2-tick candle signal: {color} → {signal} "
+            f"at {ts.strftime('%H:%M:%S')} "
+            f"(o={c['open']:.1f} c={c['close']:.1f})"
+        )
 
         if signal == "CE" and self._pre_ce_token:
             sym, token = self._pre_ce_sym, self._pre_ce_token
@@ -509,7 +516,7 @@ class SpikeNiftyStrategy(BaseStrategy):
             return
 
         self.subscribe_option(token)
-        self._build_entry(sym, token, signal, ts, reason="2x8s_signal")
+        self._build_entry(sym, token, signal, ts, reason=f"2tick_candle_{color.lower()}")
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
@@ -564,7 +571,7 @@ class SpikeNiftyStrategy(BaseStrategy):
         )
 
         # SL from actual fill price — not pre-order LTP
-        sl            = fill_price - CFG["initial_sl_buffer"]
+        sl             = fill_price - CFG["initial_sl_buffer"]
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
 
         log.info(
@@ -677,15 +684,6 @@ class SpikeNiftyStrategy(BaseStrategy):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _check_signal(self, c1: dict, c2: dict) -> Optional[str]:
-        if self._is_doji(c1) or self._is_doji(c2):
-            return None
-        if c1["close"] > c1["open"] and c2["close"] > c2["open"]:
-            return "CE"
-        if c1["close"] < c1["open"] and c2["close"] < c2["open"]:
-            return "PE"
-        return None
-
     @staticmethod
     def _is_doji(c: dict) -> bool:
         rng = c["high"] - c["low"]
@@ -733,4 +731,3 @@ class SpikeNiftyStrategy(BaseStrategy):
             )
         log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
-
