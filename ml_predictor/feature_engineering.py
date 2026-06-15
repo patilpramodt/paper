@@ -77,6 +77,10 @@ def build_features(
     d = df.copy()
     d.columns = [c.lower() for c in d.columns]
 
+    # Strip timezone from index — ensures VIX/cross reindex aligns correctly
+    if d.index.tz is not None:
+        d.index = d.index.tz_localize(None)
+
     _add_candle_features(d)
     _add_ema_features(d)
     _add_rsi(d)
