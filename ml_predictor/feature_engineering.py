@@ -198,18 +198,28 @@ def _add_atr(d, period: int = 14):
 
 
 def _add_volume_features(d, period: int = 20):
-    vol_ma            = d["volume"].rolling(period).mean()
-    d["volume_ratio"] = d["volume"] / vol_ma.replace(0, np.nan)
-    d["volume_trend"] = d["volume"].pct_change().clip(-5, 5)
+    # Nifty/BankNifty index instruments return zero volume from Kite.
+    # Use price-range proxy as volume surrogate (captures volatility activity).
+    vol = d["volume"].copy()
+    if vol.sum() == 0:
+        vol = ((d["high"] - d["low"]) * d["close"]).clip(lower=1)
+    vol_ma            = vol.rolling(period).mean()
+    d["volume_ratio"] = (vol / vol_ma.replace(0, np.nan)).clip(0, 10)
+    d["volume_trend"] = vol.pct_change().clip(-5, 5)
+    d["_vol_proxy"]   = vol   # store for VWAP
 
 
 def _add_vwap(d):
-    d["_date"]   = d.index.date
-    tp           = (d["high"] + d["low"] + d["close"]) / 3
-    cum_tp_vol   = (tp * d["volume"]).groupby(d["_date"]).cumsum()
-    cum_vol      = d["volume"].groupby(d["_date"]).cumsum()
-    vwap         = cum_tp_vol / cum_vol.replace(0, np.nan)
-    d["price_vs_vwap"] = (d["close"] - vwap) / vwap
+    d["_date"] = d.index.date
+    tp         = (d["high"] + d["low"] + d["close"]) / 3
+    # Use proxy volume if real volume is zero
+    vol = d["_vol_proxy"] if "_vol_proxy" in d.columns else d["volume"]
+    if vol.sum() == 0:
+        vol = ((d["high"] - d["low"]) * d["close"]).clip(lower=1)
+    cum_tp_vol         = (tp * vol).groupby(d["_date"]).cumsum()
+    cum_vol            = vol.groupby(d["_date"]).cumsum()
+    vwap               = cum_tp_vol / cum_vol.replace(0, np.nan)
+    d["price_vs_vwap"] = (d["close"] - vwap) / vwap.replace(0, np.nan)
 
 
 def _add_oi_placeholders(d):
@@ -261,5 +271,5 @@ def _add_target(d):
 
 def _drop_internals(d):
     drop = ["open", "high", "low", "close", "volume",
-            "_ema9", "_ema21", "_ema50", "_bb_mid", "_date", "is_green"]
+            "_ema9", "_ema21", "_ema50", "_bb_mid", "_date", "_vol_proxy", "is_green"]
     d.drop(columns=[c for c in drop if c in d.columns], inplace=True)
