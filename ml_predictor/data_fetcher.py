@@ -227,6 +227,17 @@ def load_csv(instrument: str = "BANKNIFTY") -> pd.DataFrame:
 
     df = pd.read_csv(path, index_col=0, parse_dates=True)
     df.sort_index(inplace=True)
+
+    # Strip timezone so all DataFrames are tz-naive (avoids reindex mismatches)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
+    # Ensure only market hours (09:15–15:30) — defensive re-filter
+    df = df.between_time("09:15", "15:30")
+
+    # Drop any rows with all-NaN OHLCV
+    df.dropna(subset=["open", "high", "low", "close"], inplace=True)
+
     log.info(f"Loaded {instrument}: {len(df):,} candles ({df.index.min().date()} → {df.index.max().date()})")
     return df
 
