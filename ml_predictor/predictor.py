@@ -327,15 +327,11 @@ class NiftyPredictor:
         return df
 
     def _build_cross_df(self, hub, index: pd.DatetimeIndex) -> pd.DataFrame | None:
-        """Build minimal cross-index DataFrame for cross_ret_1 feature."""
-        if self._cross_token is None:
-            return None
-        try:
-            price = hub.last_price(self._cross_token)
-            if price:
-                return pd.DataFrame({"close": price}, index=index)
-        except Exception:
-            pass
+        """Build minimal cross-index DataFrame for cross_ret_1 feature.
+
+        A single scalar price produces a constant-value column → cross_ret_1
+        always zero. Return None and let feature_engineering zero-fill instead.
+        """
         return None
 
     def _get_atm_tokens(self, hub, pm, ts: datetime):
@@ -363,3 +359,4 @@ class NiftyPredictor:
         except Exception as e:
             log.debug(f"[ML] ATM token lookup failed: {e}")
             return None, None
+
