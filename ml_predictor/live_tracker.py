@@ -536,8 +536,12 @@ def main():
                 df_recent = fetch_recent_candles(kite, token, n_bars=10)
                 if not df_recent.empty:
                     # Find the candle at last_predicted_candle time
+                    # Strip timezone from index in case Kite returns tz-aware timestamps
+                    idx = df_recent.index
+                    if idx.tz is not None:
+                        idx = idx.tz_localize(None)
                     match = df_recent[
-                        df_recent.index.floor("5min") == pd.Timestamp(last_predicted_candle)
+                        idx.floor("5min") == pd.Timestamp(last_predicted_candle)
                     ]
                     if not match.empty:
                         actual = match.iloc[0].to_dict()
