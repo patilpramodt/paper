@@ -135,8 +135,9 @@ def run_fine_tune():
             # Load existing model and continue training
             model = XGBClassifier(**{**XGB_PARAMS, "n_estimators": 100})
             model.load_model(model_path)
+            booster = model.get_booster()   # XGBClassifier.fit() xgb_model must be a Booster, not a path
             model.fit(X_b, y_b, sample_weight=weights,
-                      xgb_model=model_path,  # warm-start from saved model
+                      xgb_model=booster,
                       verbose=False)
 
             model.save_model(model_path)
@@ -168,3 +169,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
