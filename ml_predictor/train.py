@@ -125,7 +125,9 @@ def walk_forward_validate(X: pd.DataFrame, y: pd.Series, model_fn, n_folds=N_FOL
 
         model = model_fn()
         model.fit(X_tr, y_tr, sample_weight=weights,
-                  eval_set=[(X_te, y_te)], verbose=False)
+                  eval_set=[(X_te, y_te)],
+                  early_stopping_rounds=30,
+                  verbose=False)
 
         y_pred = model.predict(X_te)
         y_prob = model.predict_proba(X_te)[:, 1]
@@ -381,3 +383,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
