@@ -145,6 +145,11 @@ def fetch_recent_candles(kite, token: int, n_bars: int = FETCH_BARS) -> pd.DataF
     df.rename(columns={"date": "datetime"}, inplace=True)
     df["datetime"] = pd.to_datetime(df["datetime"])
     df.set_index("datetime", inplace=True)
+    # Strip tz — Kite returns IST-aware timestamps but all internal logic
+    # uses tz-naive datetimes (via _now_ist which already strips tz).
+    # Keeping tz-aware here causes "Cannot compare dtypes" errors downstream.
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
     df.sort_index(inplace=True)
 
     # Market hours only
@@ -536,12 +541,8 @@ def main():
                 df_recent = fetch_recent_candles(kite, token, n_bars=10)
                 if not df_recent.empty:
                     # Find the candle at last_predicted_candle time
-                    # Strip timezone from index in case Kite returns tz-aware timestamps
-                    idx = df_recent.index
-                    if idx.tz is not None:
-                        idx = idx.tz_localize(None)
                     match = df_recent[
-                        idx.floor("5min") == pd.Timestamp(last_predicted_candle)
+                        df_recent.index.floor("5min") == pd.Timestamp(last_predicted_candle)
                     ]
                     if not match.empty:
                         actual = match.iloc[0].to_dict()
@@ -603,3 +604,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
