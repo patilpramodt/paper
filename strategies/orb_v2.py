@@ -683,9 +683,19 @@ class ORBStrategy(BaseStrategy):
         bb_e = bool(bw.iloc[-1]>bw.iloc[-2]) if len(df)>1 else False
 
         # Volume (now uses real bar volumes, not zeros — Bug 7 fix in market_hub.py)
+        #
+        # FIX (Bug 10): v3 was sum(last 3 prior bars), not their average.
+        # The hard gate below compares vol_l > v3 directly, which silently
+        # demanded vol_l > ~3x the per-bar average (since 3 bars near the
+        # rolling mean sum to ~3x that mean) — roughly double the intended
+        # 1.5x spike (vol_multiplier). Confirmed against live logs: v3 was
+        # consistently ~3x vol_avg even on ordinary bars, making the
+        # vol_l > v3 condition almost unclearable outside an extreme spike.
+        # Now v3 is the 3-bar AVERAGE, so "vol_l > v3" means "stronger than
+        # the immediately preceding bars," not "stronger than 3 bars combined."
         va  = float(vol.rolling(10, min_periods=1).mean().iloc[-1])
         vl  = float(vol.iloc[-1])
-        v3  = float(vol.iloc[-4:-1].sum()) if len(vol)>=4 else va*3
+        v3  = float(vol.iloc[-4:-1].mean()) if len(vol)>=4 else va
 
         return {
             "rsi":rsi, "ema9":ema9, "ema21":ema21,
