@@ -184,6 +184,13 @@ RSI_SLOPE_MIN       = 1.0       # lowered: was 1.5 (1.5 too strict in slow trend
 #
 # Histogram must be expanding for N consecutive bars.
 MACD_EXPANSION_BARS = 2         # 2 consecutive expanding bars (3 causes too many misses)
+# NOTE: tested lowering this to 1 against the June 18 log replay (11:42-11:50
+# bull run). Result: only 2 of 8 bars in that run flipped from blocked to
+# passing on this filter specifically — the other 6 had genuinely negative
+# macd_slope (histogram actually falling bar-over-bar), which this setting
+# does not affect. Reverted rather than keep a loosening that isn't backed
+# by the actual data. macd_slope (immediately below) is the binding
+# constraint on most real blocks, not the multi-bar expansion check.
 # ATR-scaled MACD threshold (replaces fixed 0.40)
 MACD_ATR_RATIO      = 0.008     # macd_hist must be > ATR * 0.008
 MACD_HIST_FLOOR     = 0.25      # Absolute minimum even on low ATR days
