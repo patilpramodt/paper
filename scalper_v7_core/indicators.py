@@ -20,14 +20,23 @@ from scalper_v7_core.config import (
     RSI_ZSCORE_WINDOW, RSI_SLOPE_LOOKBACK,
     STRUCTURE_LOOKBACK,
     ATR_MIN_PCT, ATR_STRONG_PCT,
-    REGIME_EMA_ATR_RATIO,
+    REGIME_EMA_ATR_RATIO, REGIME_EMA_ATR_RATIO_1M,
     ATR_VOL_RATIO_WINDOW,
 )
 
 
-def compute_indicators(df: pd.DataFrame) -> dict:
+def compute_indicators(df: pd.DataFrame, timeframe: str = "5m") -> dict:
     """
     Compute all indicators for V6.
+
+    timeframe: "5m" (default) or "1m" — selects which EMA-gap/ATR ratio is
+    used for the regime/is_trending classification, so this function agrees
+    with _get_5m_regime() in signal_logic.py instead of always using the
+    5-minute ratio. Previously this always used REGIME_EMA_ATR_RATIO (0.25)
+    even when called on 1-min candles, which both mislabeled the "Regime="
+    log field for 1-min and (via is_trending) silently doubled the RSI
+    Z-score threshold / blocked entries on quiet days where trend_bias was
+    still correctly BULL/BEAR.
 
     Returns dict with:
         Core:
@@ -234,19 +243,37 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 
     # 
     # Regime Classification
-    # 
+    #
+    # FIX: previously always used REGIME_EMA_ATR_RATIO (the 5-min constant)
+    # regardless of which timeframe's candles were passed in, and additionally
+    # required atr_pct >= ATR_MIN_PCT before calling anything "TRENDING" even
+    # when the EMA-gap/ATR ratio alone (the same test _get_5m_regime uses for
+    # trend_bias) said otherwise. That second condition is a DEAD-MARKET check,
+    # not a trend-agreement check — bundling it into is_trending caused
+    # ind5m['is_trending'] to read False on quiet-but-trending days even while
+    # trend_bias correctly read BULL/BEAR, which (a) forced the stricter RSI
+    # Z-score threshold and (b) directly blocked entries via the "5m_not_trending"
+    # gate in signal_logic.py.
+    #
+    # Now: ratio matches the timeframe this was computed for, and "TRENDING"
+    # is driven purely by the EMA-gap/ATR ratio test — same test as
+    # _get_5m_regime() — so is_trending agrees with trend_bias by construction.
+    # WEAK (dead market / no ATR) is reported separately.
+    ratio = REGIME_EMA_ATR_RATIO if timeframe == "5m" else REGIME_EMA_ATR_RATIO_1M
     atr = out["atr14"]
     gap = abs(out["ema_gap"])
 
-    if atr > 0:
-        if out["atr_pct"] < ATR_MIN_PCT:
-            out["regime"]      = "WEAK"
-            out["is_trending"] = False
-        elif gap / atr >= REGIME_EMA_ATR_RATIO:
-            out["regime"]      = "TRENDING"
-            out["is_trending"] = True
-        else:
-            out["regime"]      = "SIDEWAYS"
-            out["is_trending"] = False
+    if atr <= 0:
+        out["regime"]      = "WEAK"
+        out["is_trending"] = False
+    elif gap / atr >= ratio:
+        out["regime"]      = "TRENDING"
+        out["is_trending"] = True
+    elif out["atr_pct"] < ATR_MIN_PCT:
+        out["regime"]      = "WEAK"
+        out["is_trending"] = False
+    else:
+        out["regime"]      = "SIDEWAYS"
+        out["is_trending"] = False
 
     return out
