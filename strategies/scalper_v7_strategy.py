@@ -299,8 +299,8 @@ class ScalperV7Strategy(BaseStrategy):
 
         # Build snapshot dict (mirrors get_market_snapshot() output)
         from scalper_v7_core.indicators import compute_indicators
-        ind_1m = compute_indicators(df_1m)
-        ind_5m = compute_indicators(df_5m) if not df_5m.empty else {}
+        ind_1m = compute_indicators(df_1m, timeframe="1m")
+        ind_5m = compute_indicators(df_5m, timeframe="5m") if not df_5m.empty else {}
 
         # Override VWAP with hub's session VWAP if available
         if hub_vwap and hub_vwap > 0:
