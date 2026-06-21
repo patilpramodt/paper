@@ -256,9 +256,20 @@ def _build_signal(ind1m: dict, ind5m: dict, lunch: bool) -> tuple[str, str]:
 
     #  Filter 6b: RSI Acceleration (V7 NEW) 
     # 2nd derivative: slope must be increasing (impulse start, not plateau).
+    #
+    # FIX: config.py's own changelog and RSI_ACC_MIN's comment both state
+    # "rsi_acc removed from entry combine — plateau blocks" / "not in combine
+    # gate", but rsi_acc_ok_bull/bear were still wired into the combine AND
+    # below. Confirmed in live logs (June 18, 11:46-11:50): a clean, strong
+    # bull run (RSI 64->69, Rz>1.3, price up ~60pts) was blocked by
+    # rsi_acc_bull exactly when RSI deceleration is NORMAL late in a healthy
+    # move — the 1st-derivative RSI slope filter above already confirms
+    # momentum direction; acceleration was double-penalizing the same signal.
+    # rsi_acc is still computed and logged (signal_meta in
+    # scalper_v7_strategy.py) for future analysis — just no longer gates entry.
     rsi_acc           = float(ind1m.get("rsi_acc", 0.0))
-    rsi_acc_ok_bull   = rsi_acc >= RSI_ACC_MIN
-    rsi_acc_ok_bear   = rsi_acc <= -RSI_ACC_MIN
+    rsi_acc_ok_bull    = True   # CHANGED: was rsi_acc >= RSI_ACC_MIN -- no longer gates entry
+    rsi_acc_ok_bear    = True   # CHANGED: was rsi_acc <= -RSI_ACC_MIN -- no longer gates entry
 
     #  Filter 7+8: MACD Expansion + ATR-Scaled threshold 
     macd_thresh  = _macd_threshold(ind1m, lunch)
@@ -287,7 +298,6 @@ def _build_signal(ind1m: dict, ind5m: dict, lunch: bool) -> tuple[str, str]:
         ema_ok_bull            and
         bull_rsi_ok            and
         rsi_slope_ok_bull      and
-        rsi_acc_ok_bull        and
         macd_bull_ok           and
         vol_bull_ok            and
         not rsi_exhausted_bull
@@ -305,7 +315,6 @@ def _build_signal(ind1m: dict, ind5m: dict, lunch: bool) -> tuple[str, str]:
         ema_ok_bear            and
         bear_rsi_ok            and
         rsi_slope_ok_bear      and
-        rsi_acc_ok_bear        and
         macd_bear_ok           and
         vol_bear_ok            and
         not rsi_exhausted_bear
@@ -321,7 +330,6 @@ def _build_signal(ind1m: dict, ind5m: dict, lunch: bool) -> tuple[str, str]:
         if not ema_ok_bull:          return "HOLD", "ema_gap_bull"
         if not bull_rsi_ok:          return "HOLD", "rsi_z_bull"
         if not rsi_slope_ok_bull:    return "HOLD", "rsi_slope_bull"
-        if not rsi_acc_ok_bull:      return "HOLD", "rsi_acc_bull"
         if not macd_bull_ok:         return "HOLD", "macd_bull"
         if not vol_bull_ok:          return "HOLD", "volume_bull"
         if rsi_exhausted_bull:       return "HOLD", "rsi_exhausted_bull"
@@ -329,7 +337,6 @@ def _build_signal(ind1m: dict, ind5m: dict, lunch: bool) -> tuple[str, str]:
         if not ema_ok_bear:          return "HOLD", "ema_gap_bear"
         if not bear_rsi_ok:          return "HOLD", "rsi_z_bear"
         if not rsi_slope_ok_bear:    return "HOLD", "rsi_slope_bear"
-        if not rsi_acc_ok_bear:      return "HOLD", "rsi_acc_bear"
         if not macd_bear_ok:         return "HOLD", "macd_bear"
         if not vol_bear_ok:          return "HOLD", "volume_bear"
         if rsi_exhausted_bear:       return "HOLD", "rsi_exhausted_bear"
