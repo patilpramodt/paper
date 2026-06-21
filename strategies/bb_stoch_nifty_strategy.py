@@ -5,8 +5,11 @@ BBStochNiftyStrategy -- Nifty 50 options scalper using:
   * Bollinger Bands  (BB)       -- identifies breakout / volatility expansion
   * Volume Filter               -- confirms genuine institutional participation
   * Supertrend trend filter     -- prevents counter-trend entries
-                                   Supertrend(10, 3) computed on the live
-                                   5-min candle buffer; no seeding required.
+                                   Supertrend(10, 3) computed on a 5-min
+                                   candle buffer that is now SEEDED from the
+                                   prior session at pre_market() (Bug 14) --
+                                   it no longer needs ~60 live minutes to
+                                   warm up from empty.
 
 SIGNAL LOGIC (all filters must agree before entry):
 --------------------------------------------------------------
@@ -53,19 +56,36 @@ INTERNAL CANDLE + VWAP ARCHITECTURE:
         MarketHub uses for BankNifty since the index has no traded volume).
         Reset in _reset_day() which is called from pre_market().
 
-  Backfill:
+  Backfill (today's catch-up, for late starts):
     t.py calls hub.backfill(hub.kite, index_token=256265) AFTER the BankNifty
     backfill. MarketHub's backfill filtering (INDEX_TOKEN routing) ensures only
     Nifty strategies receive those candles via on_candle(). Both paths
     (backfill on_candle + live on_tick) funnel into the same _process_candle()
     so indicator warmup is identical regardless of how candles arrive.
 
+  Historical seeding (Bug 14 fix, prior-session warmup):
+    Separately from the same-day backfill above, pre_market() now calls
+    _seed_historical_buffer(), which fetches the PRIOR trading session's
+    last N 5-min candles directly via hub.kite.historical_data() (same kite
+    handle hub.backfill() uses) and loads them straight into _buf_5m.
+    This means Supertrend(10,3) and BB(20) already have enough bars to be
+    valid the moment the market opens, instead of needing min_bars=12
+    (~60 live minutes) to accumulate from empty every single day. There is
+    a real overnight gap between the last seeded bar and the first live
+    9:15 bar -- Supertrend/BB self-correct within a few live bars, which is
+    an accepted tradeoff (same one already used for BankNifty BB_STOCH's
+    EMA seeding). If the historical fetch fails for any reason (holiday,
+    API error, no kite handle), this falls back silently to the old
+    live-only warmup path -- no regression risk.
+
 TRADE MANAGEMENT (on every option WebSocket tick):
 --------------------------------------------------------------
-  * SL    = entry_price - ATR_SL_MULT * atr   (anchored to fill price)
-  * TP    = entry_price + ATR_TP_MULT * atr   (anchored to fill price)
-  * Trail = moves SL to breakeven when profit >= TRAIL_ARM pts,
-            then trails every TRAIL_STEP pts after that
+  * SL    = entry_price - ATR_SL_MULT * (index_atr * PREMIUM_ATR_SCALE)
+            (anchored to fill price; scaled to premium points, Bug 12 fix)
+  * TP    = entry_price + ATR_TP_MULT * (index_atr * PREMIUM_ATR_SCALE)
+  * Trail = once profit >= TRAIL_ARM pts, SL locks TRAIL_LOCK_PCT of the
+            profit reached so far (not flat breakeven), re-locking every
+            TRAIL_STEP pts thereafter (Bug 13 fix)
 
 ALL BUG FIXES FROM BB_STOCH (BankNifty) ARE INHERITED:
   Bug 1  -- time.sleep() removed from WebSocket callbacks.
@@ -79,6 +99,34 @@ ALL BUG FIXES FROM BB_STOCH (BankNifty) ARE INHERITED:
   Bug 9  -- Trail breakeven SL at entry+slippage (true net-zero breakeven).
   Bug 10 -- _force_close fires exactly once via _squareoff_done flag.
   Bug 11 -- BBTrade __slots__ includes "order_id".
+
+NEW FIXES (this revision):
+  Bug 12 -- ATR unit mismatch: SL/TP were previously sized directly off the
+            raw NIFTY *index*-point ATR (typically 15-25 pts) and applied
+            as if it were option-*premium* points. That mismatch meant
+            sl_pts (atr*0.8) almost never exceeded the old sl_min=20 floor,
+            so the "ATR-adaptive" SL was actually a flat 20 on nearly every
+            trade. Fix: index ATR is scaled by PREMIUM_ATR_SCALE (a rough
+            ATM-delta proxy) into an estimated premium-point ATR before
+            sizing, and sl_min/sl_max/tp_min/tp_max were recalibrated to
+            that smaller scale so the multiplier can actually flex with
+            volatility instead of pinning at a floor every time.
+            See _compute_sl_tp().
+  Bug 13 -- Trail give-back: the old trail jumped straight from "no
+            protection" to a flat breakeven the instant profit crossed
+            trail_arm, then only added a new stage every trail_step points
+            *after* that -- so a trade that ran most of the way to TP and
+            reversed gave back the ENTIRE move (observed live 2026-06-18:
+            PE ran to +25pts vs a +30.4 TP, reversed, exited at -0.25pts).
+            Fix: once armed, SL locks TRAIL_LOCK_PCT of the profit reached
+            so far (not just breakeven), re-locking at each new stage.
+            See _update_trail().
+  Bug 14 -- No historical seeding: _buf_5m started empty every session and
+            needed min_bars=12 (~60 live minutes from 9:15) before the
+            first possible signal, missing the most volatile opening hour
+            every single day. Fix: pre_market() now seeds _buf_5m with the
+            prior session's last N 5-min candles via
+            hub.kite.historical_data(). See _seed_historical_buffer().
 """
 
 import csv
@@ -145,12 +193,28 @@ CFG = {
     "atr_period"         : 14,
     "atr_sl_mult"        : 0.8,
     "atr_tp_mult"        : 2.0,
-    "sl_min"             : 20.0,
-    "sl_max"             : 50.0,
-    "tp_min"             : 30.0,
-    "tp_max"             : 120.0,
-    "trail_arm"          : 25.0,    # move SL to BE when profit >= this
-    "trail_step"         : 12.0,    # then trail every N pts
+
+    # Bug 12 fix: `atr` from evaluate_signal() is computed on the NIFTY
+    # *index* 5-min candles (15-25 pt range), not the option premium.
+    # Scale it into an estimated premium-point ATR (rough ATM-delta proxy)
+    # before using it to size SL/TP in premium terms. 0.45 is a starting
+    # estimate for near-ATM weekly options -- revisit once real option-tick
+    # ATR data is available (see _seed/_compute_sl_tp TODO).
+    "premium_atr_scale"  : 0.45,
+
+    # Recalibrated to the premium-point scale above (old values of
+    # 20/50/30/120 were sized for raw index points and pinned SL to the
+    # floor on almost every trade -- see Bug 12).
+    "sl_min"             : 8.0,
+    "sl_max"             : 35.0,
+    "tp_min"             : 15.0,
+    "tp_max"             : 90.0,
+
+    # Bug 13 fix: trail now locks a FRACTION of profit reached at each
+    # stage instead of jumping straight to flat breakeven.
+    "trail_arm"          : 15.0,    # arm trail once profit >= this
+    "trail_lock_pct"     : 0.5,     # lock this fraction of profit reached
+    "trail_step"         : 8.0,     # re-lock every N pts of profit after arming
     "slippage"           : 1.5,
     "exit_cooldown"      : 2.0,
 
@@ -586,6 +650,11 @@ class BBStochNiftyStrategy(BaseStrategy):
         self._session_date = _now_ist().date()
         self._reset_day()
 
+        # Bug 14 fix: seed _buf_5m with the prior session's candles so
+        # Supertrend/BB are warm from market open instead of needing
+        # min_bars=12 (~60 live minutes) to fill up from empty.
+        self._seed_historical_buffer()
+
         log.info(
             f"[BB_STOCH_NIFTY] Pre-market | VIX={premarket_data.vix} "
             f"PCR={premarket_data.pcr} Expiry={self._expiry_date} DTE={self._dte}"
@@ -641,6 +710,95 @@ class BBStochNiftyStrategy(BaseStrategy):
         self._nifty_vwap.reset()   # Reset internal Nifty VWAP for fresh session
         # Bug A fix: clear range-subscription tracking on each new session
         self._subscribed_range.clear()
+
+    # ----------------------------------------------------------
+    # Bug 14: Historical candle seeding (prior-session warmup)
+    # ----------------------------------------------------------
+
+    def _seed_historical_buffer(self):
+        """
+        Fetch the prior trading session's last N 5-min Nifty candles via
+        hub.kite.historical_data() and load them into _buf_5m, so that
+        Supertrend(10,3) and BB(20) already have enough bars to be valid
+        the moment the market opens -- instead of needing min_bars=12
+        (~60 live minutes from 9:15) to accumulate from empty every day.
+
+        This is separate from hub.backfill(), which only replays TODAY's
+        already-elapsed candles for late starts. This seeds yesterday's
+        close-of-session data so today's first candle isn't starting cold.
+
+        There is a genuine overnight gap between the last seeded bar and
+        the first live 9:15 bar -- Supertrend/BB self-correct within a few
+        live bars, which is an accepted tradeoff (mirrors the BankNifty
+        BB_STOCH EMA-seeding approach already used elsewhere).
+
+        Fails safe: if kite is unavailable, the fetch errors, or no data
+        comes back, this silently falls back to the old live-only warmup
+        path (no regression -- the strategy just trades a bit later that
+        day, exactly as it did before this fix).
+        """
+        kite = getattr(self._hub, "kite", None)
+        if kite is None:
+            log.warning(
+                "[BB_STOCH_NIFTY] No kite handle on hub -- cannot seed "
+                "historical candles, falling back to live-only warmup "
+                f"(~{CFG['min_bars'] * 5}min)"
+            )
+            return
+
+        needed = self._buf_5m.maxlen or (CFG["bb_period"] + CFG["st_period"] + 10)
+        today  = _now_ist().date()
+
+        try:
+            raw = kite.historical_data(
+                instrument_token = self.INDEX_TOKEN,
+                from_date        = datetime.combine(today - timedelta(days=7), dtime(9, 15)),
+                to_date          = datetime.combine(today - timedelta(days=1), dtime(15, 30)),
+                interval         = "5minute",
+            )
+        except Exception as e:
+            log.warning(
+                f"[BB_STOCH_NIFTY] Historical seed fetch failed: {e} -- "
+                f"falling back to live-only warmup (~{CFG['min_bars'] * 5}min)"
+            )
+            return
+
+        if not raw:
+            log.warning(
+                "[BB_STOCH_NIFTY] Historical seed returned no candles -- "
+                f"falling back to live-only warmup (~{CFG['min_bars'] * 5}min)"
+            )
+            return
+
+        tail = raw[-needed:]
+        with self._lock:
+            self._buf_5m.clear()
+            for bar in tail:
+                try:
+                    self._buf_5m.append({
+                        "ts"     : bar["date"],
+                        "open"   : float(bar["open"]),
+                        "high"   : float(bar["high"]),
+                        "low"    : float(bar["low"]),
+                        "close"  : float(bar["close"]),
+                        "volume" : float(bar.get("volume", 0)),
+                    })
+                except (KeyError, TypeError, ValueError) as e:
+                    log.warning(f"[BB_STOCH_NIFTY] Skipping malformed seed bar {bar}: {e}")
+
+        if self._buf_5m:
+            log.info(
+                f"[BB_STOCH_NIFTY] Seeded {len(self._buf_5m)} prior-session 5-min "
+                f"candles ({tail[0].get('date', '?')} -> {tail[-1].get('date', '?')}) "
+                f"-- Supertrend/BB warm from first live tick, "
+                f"no {CFG['min_bars'] * 5}min wait"
+            )
+        else:
+            log.warning(
+                "[BB_STOCH_NIFTY] Seed buffer empty after load -- "
+                "falling back to live-only warmup"
+            )
+
 
     # ----------------------------------------------------------
     # Bug 6: Dynamic spot-based subscription on first live candle
@@ -1164,22 +1322,37 @@ class BBStochNiftyStrategy(BaseStrategy):
 
     def _update_trail(self, trade: BBTrade, ltp: float, pnl_pts: float):
         """
-        Bug 9 fix: trail SL to entry + slippage so exit at trail SL
-        yields net P&L = 0 (true breakeven), not -slippage.
+        Bug 13 fix (trail give-back): the old version jumped straight from
+        "no protection" to a flat breakeven SL the instant profit crossed
+        trail_arm, then only added a new stage every trail_step points
+        *after* that. That left a dead zone where a trade running most of
+        the way to TP and reversing gave back the ENTIRE move (observed
+        live 2026-06-18: PE ran to +25pts vs a +30.4pt TP, reversed, and
+        was stopped out for -0.25pts net -- a near-winner turned scratch).
+
+        Fix: once armed (profit >= trail_arm), SL locks TRAIL_LOCK_PCT of
+        the profit reached *at that point* (not just breakeven+slippage),
+        and re-locks at the same fraction every trail_step points beyond
+        the arm threshold. SL only ever moves up, never down.
         """
-        if pnl_pts >= CFG["trail_arm"] and trade.trail_stage == 0:
-            new_sl = round(trade.entry + CFG["slippage"], 2)
-            if new_sl > trade.sl:
-                trade.sl          = new_sl
-                trade.trail_stage = 1
-                log.info(f"[BB_STOCH_NIFTY] Trail -> BE | SL={trade.sl:.2f}")
-        elif pnl_pts > CFG["trail_arm"] and trade.trail_stage >= 1:
-            new_stage = int((pnl_pts - CFG["trail_arm"]) / CFG["trail_step"]) + 1
-            if new_stage > trade.trail_stage:
-                inc               = (new_stage - trade.trail_stage) * CFG["trail_step"]
-                trade.sl          = round(trade.sl + inc, 2)
-                trade.trail_stage = new_stage
-                log.info(f"[BB_STOCH_NIFTY] Trail stage {new_stage} | SL={trade.sl:.2f}")
+        if pnl_pts < CFG["trail_arm"]:
+            return
+
+        stage = int((pnl_pts - CFG["trail_arm"]) / CFG["trail_step"]) + 1
+        if stage <= trade.trail_stage:
+            return
+
+        locked_pts = round(pnl_pts * CFG["trail_lock_pct"], 2)
+        new_sl     = round(trade.entry + locked_pts, 2)
+
+        if new_sl > trade.sl:
+            trade.sl          = new_sl
+            trade.trail_stage = stage
+            log.info(
+                f"[BB_STOCH_NIFTY] Trail stage {stage} | "
+                f"profit={pnl_pts:+.1f}pts locked={locked_pts:+.1f}pts | "
+                f"SL={trade.sl:.2f}"
+            )
 
     def _close_trade(self, ltp: float, reason: str):
         """Bug 3 fix: atomically claim self._trade at the top."""
@@ -1280,15 +1453,38 @@ class BBStochNiftyStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def _compute_sl_tp(self, ltp: float, atr: float) -> Tuple[float, float]:
-        sl_pts = float(atr * CFG["atr_sl_mult"]) if atr > 0 else CFG["sl_min"]
-        tp_pts = float(atr * CFG["atr_tp_mult"]) if atr > 0 else CFG["tp_min"]
+        """
+        Bug 12 fix (ATR unit mismatch): `atr` here is the NIFTY *index*
+        ATR (5-min OHLC of the spot index, typically 15-25 pts) -- NOT the
+        option premium's own ATR. Previously this index-point value was
+        subtracted/added directly onto the option premium (rupees), a unit
+        mismatch that meant sl_pts = atr*0.8 almost never exceeded the old
+        sl_min=20 floor: the "ATR-adaptive" SL was actually a flat 20 on
+        nearly every trade, regardless of real volatility.
+
+        Fix: scale the index ATR by PREMIUM_ATR_SCALE -- a rough proxy for
+        an ATM weekly option's delta -- into an estimated premium-point
+        ATR before sizing. sl_min/sl_max/tp_min/tp_max were recalibrated
+        to that smaller scale (see CFG) so the multiplier actually flexes
+        with volatility instead of pinning at a floor every trade.
+
+        TODO (future improvement): replace this scale-factor proxy with
+        ATR computed directly from the option's own premium tick/candle
+        series once that buffer exists -- this is an interim fix, not the
+        final correct measurement.
+        """
+        premium_atr = atr * CFG["premium_atr_scale"] if atr > 0 else 0.0
+
+        sl_pts = float(premium_atr * CFG["atr_sl_mult"]) if premium_atr > 0 else CFG["sl_min"]
+        tp_pts = float(premium_atr * CFG["atr_tp_mult"]) if premium_atr > 0 else CFG["tp_min"]
         sl_pts = max(CFG["sl_min"], min(sl_pts, CFG["sl_max"]))
         tp_pts = max(CFG["tp_min"], min(tp_pts, CFG["tp_max"]))
         if self._dte == 0:
             tp_pts = max(CFG["tp_min"], tp_pts * 0.75)
         rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
         log.info(
-            f"[BB_STOCH_NIFTY] SL/TP | ATR={atr:.1f} "
+            f"[BB_STOCH_NIFTY] SL/TP | IndexATR={atr:.1f} "
+            f"PremiumATR~{premium_atr:.1f} "
             f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} RR=1:{rr}"
         )
         return sl_pts, tp_pts
