@@ -89,7 +89,17 @@ ISOLATION
 CSV LOG
   nifty_fut_directional_trades.csv
   Columns: timestamp, direction, action, futures_sym, futures_token,
-           index_price, entry_price, sl, pnl, reason, mode, vix, pcr, order_id
+           index_price, entry_price, exit_price, sl, pnl, reason, mode, vix, pcr, order_id
+
+CHANGES vs original
+  Fix 1 : Mode B breakout on next bar after consolidation (not during zone build)
+  Fix 2 : SHORT fully implemented — _place_sell() entry, _place_buy() close
+  Fix 3 : Per-candle DEBUG logging of each Mode A condition result
+  Fix 4 : RSI range widened to 50-72 (LONG) and 28-50 (SHORT)
+  Fix 5 : PCR gate relaxed: LONG >= 0.70, SHORT <= 1.30
+  Fix 6 : Mode B cutoff extended from 11:00 to 11:30 AM
+  Fix 7 : Mode B max consolidation bars raised from 4 to 6
+  Fix 8 : Pullback: 3-bar lookback + EMA9 +/-0.1% tolerance; buffer min ema_slow+2
 """
 
 import csv
@@ -135,7 +145,7 @@ CFG = {
     "mode_a_window2_start"    : dtime(13, 15),
     "mode_a_window2_end"      : dtime(14, 15),
     "mode_b_start"            : dtime(9, 15),
-    "mode_b_cutoff"           : dtime(11, 0),
+    "mode_b_cutoff"           : dtime(11, 30),  # FIX 6: extended from 11:00
     "entry_cutoff"            : dtime(14, 30),
     "hard_exit_time"          : dtime(15, 0),
 
@@ -145,7 +155,7 @@ CFG = {
     "mode_b_range_trigger"    : 80,      # first-15-min range > 80 pts → Mode B
     "mode_b_consol_range"     : 80,      # consolidation bar range must be < this
     "mode_b_consol_min_bars"  : 2,       # min bars needed before breakout check
-    "mode_b_consol_max_bars"  : 4,       # consolidation expires after this many bars
+    "mode_b_consol_max_bars"  : 6,       # FIX 7: raised from 4
 
     # ── Indicators ────────────────────────────────────────────────────────────
     "ema_fast"                : 9,
@@ -155,12 +165,18 @@ CFG = {
     "buf_size"                : 120,
 
     # ── Mode A filters ────────────────────────────────────────────────────────
-    "rsi_long_min"            : 55,
-    "rsi_long_max"            : 68,
-    "rsi_short_min"           : 32,
-    "rsi_short_max"           : 45,
-    "pcr_min_long"            : 0.80,
-    "pcr_max_short"           : 1.20,
+    # FIX 4: widened RSI ranges (was 55-68 / 32-45)
+    "rsi_long_min"            : 50,
+    "rsi_long_max"            : 72,
+    "rsi_short_min"           : 28,
+    "rsi_short_max"           : 50,
+    # FIX 5: relaxed PCR gates (was 0.80 / 1.20)
+    "pcr_min_long"            : 0.70,
+    "pcr_max_short"           : 1.30,
+
+    # ── Mode A pullback tolerance ─────────────────────────────────────────────
+    # FIX 8: 0.1% tolerance so near-touches count; 3-bar lookback
+    "pullback_ema_tolerance"  : 0.001,
 
     # ── SL / Trail (index points) ─────────────────────────────────────────────
     "sl_pts"                  : 30,      # SL distance from entry in index points
@@ -309,6 +325,8 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
         self._mb_consol_high  : Optional[float] = None
         self._mb_consol_low   : Optional[float] = None
         self._mb_consol_bars  : int             = 0
+        # FIX 1: arm flag — when True the NEXT candle is the breakout candidate
+        self._mb_consol_ready : bool            = False
 
         # ── Trade state ───────────────────────────────────────────────────────
         self._trade           = None
@@ -603,14 +621,20 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
         if not in_window:
             return
 
-        if len(self._buf) < CFG["ema_slow"] + 5:
+        # FIX 8/3: lowered warm-up min from +5 to +2; log when not ready
+        min_bars = CFG["ema_slow"] + 2
+        if len(self._buf) < min_bars:
+            log.debug(
+                f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} buffer not warm: "
+                f"{len(self._buf)}/{min_bars} bars"
+            )
             return
 
         ind = self._compute_indicators()
         if not ind:
             return
 
-        direction = self._mode_a_signal(ind, candle)
+        direction = self._mode_a_signal(ind, candle, ts)  # FIX 3: pass ts
         if not direction:
             return
 
@@ -641,34 +665,64 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         self._enter(direction, candle["close"], ts, reason="mode_a_pullback")
 
-    def _mode_a_signal(self, ind: dict, candle: dict) -> Optional[str]:
-        """Returns 'LONG', 'SHORT', or None. All 4 filters must pass."""
+    def _mode_a_signal(self, ind: dict, candle: dict, ts: datetime) -> Optional[str]:
+        """
+        Returns 'LONG', 'SHORT', or None. All 4 filters must pass.
+        FIX 3: logs each condition at DEBUG level for diagnosability.
+        FIX 4: RSI range widened (50-72 / 28-50).
+        FIX 8: 3-bar lookback + EMA9 ±0.1% tolerance for pullback.
+        """
         e9, e20, e50 = ind["ema9"], ind["ema20"], ind["ema50"]
         rsi   = ind["rsi"]
         vwap  = ind["vwap"]
         close = candle["close"]
+        tol   = CFG["pullback_ema_tolerance"]
 
-        # Previous 2 candles for pullback check
-        prev_two = list(self._buf)[-3:-1] if len(self._buf) >= 3 else []
+        # FIX 8: 3-bar lookback (was 2)
+        prev_three = list(self._buf)[-4:-1] if len(self._buf) >= 4 else list(self._buf)[:-1]
 
         # ── LONG ─────────────────────────────────────────────────────────────
-        if (
-            e9 > e20 > e50 and
-            CFG["rsi_long_min"] <= rsi <= CFG["rsi_long_max"] and
-            (vwap is None or close > vwap) and
-            any(c["low"] <= e9 for c in prev_two) and
+        ema_stack_long = e9 > e20 > e50
+        rsi_ok_long    = CFG["rsi_long_min"] <= rsi <= CFG["rsi_long_max"]
+        vwap_ok_long   = (vwap is None) or (close > vwap)
+        # FIX 8: low <= EMA9*(1+tol) catches near-touches
+        pullback_long  = (
+            any(c["low"] <= e9 * (1 + tol) for c in prev_three) and
             close > e9
-        ):
+        )
+
+        log.debug(
+            f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} LONG | "
+            f"EMA={'✓' if ema_stack_long else '✗'}({e9:.0f}>{e20:.0f}>{e50:.0f}) "
+            f"RSI={'✓' if rsi_ok_long else '✗'}({rsi:.1f} in "
+            f"[{CFG['rsi_long_min']}-{CFG['rsi_long_max']}]) "
+            f"VWAP={'✓' if vwap_ok_long else '✗'} "
+            f"Pullback={'✓' if pullback_long else '✗'}"
+        )
+
+        if ema_stack_long and rsi_ok_long and vwap_ok_long and pullback_long:
             return "LONG"
 
         # ── SHORT ────────────────────────────────────────────────────────────
-        if (
-            e9 < e20 < e50 and
-            CFG["rsi_short_min"] <= rsi <= CFG["rsi_short_max"] and
-            (vwap is None or close < vwap) and
-            any(c["high"] >= e9 for c in prev_two) and
+        ema_stack_short = e9 < e20 < e50
+        rsi_ok_short    = CFG["rsi_short_min"] <= rsi <= CFG["rsi_short_max"]
+        vwap_ok_short   = (vwap is None) or (close < vwap)
+        # FIX 8: high >= EMA9*(1-tol)
+        pullback_short  = (
+            any(c["high"] >= e9 * (1 - tol) for c in prev_three) and
             close < e9
-        ):
+        )
+
+        log.debug(
+            f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} SHORT | "
+            f"EMA={'✓' if ema_stack_short else '✗'}({e9:.0f}<{e20:.0f}<{e50:.0f}) "
+            f"RSI={'✓' if rsi_ok_short else '✗'}({rsi:.1f} in "
+            f"[{CFG['rsi_short_min']}-{CFG['rsi_short_max']}]) "
+            f"VWAP={'✓' if vwap_ok_short else '✗'} "
+            f"Pullback={'✓' if pullback_short else '✗'}"
+        )
+
+        if ema_stack_short and rsi_ok_short and vwap_ok_short and pullback_short:
             return "SHORT"
 
         return None
@@ -676,6 +730,15 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
     # ── Mode B: momentum / gap-and-go consolidation breakout ─────────────────
 
     def _check_mode_b(self, candle: dict, ts: datetime):
+        """
+        FIX 1: Breakout is checked on the bar AFTER the consolidation is
+        complete (_mb_consol_ready=True), not on the bar that expands the zone.
+        This fixes the impossible condition of close > zone_high while the
+        zone is still being built from the current candle's high.
+
+        FIX 6: Window extended to 11:30 AM.
+        FIX 7: max_bars raised to 6.
+        """
         t = ts.time()
         if not (CFG["mode_b_start"] <= t < CFG["mode_b_cutoff"]):
             return
@@ -686,13 +749,52 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         bar_range = candle["high"] - candle["low"]
 
+        # ── FIX 1: Check breakout FIRST if consolidation is armed ─────────────
+        # _mb_consol_ready is set True once min_bars are formed. The current
+        # candle is the FIRST candle after the consolidation window closed.
+        if self._mb_consol_ready:
+            triggered = False
+            if direction == "LONG" and candle["close"] > self._mb_consol_high:
+                log.info(
+                    f"[{self.name}] [ModeB] Breakout LONG @ {ts.strftime('%H:%M')} | "
+                    f"close={candle['close']:.0f} > zone_H={self._mb_consol_high:.0f} "
+                    f"(consol_bars={self._mb_consol_bars})"
+                )
+                triggered = True
+            elif direction == "SHORT" and candle["close"] < self._mb_consol_low:
+                log.info(
+                    f"[{self.name}] [ModeB] Breakout SHORT @ {ts.strftime('%H:%M')} | "
+                    f"close={candle['close']:.0f} < zone_L={self._mb_consol_low:.0f} "
+                    f"(consol_bars={self._mb_consol_bars})"
+                )
+                triggered = True
+
+            # Always reset — one breakout attempt per consolidation window.
+            # If it failed (price didn't break), go back to WATCHING.
+            self._mb_consol_ready = False
+            self._mb_state = "WATCHING"
+
+            if triggered:
+                self._enter(direction, candle["close"], ts,
+                            reason=f"mode_b_consol_breakout_{direction.lower()}")
+            else:
+                log.info(
+                    f"[{self.name}] [ModeB] Breakout attempt failed @ "
+                    f"{ts.strftime('%H:%M')} | "
+                    f"close={candle['close']:.0f} "
+                    f"zone=[{self._mb_consol_low:.0f}–{self._mb_consol_high:.0f}] "
+                    f"— re-watching"
+                )
+            return
+
         # ── WATCHING: wait for a tight consolidation bar ──────────────────────
         if self._mb_state == "WATCHING":
             if bar_range < CFG["mode_b_consol_range"]:
-                self._mb_state       = "CONSOL"
-                self._mb_consol_high = candle["high"]
-                self._mb_consol_low  = candle["low"]
-                self._mb_consol_bars = 1
+                self._mb_state        = "CONSOL"
+                self._mb_consol_high  = candle["high"]
+                self._mb_consol_low   = candle["low"]
+                self._mb_consol_bars  = 1
+                self._mb_consol_ready = False
                 log.info(
                     f"[{self.name}] [ModeB] Consolidation start @ "
                     f"{ts.strftime('%H:%M')} | "
@@ -704,7 +806,7 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
         # ── CONSOLIDATING ─────────────────────────────────────────────────────
         if self._mb_state == "CONSOL":
             if bar_range < CFG["mode_b_consol_range"]:
-                # Expand zone
+                # Expand zone with this bar
                 self._mb_consol_high = max(self._mb_consol_high, candle["high"])
                 self._mb_consol_low  = min(self._mb_consol_low,  candle["low"])
                 self._mb_consol_bars += 1
@@ -715,75 +817,81 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
                 )
 
                 if self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
+                    # Min bars met — arm the breakout check for the NEXT candle.
+                    # We arm immediately on meeting min_bars (not max_bars) so we
+                    # don't miss a fast breakout, while still checking on next bar.
+                    self._mb_consol_ready = True
+                    log.info(
+                        f"[{self.name}] [ModeB] Min bars met "
+                        f"({self._mb_consol_bars}/{CFG['mode_b_consol_min_bars']}) — "
+                        f"armed for breakout on next candle | "
+                        f"zone=[{self._mb_consol_low:.0f}–{self._mb_consol_high:.0f}]"
+                    )
+
+                if self._mb_consol_bars >= CFG["mode_b_consol_max_bars"]:
+                    # Hit max bars — stay armed (already set above if >= min_bars)
+                    # and stop accepting more consolidation bars.
+                    log.info(
+                        f"[{self.name}] [ModeB] Max bars reached "
+                        f"({self._mb_consol_bars}) — "
+                        f"waiting for breakout candle"
+                    )
+                    self._mb_state = "WATCHING"   # next bar evaluated via ready flag
+
+            else:
+                # Wide bar broke the consolidation zone.
+                if self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
+                    # This wide bar itself could be the breakout candle — check now.
+                    # This is valid because the zone was already fully formed
+                    # on the previous bars; this bar came AFTER.
+                    triggered = False
                     if direction == "LONG" and candle["close"] > self._mb_consol_high:
                         log.info(
-                            f"[{self.name}] [ModeB] Breakout LONG @ "
+                            f"[{self.name}] [ModeB] Breakout LONG (wide bar) @ "
                             f"{ts.strftime('%H:%M')} | "
                             f"close={candle['close']:.0f} > "
                             f"zone_H={self._mb_consol_high:.0f}"
                         )
-                        self._mb_state = "WATCHING"
-                        self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_consol_breakout_long")
-                        return
-
-                    if direction == "SHORT" and candle["close"] < self._mb_consol_low:
+                        triggered = True
+                    elif direction == "SHORT" and candle["close"] < self._mb_consol_low:
                         log.info(
-                            f"[{self.name}] [ModeB] Breakout SHORT @ "
+                            f"[{self.name}] [ModeB] Breakout SHORT (wide bar) @ "
                             f"{ts.strftime('%H:%M')} | "
                             f"close={candle['close']:.0f} < "
                             f"zone_L={self._mb_consol_low:.0f}"
                         )
-                        self._mb_state = "WATCHING"
+                        triggered = True
+
+                    self._mb_state        = "WATCHING"
+                    self._mb_consol_ready = False
+
+                    if triggered:
                         self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_consol_breakout_short")
-                        return
-
-                # Tight bars exceeded max — zone too wide, reset and re-seek
-                if self._mb_consol_bars >= CFG["mode_b_consol_max_bars"]:
-                    log.info(
-                        f"[{self.name}] [ModeB] Consolidation expired (tight) after "
-                        f"{self._mb_consol_bars} bars — reset"
-                    )
-                    self._mb_state = "WATCHING"
-
-            else:
-                # Wide bar — check for breakout first before resetting
-                if self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
-                    if direction == "LONG" and candle["close"] > self._mb_consol_high:
+                                    reason=f"mode_b_wide_breakout_{direction.lower()}")
+                    else:
                         log.info(
-                            f"[{self.name}] [ModeB] Breakout LONG (wide bar) @ "
-                            f"{ts.strftime('%H:%M')}"
+                            f"[{self.name}] [ModeB] Wide bar broke zone without "
+                            f"breakout @ {ts.strftime('%H:%M')} — resetting"
                         )
-                        self._mb_state = "WATCHING"
-                        self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_wide_bar_breakout_long")
-                        return
-                    if direction == "SHORT" and candle["close"] < self._mb_consol_low:
-                        log.info(
-                            f"[{self.name}] [ModeB] Breakout SHORT (wide bar) @ "
-                            f"{ts.strftime('%H:%M')}"
-                        )
-                        self._mb_state = "WATCHING"
-                        self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_wide_bar_breakout_short")
-                        return
-
-                # Consolidation expired if too many bars
-                if self._mb_consol_bars >= CFG["mode_b_consol_max_bars"]:
+                else:
+                    # Not enough bars formed — reset entirely
                     log.info(
-                        f"[{self.name}] [ModeB] Consolidation expired "
-                        f"({self._mb_consol_bars} bars) — reset"
+                        f"[{self.name}] [ModeB] Early wide bar "
+                        f"({self._mb_consol_bars} bars < "
+                        f"{CFG['mode_b_consol_min_bars']} min) — resetting"
                     )
-                self._mb_state = "WATCHING"
+                    self._mb_state        = "WATCHING"
+                    self._mb_consol_ready = False
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
     def _enter(self, direction: str, index_price: float, ts: datetime, reason: str):
         """
-        Place a futures BUY (LONG) order.
-        SHORT direction is logged but not executed — futures short MIS support
-        is planned for next version (requires margin and order-type verification).
+        Place a futures LONG or SHORT entry order.
+        FIX 2: SHORT is now fully implemented. Both directions use MIS product.
+          LONG  entry : _place_buy()  → buy futures
+          SHORT entry : _place_sell() → sell futures (short MIS, allowed on NSE)
+        SL is placed above entry for SHORT, below for LONG.
         """
         with self._lock:
             if self._trade and self._trade["state"] == "OPEN":
@@ -792,32 +900,6 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
                 return
             if self._day_paused:
                 return
-
-        # SHORT: log and skip (not yet implemented)
-        if direction == "SHORT":
-            log.info(
-                f"[{self.name}] SHORT signal at {ts.strftime('%H:%M')} "
-                f"index={index_price:.2f} — SHORT EXECUTION NOT YET ACTIVE "
-                f"(signal logged, no order placed)"
-            )
-            _csv_append({
-                "timestamp"    : ts.strftime("%Y-%m-%d %H:%M:%S"),
-                "direction"    : "SHORT",
-                "action"       : "SIGNAL_SKIPPED",
-                "futures_sym"  : self._fut_sym or "",
-                "futures_token": self._fut_token or "",
-                "index_price"  : round(index_price, 2),
-                "entry_price"  : "",
-                "exit_price"   : "",
-                "sl"           : "",
-                "pnl"          : "",
-                "reason"       : reason + "_short_not_implemented",
-                "mode"         : self._mode,
-                "vix"          : self._vix,
-                "pcr"          : self._pm.pcr if self._pm else "",
-                "order_id"     : "",
-            })
-            return
 
         # Get current futures LTP
         fut_ltp = self.get_price(self._fut_token)
@@ -828,28 +910,43 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
             )
             return
 
-        # Acquire slot
+        # Acquire global live-trade slot
         if not self._acquire_slot():
             log.warning(f"[{self.name}] Trade slot blocked")
             return
 
-        # Place BUY
-        result = self._place_buy(self._fut_sym, self._fut_token, CFG["quantity"], fut_ltp)
+        # ── Place order based on direction ────────────────────────────────────
+        if direction == "LONG":
+            result = self._place_buy(
+                self._fut_sym, self._fut_token, CFG["quantity"], fut_ltp
+            )
+        else:  # SHORT — sell futures MIS (FIX 2)
+            result = self._place_sell(
+                self._fut_sym, self._fut_token, CFG["quantity"], fut_ltp
+            )
+
         if result is None:
             self._release_slot()
-            log.error(f"[{self.name}] BUY FAILED for {self._fut_sym}")
+            log.error(
+                f"[{self.name}] {direction} ORDER FAILED for {self._fut_sym}"
+            )
             return
 
         order_id, fill_price = result
 
-        sl             = fill_price - CFG["sl_pts"]   # LONG SL below entry
+        # ── SL: below entry for LONG, above entry for SHORT ───────────────────
+        if direction == "LONG":
+            sl = fill_price - CFG["sl_pts"]
+        else:
+            sl = fill_price + CFG["sl_pts"]
+
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
         mode_tag       = "LIVE" if LIVE_MODE else "PAPER"
 
         with self._lock:
             self._trade = {
                 "state"          : "OPEN",
-                "direction"      : "LONG",
+                "direction"      : direction,
                 "entry"          : fill_price,
                 "sl"             : sl,
                 "peak_pnl"       : 0.0,
@@ -865,10 +962,11 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
             }
             self._trades_taken += 1
 
+        sl_desc = f"−{CFG['sl_pts']}pts" if direction == "LONG" else f"+{CFG['sl_pts']}pts"
         log.info(
-            f"[{self.name}] [{mode_tag}] LONG ENTRY #{self._trades_taken} | "
+            f"[{self.name}] [{mode_tag}] {direction} ENTRY #{self._trades_taken} | "
             f"{self._fut_sym} @ {fill_price:.2f} | "
-            f"SL={sl:.2f} (−{CFG['sl_pts']}pts) | "
+            f"SL={sl:.2f} ({sl_desc}) | "
             f"Trail1@+{CFG['trail1_trigger_pts']}pts "
             f"Trail2@+{CFG['trail2_start_pts']}pts | "
             f"mode={self._mode} reason={reason} | "
@@ -877,7 +975,7 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         _csv_append({
             "timestamp"    : ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "direction"    : "LONG",
+            "direction"    : direction,
             "action"       : "ENTRY",
             "futures_sym"  : self._fut_sym,
             "futures_token": self._fut_token,
@@ -903,14 +1001,22 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
         with self._lock:
             t["state"] = "CLOSED"
 
-        result = self._place_sell_with_retry(
-            self._fut_sym, self._fut_token, t["qty"], fut_price, max_retries=3
-        )
+        direction = t["direction"]
+
+        # For LONG: sell to close. For SHORT: buy to close.
+        if direction == "LONG":
+            result = self._place_sell_with_retry(
+                self._fut_sym, self._fut_token, t["qty"], fut_price, max_retries=3
+            )
+        else:  # SHORT — buy back to close (FIX 2)
+            result = self._place_buy(
+                self._fut_sym, self._fut_token, t["qty"], fut_price
+            )
 
         if result is None:
             if LIVE_MODE:
                 log.error(
-                    f"[{self.name}] SELL FAILED for {self._fut_sym} — "
+                    f"[{self.name}] CLOSE FAILED for {self._fut_sym} [{direction}] — "
                     f"SQUARE OFF MANUALLY IN ZERODHA!"
                 )
             sell_price = fut_price
@@ -920,12 +1026,17 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         self._release_slot()
 
-        pnl = (sell_price - t["entry"]) * t["qty"]
+        # PnL: LONG profits when price rises; SHORT profits when price falls
+        if direction == "LONG":
+            pnl = (sell_price - t["entry"]) * t["qty"]
+        else:
+            pnl = (t["entry"] - sell_price) * t["qty"]
+
         self._today_pnl += pnl
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
 
         log.info(
-            f"[{self.name}] [{mode_tag}] LONG EXIT #{self._trades_taken} | "
+            f"[{self.name}] [{mode_tag}] {direction} EXIT #{self._trades_taken} | "
             f"[{reason}] {self._fut_sym} @ {sell_price:.2f} | "
             f"entry={t['entry']:.2f} "
             f"PnL={pnl:+.0f} ({pnl / t['qty']:+.1f}/unit) | "
@@ -934,7 +1045,7 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         _csv_append({
             "timestamp"    : ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "direction"    : "LONG",
+            "direction"    : direction,
             "action"       : "EXIT",
             "futures_sym"  : self._fut_sym,
             "futures_token": self._fut_token,
@@ -960,7 +1071,8 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
     # ── Indicators ────────────────────────────────────────────────────────────
 
     def _compute_indicators(self) -> Optional[dict]:
-        if len(self._buf) < CFG["ema_slow"] + 5:
+        # FIX 8: lowered from ema_slow+5 to ema_slow+2
+        if len(self._buf) < CFG["ema_slow"] + 2:
             return None
 
         df    = pd.DataFrame(list(self._buf))
@@ -1024,4 +1136,5 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         log.info(f"[{self.name}] Today PnL     : {self._today_pnl:+.0f}")
         log.info(f"[{self.name}] {'═'*55}\n")
+
 
