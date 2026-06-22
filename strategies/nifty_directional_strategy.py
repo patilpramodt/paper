@@ -29,31 +29,31 @@ MODE A — NORMAL TRENDING DAY
   Filters (all must pass):
     1. EMA stack  : EMA9 > EMA20 > EMA50 (CE)  or  EMA9 < EMA20 < EMA50 (PE)
     2. VWAP side  : price above VWAP (CE) or below VWAP (PE)
-    3. RSI(14)    : 55–68 (CE) or 32–45 (PE)   — avoids overbought/oversold entries
-    4. Pullback   : at least one of the last 2 candle lows ≤ EMA9 (CE)
-                    or one of the last 2 candle highs ≥ EMA9 (PE)
+    3. RSI(14)    : 50–72 (CE) or 28–50 (PE)   — widened from 55-68/32-45
+    4. Pullback   : at least one of the last 3 candle lows ≤ EMA9*1.001 (CE)
+                    or one of the last 3 candle highs ≥ EMA9*0.999 (PE)
                     AND current candle resumed direction (close > EMA9 for CE)
-    5. PCR gate   : if available, CE needs PCR ≥ PCR_MIN (0.8),
-                                  PE needs PCR ≤ PCR_MAX (1.2)
+    5. PCR gate   : if available, CE needs PCR ≥ PCR_MIN (0.70),
+                                  PE needs PCR ≤ PCR_MAX (1.30)
   On valid signal: enter ATM call/put, current weekly expiry.
 
 MODE B — MOMENTUM / EXPIRY / GAP-AND-GO DAY
-  Entry window  : 9:15–11:00 AM
-  Hard cutoff   : no new entries after 11:00 AM in Mode B
+  Entry window  : 9:15–11:30 AM  (extended from 11:00)
+  Hard cutoff   : no new entries after 11:30 AM in Mode B
   Logic:
     After initial spike direction is detected (gap or strong first bar),
-    wait for a micro-consolidation: 2–4 consecutive 5-min candles whose
+    wait for a micro-consolidation: 2–6 consecutive 5-min candles whose
     H-L range stays below MODE_B_CONSOL_RANGE (80) pts.
-    Entry trigger: next candle closes above consolidation high (CE) or
-                   below consolidation low (PE).
+    Entry trigger: NEXT candle (after consolidation is complete) closes
+                   above consolidation high (CE) or below consolidation
+                   low (PE). Breakout is checked on the bar AFTER the
+                   consolidation window is formed, not during it.
     IV guard: if VIX > VIX_SKIP_THRESH (18), skip Mode B entries
-              (IV is too expensive at spike peak).
+              (IV is too expensive at spike peak)
   On valid signal: enter ATM call/put.
 
 STRIKE SELECTION
   Default: ATM strike (rounded to nearest 50-pt multiple).
-  1 OTM only when MODE_B_CONSOL entry and score is marginal — currently
-  always ATM for simplicity (easier to review in paper mode).
 
 TRADE MANAGEMENT  (option premium based, tick-by-tick via on_option_tick)
   SL      : fill_price × (1 − SL_PCT)  i.e. 30 % of premium paid
@@ -62,19 +62,14 @@ TRADE MANAGEMENT  (option premium based, tick-by-tick via on_option_tick)
   Hard exit: 3:00 PM regardless of position
   Max trades: 2 per day
 
-CANONICAL PATTERNS (t.py integration)
-  • INDEX_TOKEN = 256265  → t.py routes nifty_pm + nifty_instruments via
-                            the `if strat_index == 256265` branch.
-  • hub.add_index_token(256265) already called in t.py — no change needed.
-  • hub.backfill(hub.kite, index_token=256265) already called — warms up
-    _buf_5m so EMA/RSI are seeded from historical candles at start.
-  • Logger name "strategy.nifty_directional" must be added to t.py _STRAT dict.
-
-ISOLATION GUARANTEE
-  This strategy shares zero mutable state with any other strategy.
-  All reads from PreMarketData are via self._pm (live reference — same
-  PCR-caching fix applied to ORB_v2). No BankNifty state is touched.
-  Other strategies are completely unaffected.
+CHANGES vs original
+  Fix 1 : Mode B breakout checked on next bar after consolidation, not during
+  Fix 3 : Per-candle DEBUG logging of each Mode A condition result
+  Fix 4 : RSI range widened to 50-72 (CE) and 28-50 (PE)
+  Fix 5 : PCR CE gate lowered to 0.70, PE gate raised to 1.30
+  Fix 6 : Mode B cutoff extended from 11:00 to 11:30 AM
+  Fix 7 : Mode B max consolidation bars raised from 4 to 6
+  Fix 8 : Pullback check relaxed: 3-bar lookback + EMA9 ±0.1% tolerance
 """
 
 import csv
@@ -103,7 +98,6 @@ def _now_ist() -> datetime:
 # ─────────────────────────────────────────────────────────────────────────────
 #  LIVE MODE FLAG
 #  Change to True only when you want real orders.
-#  All other strategies remain in paper mode until their own flag is changed.
 # ─────────────────────────────────────────────────────────────────────────────
 LIVE_MODE = False
 
@@ -127,7 +121,7 @@ CFG = {
     "mode_a_window2_start"    : dtime(13, 15),
     "mode_a_window2_end"      : dtime(14, 15),
     "mode_b_start"            : dtime(9, 15),
-    "mode_b_cutoff"           : dtime(11, 0),
+    "mode_b_cutoff"           : dtime(11, 30),   # FIX 6: extended from 11:00
     "entry_cutoff"            : dtime(14, 30),   # hard: no new entries after this
     "hard_exit_time"          : dtime(15, 0),
 
@@ -136,8 +130,8 @@ CFG = {
     "mode_b_gap_pct_expiry"   : 0.002,    # > 0.2 % gap on expiry day
     "mode_b_range_trigger"    : 80,       # first-15-min OR range > 80 pts → Mode B
     "mode_b_consol_range"     : 80,       # consolidation must be tighter than this
-    "mode_b_consol_min_bars"  : 2,        # min bars in consolidation
-    "mode_b_consol_max_bars"  : 4,        # max bars before consolidation expires
+    "mode_b_consol_min_bars"  : 2,        # min bars to form a valid consolidation
+    "mode_b_consol_max_bars"  : 6,        # FIX 7: raised from 4 — more time to form
 
     # ── Indicator settings ────────────────────────────────────────────────────
     "ema_fast"                : 9,
@@ -147,12 +141,18 @@ CFG = {
     "buf_size"                : 100,      # rolling 5-min candle buffer
 
     # ── Mode A signal filters ─────────────────────────────────────────────────
-    "rsi_ce_min"              : 55,       # RSI must be in this range for CE
-    "rsi_ce_max"              : 68,       # avoid overbought entries
-    "rsi_pe_min"              : 32,       # avoid oversold entries for PE
-    "rsi_pe_max"              : 45,
-    "pcr_min_ce"              : 0.80,     # PCR must be ≥ this for CE (bullish OI skew)
-    "pcr_max_pe"              : 1.20,     # PCR must be ≤ this for PE (bearish OI skew)
+    # FIX 4: widened RSI ranges (was 55-68 / 32-45)
+    "rsi_ce_min"              : 50,       # RSI must be in this range for CE
+    "rsi_ce_max"              : 72,
+    "rsi_pe_min"              : 28,
+    "rsi_pe_max"              : 50,
+    # FIX 5: relaxed PCR gate (was 0.80 / 1.20)
+    "pcr_min_ce"              : 0.70,     # PCR must be ≥ this for CE
+    "pcr_max_pe"              : 1.30,     # PCR must be ≤ this for PE
+
+    # ── Mode A pullback tolerance ─────────────────────────────────────────────
+    # FIX 8: 0.1% EMA tolerance so near-touches count
+    "pullback_ema_tolerance"  : 0.001,    # low <= EMA9 * (1 + tol) counts as pullback
 
     # ── Mode B IV guard ───────────────────────────────────────────────────────
     "vix_skip_thresh"         : 18.0,     # skip Mode B entries when VIX > this
@@ -167,8 +167,6 @@ CFG = {
     "csv_file"                : "nifty_directional_trades.csv",
 
     # ── SL grace period after BUY confirm ────────────────────────────────────
-    # Prevents stale WebSocket ticks (buffered during _confirm_order poll)
-    # from immediately triggering a false SL exit right after entry.
     "sl_grace_seconds"        : 10,
 }
 
@@ -190,21 +188,12 @@ class NiftyDirectionalStrategy(BaseStrategy):
     def __init__(self, market_hub):
         super().__init__(market_hub)
 
-        # ── Internal 5-min candle builder (Nifty strategies build their own) ──
-        # MarketHub does NOT call on_candle() for extra-index strategies.
-        # on_tick() feeds price into this builder; when a bar closes it calls
-        # _process_candle() — mirrors the BBStochNifty pattern exactly.
         self._candle_builder = CandleBuilder(minutes=5)
-
-        # ── Candle buffer for indicator computation ───────────────────────────
         self._buf: deque = deque(maxlen=CFG["buf_size"])
-
-        # ── Internal Nifty VWAP ───────────────────────────────────────────────
-        # MarketHub's session_vwap tracks BankNifty prices — useless here.
         self._vwap = SessionVWAP()
 
         # ── Pre-market data ───────────────────────────────────────────────────
-        self._pm            = None       # live reference (for live PCR reads)
+        self._pm            = None
         self._vix           = None
         self._prev_close    = None
         self._ema200        = None
@@ -219,19 +208,23 @@ class NiftyDirectionalStrategy(BaseStrategy):
         self._pre_pe_sym    : Optional[str] = None
 
         # ── Mode detection state ──────────────────────────────────────────────
-        self._mode               : Optional[str] = None   # "A" or "B"
+        self._mode               : Optional[str] = None
         self._open_price         : Optional[float] = None
         self._or_high            : Optional[float] = None
         self._or_low             : Optional[float] = None
         self._mode_finalised     : bool = False
-        self._spike_direction    : Optional[str] = None   # "CE" or "PE" from gap
+        self._spike_direction    : Optional[str] = None
 
         # ── Mode B consolidation tracking ─────────────────────────────────────
-        # State machine: WATCHING → CONSOLIDATING → triggered (entry) / EXPIRED
-        self._mb_state           : str = "WATCHING"   # "WATCHING", "CONSOL"
+        # FIX 1: added _mb_consol_ready flag.
+        # When True, the consolidation is complete and the NEXT candle is the
+        # breakout candidate. This prevents checking close > zone_high on the
+        # same bar that just expanded the zone.
+        self._mb_state           : str = "WATCHING"
         self._mb_consol_high     : Optional[float] = None
         self._mb_consol_low      : Optional[float] = None
         self._mb_consol_bars     : int = 0
+        self._mb_consol_ready    : bool = False   # FIX 1: breakout arm flag
 
         # ── Trade state ───────────────────────────────────────────────────────
         self._trade              = None
@@ -253,13 +246,8 @@ class NiftyDirectionalStrategy(BaseStrategy):
     # ── Pre-market ────────────────────────────────────────────────────────────
 
     def pre_market(self, pm, instruments) -> bool:
-        """
-        Called from t.py with nifty_pm and nifty_instruments (INDEX_TOKEN=256265 branch).
-        Stores live pm reference so _process_candle() always reads current PCR.
-        Pre-subscribes ATM CE+PE so option prices are warm before 9:15.
-        """
         self._instruments = instruments
-        self._pm          = pm            # live reference — NOT a snapshot
+        self._pm          = pm
         self._vix         = pm.vix
         self._prev_close  = pm.prev_close
         self._ema200      = pm.ema200_daily
@@ -272,7 +260,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
             f"expiry={self._expiry} DTE={self._dte_days}"
         )
 
-        # Pre-subscribe ATM CE + PE so option prices arrive before 9:15 AM
         ref = self._prev_close or (pm.prev_last5m_close if hasattr(pm, "prev_last5m_close") else None)
         if ref:
             strike = get_atm_strike(ref, step=NIFTY_STRIKE_STEP)
@@ -298,63 +285,46 @@ class NiftyDirectionalStrategy(BaseStrategy):
 
         return True
 
-    # ── on_tick  (every Nifty index tick) ────────────────────────────────────
+    # ── on_tick ───────────────────────────────────────────────────────────────
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
-        # Hard exit: must be checked BEFORE the market-hours guard below,
-        # otherwise the guard returns early and this block is never reached.
         if self._trade and self._trade["state"] == "OPEN" and t >= CFG["hard_exit_time"]:
             opt_ltp = self.get_price(self._trade["token"]) or self._trade["entry"]
             self._do_exit(opt_ltp, "HARD_EXIT_EOD", ts)
             return
 
-        # Ignore outside trading hours
         if t < CFG["market_open"] or t >= CFG["hard_exit_time"]:
             return
 
-        # Update internal Nifty VWAP (proxy_weight=1 — price-only, no volume)
         self._vwap.update(price, price, price, volume=0, proxy_weight=1)
 
-        # Capture true open price at first 9:15 tick (for gap calculation)
         if self._open_price is None and t >= CFG["market_open"]:
             self._open_price = price
             log.info(f"[{self.name}] Open price captured: {price:.2f}")
 
-            # Late-subscribe ATM options if pre-market subscription failed
             if self._pre_ce_token is None or self._pre_pe_token is None:
                 self._subscribe_atm_now(price)
 
-        # Track OR range for the first 15 min (9:15–9:30)
         if CFG["market_open"] <= t < dtime(9, 30):
             if self._or_high is None or price > self._or_high:
                 self._or_high = price
             if self._or_low is None or price < self._or_low:
                 self._or_low = price
 
-        # Build 5-min candle from live ticks
         closed = self._candle_builder.feed_tick(price, 1, ts)
         if closed is not None:
             self._process_candle(closed, ts)
 
-    # ── on_candle  (backfill from hub.backfill) ───────────────────────────────
+    # ── on_candle (backfill) ──────────────────────────────────────────────────
 
     def on_candle(self, candle: dict, ts: datetime):
-        """
-        During backfill, MarketHub replays historical Nifty candles here.
-        In live trading, on_tick() builds candles internally via CandleBuilder.
-        Both paths funnel into _process_candle() — identical indicator warmup.
-        """
         self._process_candle(candle, ts)
 
-    # ── on_option_tick  (live premium management) ────────────────────────────
+    # ── on_option_tick (live premium SL/trail) ────────────────────────────────
 
     def on_option_tick(self, token: int, price: float, ts: datetime, tick_ts: datetime = None):
-        """
-        Runs on every WebSocket option tick.
-        Handles: SL check, Trail-1 (BE move), Trail-2 (peak trail).
-        """
         if not (self._trade and token == self._trade.get("token")):
             return
         if self._trade["state"] != "OPEN":
@@ -362,7 +332,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
         if price <= 0:
             return
 
-        # SL grace period — suppress check for N seconds after entry fill
         sl_active_from = self._trade.get("sl_active_from")
         if sl_active_from and ts < sl_active_from:
             return
@@ -372,14 +341,12 @@ class NiftyDirectionalStrategy(BaseStrategy):
         peak   = self._trade.get("peak", entry)
         trail1 = self._trade.get("trail1_active", False)
 
-        # Update peak
         if price > peak:
             self._trade["peak"] = price
             peak = price
 
-        # Trail 1: when premium ≥ fill × 1.50 → move SL to breakeven
         if not trail1 and price >= entry * CFG["trail1_trigger_mult"]:
-            new_sl = entry   # breakeven
+            new_sl = entry
             if new_sl > sl:
                 self._trade["sl"] = new_sl
                 self._trade["trail1_active"] = True
@@ -389,7 +356,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
                 )
                 sl = new_sl
 
-        # Trail 2: SL = peak × (1 − TRAIL_PCT) — only after trail1 active
         if trail1:
             trail2_sl = peak * (1 - CFG["trail2_distance_pct"])
             if trail2_sl > sl:
@@ -400,29 +366,19 @@ class NiftyDirectionalStrategy(BaseStrategy):
                 )
                 sl = trail2_sl
 
-        # SL check
         if price <= sl:
             self._do_exit(price, "SL_HIT", ts)
 
     # ── Core candle processor ─────────────────────────────────────────────────
 
     def _process_candle(self, candle: dict, ts: datetime):
-        """
-        Called for every 5-min candle (backfill or live).
-        1. Append to indicator buffer.
-        2. Finalise mode detection once after 9:20 (first candle closes after OR).
-        3. Run Mode A or Mode B entry check when in the right time window.
-        4. Check Mode B consolidation state machine.
-        """
         self._buf.append(candle)
 
         t = ts.time()
 
-        # ── Finalise mode after first candle at/after 9:20 ────────────────────
         if not self._mode_finalised and t >= dtime(9, 20):
             self._finalise_mode(ts)
 
-        # Backfill guard — skip entry logic for stale historical candles
         stale = (_now_ist() - ts).total_seconds() > 600
         if stale:
             return
@@ -450,20 +406,14 @@ class NiftyDirectionalStrategy(BaseStrategy):
     # ── Mode detection ────────────────────────────────────────────────────────
 
     def _finalise_mode(self, ts: datetime):
-        """
-        Classify today as Mode A (normal) or Mode B (momentum/gap/expiry).
-        Called once after the first 5-min candle closes at/after 9:20 AM.
-        """
-        prev = self._prev_close
+        prev   = self._prev_close
         open_p = self._open_price
 
         gap_pct = abs(open_p - prev) / prev if (prev and open_p) else 0.0
 
-        # Is today expiry?
-        today = _now_ist().date()
+        today     = _now_ist().date()
         is_expiry = (self._expiry == today)
 
-        # OR range from 9:15–9:30 ticks
         or_range = (self._or_high - self._or_low) if (
             self._or_high is not None and self._or_low is not None
         ) else 0.0
@@ -477,7 +427,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
         self._mode = "B" if mode_b else "A"
         self._mode_finalised = True
 
-        # Determine spike direction for Mode B
         if mode_b and prev and open_p:
             self._spike_direction = "CE" if open_p > prev else "PE"
 
@@ -490,10 +439,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
     # ── Mode A entry check ────────────────────────────────────────────────────
 
     def _check_mode_a_entry(self, candle: dict, ts: datetime):
-        """
-        Mode A: EMA stack + VWAP + RSI + pullback to 9 EMA.
-        Two time windows: 9:30–11:00 AM and 1:15–2:15 PM.
-        """
         t = ts.time()
         in_window = (
             (CFG["mode_a_start"] <= t < CFG["mode_a_window1_end"]) or
@@ -502,18 +447,24 @@ class NiftyDirectionalStrategy(BaseStrategy):
         if not in_window:
             return
 
-        if len(self._buf) < CFG["ema_slow"] + 5:
+        # FIX 3 + buffer guard with logging
+        min_bars = CFG["ema_slow"] + 2   # lowered from +5 to +2 (FIX 8 adjacent)
+        if len(self._buf) < min_bars:
+            log.debug(
+                f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} buffer not warm: "
+                f"{len(self._buf)}/{min_bars} bars"
+            )
             return
 
         ind = self._compute_indicators()
         if not ind:
             return
 
-        direction = self._mode_a_signal(ind, candle)
+        direction = self._mode_a_signal(ind, candle, ts)  # FIX 3: pass ts for logging
         if not direction:
             return
 
-        # PCR gate — live reference via self._pm
+        # PCR gate — live reference
         live_pcr = self._pm.pcr if self._pm else None
         if live_pcr:
             if direction == "CE" and live_pcr < CFG["pcr_min_ce"]:
@@ -538,28 +489,40 @@ class NiftyDirectionalStrategy(BaseStrategy):
 
         self._enter(direction, candle["close"], ts, reason="mode_a_pullback")
 
-    def _mode_a_signal(self, ind: dict, candle: dict) -> Optional[str]:
+    def _mode_a_signal(self, ind: dict, candle: dict, ts: datetime) -> Optional[str]:
         """
         Returns "CE", "PE", or None.
         All 4 Mode A conditions must pass simultaneously.
+        FIX 3: logs each condition result at DEBUG level for diagnosability.
+        FIX 4: RSI range widened.
+        FIX 8: pullback uses 3-bar lookback and EMA9 ±0.1% tolerance.
         """
         e9, e20, e50 = ind["ema9"], ind["ema20"], ind["ema50"]
         rsi  = ind["rsi"]
         vwap = ind["vwap"]
         close = candle["close"]
-        low   = candle["low"]
-        high  = candle["high"]
+
+        # FIX 8: 3-bar lookback (was 2) + tolerance band
+        tol = CFG["pullback_ema_tolerance"]
+        prev_three = list(self._buf)[-4:-1] if len(self._buf) >= 4 else list(self._buf)[:-1]
 
         # ── CE path ───────────────────────────────────────────────────────────
         ema_stack_ce  = e9 > e20 > e50
         rsi_ok_ce     = CFG["rsi_ce_min"] <= rsi <= CFG["rsi_ce_max"]
         vwap_ok_ce    = (vwap is None) or (close > vwap)
-        # Pullback: last 2 candle lows touched or crossed below EMA9,
-        # current close resumed above EMA9
-        prev_two = list(self._buf)[-3:-1] if len(self._buf) >= 3 else []
-        pullback_ce = (
-            any(c["low"] <= e9 for c in prev_two) and
+        # FIX 8: low <= EMA9 * (1 + tol) counts — catches near-touches
+        pullback_ce   = (
+            any(c["low"] <= e9 * (1 + tol) for c in prev_three) and
             close > e9
+        )
+
+        # FIX 3: per-condition DEBUG log
+        log.debug(
+            f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} CE check | "
+            f"EMA_stack={'✓' if ema_stack_ce else '✗'}({e9:.0f}>{e20:.0f}>{e50:.0f}) "
+            f"RSI={'✓' if rsi_ok_ce else '✗'}({rsi:.1f} in [{CFG['rsi_ce_min']}-{CFG['rsi_ce_max']}]) "
+            f"VWAP={'✓' if vwap_ok_ce else '✗'}(close={close:.0f} vwap={vwap:.0f if vwap else 'N/A'}) "
+            f"Pullback={'✓' if pullback_ce else '✗'}"
         )
 
         if ema_stack_ce and rsi_ok_ce and vwap_ok_ce and pullback_ce:
@@ -569,9 +532,18 @@ class NiftyDirectionalStrategy(BaseStrategy):
         ema_stack_pe  = e9 < e20 < e50
         rsi_ok_pe     = CFG["rsi_pe_min"] <= rsi <= CFG["rsi_pe_max"]
         vwap_ok_pe    = (vwap is None) or (close < vwap)
-        pullback_pe = (
-            any(c["high"] >= e9 for c in prev_two) and
+        # FIX 8: high >= EMA9 * (1 - tol) counts
+        pullback_pe   = (
+            any(c["high"] >= e9 * (1 - tol) for c in prev_three) and
             close < e9
+        )
+
+        log.debug(
+            f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} PE check | "
+            f"EMA_stack={'✓' if ema_stack_pe else '✗'}({e9:.0f}<{e20:.0f}<{e50:.0f}) "
+            f"RSI={'✓' if rsi_ok_pe else '✗'}({rsi:.1f} in [{CFG['rsi_pe_min']}-{CFG['rsi_pe_max']}]) "
+            f"VWAP={'✓' if vwap_ok_pe else '✗'} "
+            f"Pullback={'✓' if pullback_pe else '✗'}"
         )
 
         if ema_stack_pe and rsi_ok_pe and vwap_ok_pe and pullback_pe:
@@ -585,13 +557,17 @@ class NiftyDirectionalStrategy(BaseStrategy):
         """
         Mode B: wait for a tight consolidation after the initial spike, then
         enter the breakout of that consolidation.
-        Window: 9:15–11:00 AM.
+        Window: 9:15–11:30 AM (FIX 6).
+
+        FIX 1: Breakout is checked on the bar AFTER the consolidation is
+        complete (_mb_consol_ready=True), not on the bar that expands the zone.
+        This prevents the impossible condition of close > zone_high while the
+        zone is still being built from the current bar.
         """
         t = ts.time()
         if not (CFG["mode_b_start"] <= t < CFG["mode_b_cutoff"]):
             return
 
-        # IV guard — skip Mode B if VIX too high
         if self._vix and self._vix > CFG["vix_skip_thresh"]:
             log.info(
                 f"[{self.name}] [ModeB] Entry skipped — VIX={self._vix:.1f} "
@@ -599,107 +575,148 @@ class NiftyDirectionalStrategy(BaseStrategy):
             )
             return
 
-        bar_range = candle["high"] - candle["low"]
-        direction = self._spike_direction  # already set in _finalise_mode
-
+        direction = self._spike_direction
         if direction is None:
+            return
+
+        bar_range = candle["high"] - candle["low"]
+
+        # ── FIX 1: Check breakout FIRST if consolidation is armed ─────────────
+        # _mb_consol_ready is set to True once min_bars are formed.
+        # The current candle is the first candle AFTER the consolidation window.
+        if self._mb_consol_ready:
+            triggered = False
+            if direction == "CE" and candle["close"] > self._mb_consol_high:
+                log.info(
+                    f"[{self.name}] [ModeB] Breakout CE at {ts.strftime('%H:%M')} | "
+                    f"close={candle['close']:.0f} > zone_high={self._mb_consol_high:.0f} "
+                    f"(consol_bars={self._mb_consol_bars})"
+                )
+                triggered = True
+            elif direction == "PE" and candle["close"] < self._mb_consol_low:
+                log.info(
+                    f"[{self.name}] [ModeB] Breakout PE at {ts.strftime('%H:%M')} | "
+                    f"close={candle['close']:.0f} < zone_low={self._mb_consol_low:.0f} "
+                    f"(consol_bars={self._mb_consol_bars})"
+                )
+                triggered = True
+
+            # Always reset ready flag — we only get one breakout attempt per
+            # consolidation window. If it failed, start looking again.
+            self._mb_consol_ready = False
+            self._mb_state = "WATCHING"
+
+            if triggered:
+                self._enter(direction, candle["close"], ts,
+                            reason=f"mode_b_consol_breakout_{direction.lower()}")
+            else:
+                log.info(
+                    f"[{self.name}] [ModeB] Breakout attempt failed at "
+                    f"{ts.strftime('%H:%M')} | "
+                    f"close={candle['close']:.0f} zone=[{self._mb_consol_low:.0f}"
+                    f"–{self._mb_consol_high:.0f}] — re-watching"
+                )
             return
 
         # ── Consolidation state machine ───────────────────────────────────────
         if self._mb_state == "WATCHING":
-            # Transition to CONSOLIDATING when a candle is sufficiently tight
             if bar_range < CFG["mode_b_consol_range"]:
                 self._mb_state       = "CONSOL"
                 self._mb_consol_high = candle["high"]
                 self._mb_consol_low  = candle["low"]
                 self._mb_consol_bars = 1
+                self._mb_consol_ready = False
                 log.info(
-                    f"[{self.name}] [ModeB] Consolidation started at {ts.strftime('%H:%M')} | "
+                    f"[{self.name}] [ModeB] Consolidation started at "
+                    f"{ts.strftime('%H:%M')} | "
                     f"range={bar_range:.0f}pts "
                     f"H={candle['high']:.0f} L={candle['low']:.0f}"
                 )
             return
 
         if self._mb_state == "CONSOL":
-            # Expand consolidation zone if bar is still tight
             if bar_range < CFG["mode_b_consol_range"]:
+                # Expand zone
                 self._mb_consol_high = max(self._mb_consol_high, candle["high"])
-                self._mb_consol_low  = min(self._mb_consol_low, candle["low"])
+                self._mb_consol_low  = min(self._mb_consol_low,  candle["low"])
                 self._mb_consol_bars += 1
                 log.info(
-                    f"[{self.name}] [ModeB] Consolidation bar {self._mb_consol_bars} | "
+                    f"[{self.name}] [ModeB] Consolidation bar "
+                    f"{self._mb_consol_bars} | "
                     f"zone=[{self._mb_consol_low:.0f}–{self._mb_consol_high:.0f}] "
                     f"range={self._mb_consol_high - self._mb_consol_low:.0f}pts"
                 )
 
-                # Check for breakout from consolidation (need min bars first)
-                if self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
-                    if direction == "CE" and candle["close"] > self._mb_consol_high:
-                        log.info(
-                            f"[{self.name}] [ModeB] Breakout CE at {ts.strftime('%H:%M')} | "
-                            f"close={candle['close']:.0f} > zone_high={self._mb_consol_high:.0f}"
-                        )
-                        self._mb_state = "WATCHING"   # reset for potential next setup
-                        self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_consol_breakout_ce")
-                        return
-
-                    if direction == "PE" and candle["close"] < self._mb_consol_low:
-                        log.info(
-                            f"[{self.name}] [ModeB] Breakout PE at {ts.strftime('%H:%M')} | "
-                            f"close={candle['close']:.0f} < zone_low={self._mb_consol_low:.0f}"
-                        )
-                        self._mb_state = "WATCHING"
-                        self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_consol_breakout_pe")
-                        return
-
-                # Tight bars exceeded max — zone too wide, reset and re-seek
                 if self._mb_consol_bars >= CFG["mode_b_consol_max_bars"]:
+                    # Zone built to max — arm the breakout check for next bar
                     log.info(
-                        f"[{self.name}] [ModeB] Consolidation expired (tight) after "
-                        f"{self._mb_consol_bars} bars — resetting"
+                        f"[{self.name}] [ModeB] Consolidation complete "
+                        f"({self._mb_consol_bars} bars) — "
+                        f"armed for breakout on next candle"
                     )
+                    self._mb_consol_ready = True
                     self._mb_state = "WATCHING"
+                elif self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
+                    # Minimum bars met — arm breakout for next candle
+                    # (we don't wait for max; arm as soon as min is met so
+                    # we don't miss a fast breakout, but the check fires on
+                    # the NEXT bar, not this one)
+                    log.info(
+                        f"[{self.name}] [ModeB] Min bars met "
+                        f"({self._mb_consol_bars}/{CFG['mode_b_consol_min_bars']}) — "
+                        f"armed for breakout on next candle"
+                    )
+                    self._mb_consol_ready = True
+                    # Stay in CONSOL so we keep expanding zone if next bar is tight
+                    # but breakout check fires first in next call
 
-            # Bar is too wide — consolidation expires, start watching again
-            elif self._mb_consol_bars >= CFG["mode_b_consol_max_bars"]:
-                log.info(
-                    f"[{self.name}] [ModeB] Consolidation expired after "
-                    f"{self._mb_consol_bars} bars — resetting"
-                )
-                self._mb_state = "WATCHING"
             else:
-                # Wide bar mid-consolidation — breakout check before expiry
+                # Wide bar breaks consolidation
                 if self._mb_consol_bars >= CFG["mode_b_consol_min_bars"]:
+                    # Wide bar itself could be the breakout candle —
+                    # check immediately (this bar is AFTER sufficient consol)
+                    triggered = False
                     if direction == "CE" and candle["close"] > self._mb_consol_high:
                         log.info(
                             f"[{self.name}] [ModeB] Breakout CE (wide bar) at "
-                            f"{ts.strftime('%H:%M')}"
+                            f"{ts.strftime('%H:%M')} | "
+                            f"close={candle['close']:.0f} > "
+                            f"zone_high={self._mb_consol_high:.0f}"
                         )
-                        self._mb_state = "WATCHING"
-                        self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_breakout_wide_ce")
-                        return
-                    if direction == "PE" and candle["close"] < self._mb_consol_low:
+                        triggered = True
+                    elif direction == "PE" and candle["close"] < self._mb_consol_low:
                         log.info(
                             f"[{self.name}] [ModeB] Breakout PE (wide bar) at "
-                            f"{ts.strftime('%H:%M')}"
+                            f"{ts.strftime('%H:%M')} | "
+                            f"close={candle['close']:.0f} < "
+                            f"zone_low={self._mb_consol_low:.0f}"
                         )
-                        self._mb_state = "WATCHING"
+                        triggered = True
+
+                    self._mb_state = "WATCHING"
+                    self._mb_consol_ready = False
+
+                    if triggered:
                         self._enter(direction, candle["close"], ts,
-                                    reason="mode_b_breakout_wide_pe")
-                        return
-                # Wide bar, not enough bars, not a breakout — reset
-                self._mb_state = "WATCHING"
+                                    reason=f"mode_b_wide_breakout_{direction.lower()}")
+                    else:
+                        log.info(
+                            f"[{self.name}] [ModeB] Wide bar broke consolidation "
+                            f"without breakout at {ts.strftime('%H:%M')} — resetting"
+                        )
+                else:
+                    # Not enough bars — reset and start fresh
+                    log.info(
+                        f"[{self.name}] [ModeB] Wide bar broke early consolidation "
+                        f"({self._mb_consol_bars} bars < "
+                        f"{CFG['mode_b_consol_min_bars']} min) — resetting"
+                    )
+                    self._mb_state = "WATCHING"
+                    self._mb_consol_ready = False
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
     def _enter(self, direction: str, index_price: float, ts: datetime, reason: str):
-        """
-        Resolve ATM option token, place BUY, record trade.
-        SL is set from confirmed fill price (not pre-order LTP).
-        """
         with self._lock:
             if self._trade and self._trade["state"] == "OPEN":
                 return
@@ -710,9 +727,7 @@ class NiftyDirectionalStrategy(BaseStrategy):
 
         strike = get_atm_strike(index_price, step=NIFTY_STRIKE_STEP)
 
-        # Use pre-subscribed token if strike matches, else look up fresh
         if direction == "CE" and self._pre_ce_token:
-            # Verify strike still matches (may drift if market moved a lot)
             pre_strike = self._get_strike_from_sym(self._pre_ce_sym)
             if pre_strike == strike:
                 token, sym = self._pre_ce_token, self._pre_ce_sym
@@ -737,10 +752,8 @@ class NiftyDirectionalStrategy(BaseStrategy):
             )
             return
 
-        # Subscribe if not already
         self.subscribe_option(token)
 
-        # Get current option LTP
         opt_ltp = self.get_price(token)
         if not opt_ltp or opt_ltp <= 0:
             log.warning(
@@ -749,12 +762,10 @@ class NiftyDirectionalStrategy(BaseStrategy):
             )
             return
 
-        # Acquire live trade slot
         if not self._acquire_slot():
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy active")
             return
 
-        # Place BUY order
         result = self._place_buy(sym, token, CFG["quantity"], opt_ltp)
         if result is None:
             self._release_slot()
@@ -868,11 +879,8 @@ class NiftyDirectionalStrategy(BaseStrategy):
     # ── Indicator computation ─────────────────────────────────────────────────
 
     def _compute_indicators(self) -> Optional[dict]:
-        """
-        Compute EMA9/20/50, RSI14, and current VWAP from the 5-min candle buffer.
-        Returns None if not enough bars.
-        """
-        if len(self._buf) < CFG["ema_slow"] + 5:
+        min_bars = CFG["ema_slow"] + 2
+        if len(self._buf) < min_bars:
             return None
 
         candles = list(self._buf)
@@ -888,7 +896,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
         ema20 = float(close.ewm(span=CFG["ema_mid"],  adjust=False).mean().iloc[-1])
         ema50 = float(close.ewm(span=CFG["ema_slow"], adjust=False).mean().iloc[-1])
 
-        # RSI(14)
         delta = close.diff()
         gain  = delta.clip(lower=0).rolling(CFG["rsi_period"], min_periods=1).mean()
         loss  = (-delta.clip(upper=0)).rolling(CFG["rsi_period"], min_periods=1).mean()
@@ -908,7 +915,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _subscribe_atm_now(self, price: float):
-        """Subscribe ATM CE+PE when pre-market subscription was skipped."""
         from core.instruments import get_atm_strike
         strike = get_atm_strike(price, step=NIFTY_STRIKE_STEP)
         log.info(
@@ -931,15 +937,9 @@ class NiftyDirectionalStrategy(BaseStrategy):
 
     @staticmethod
     def _get_strike_from_sym(sym: Optional[str]) -> Optional[int]:
-        """
-        Extract strike from option symbol like 'NIFTY2561824000CE'.
-        Returns None if parsing fails.
-        """
         if not sym:
             return None
         try:
-            # Symbol format: NIFTY + YYMMDD + STRIKE + CE/PE
-            # e.g. NIFTY2561824000CE → strip NIFTY (5) + date (6) = 11 chars, then strip last 2
             core = sym[11:-2]
             return int(float(core))
         except Exception:
@@ -959,10 +959,6 @@ class NiftyDirectionalStrategy(BaseStrategy):
             w.writerow({k: row.get(k, "") for k in fields})
 
     def eod_summary(self):
-        # ── Safety net: force-close any position still open at EOD ───────────
-        # Normally HARD_EXIT_EOD fires at 15:00 via on_tick(). This handles
-        # the edge case where no index tick arrives at exactly 15:00 (e.g.
-        # WebSocket lag, last tick at 14:59:59).
         if self._trade and self._trade["state"] == "OPEN":
             token   = self._trade.get("token")
             opt_ltp = (self.get_price(token) if token else None) or self._trade["entry"]
