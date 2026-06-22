@@ -260,6 +260,12 @@ class NiftyDirectionalStrategy(BaseStrategy):
             f"expiry={self._expiry} DTE={self._dte_days}"
         )
 
+        # Bug 14 fix: seed _buf with the prior session's 5-min candles so
+        # EMA9/20/50 + RSI are already warm at market open instead of
+        # needing min_bars=ema_slow+2 (~260 live minutes from 9:30) to
+        # fill up from empty every single day.
+        self._seed_historical_buffer()
+
         ref = self._prev_close or (pm.prev_last5m_close if hasattr(pm, "prev_last5m_close") else None)
         if ref:
             strike = get_atm_strike(ref, step=NIFTY_STRIKE_STEP)
@@ -284,6 +290,96 @@ class NiftyDirectionalStrategy(BaseStrategy):
             )
 
         return True
+
+    # ── Historical candle seeding (Bug 14 fix, prior-session warmup) ──────────
+
+    def _seed_historical_buffer(self):
+        """
+        Fetch the prior trading session's last N 5-min Nifty candles via
+        hub.kite.historical_data() and load them into _buf, so EMA9/20/50
+        and RSI(14) already have enough bars to be valid the moment the
+        market opens — instead of needing min_bars=ema_slow+2 (52 bars,
+        ~260 live minutes from 9:30) to accumulate from empty every day.
+
+        This is separate from hub.backfill(), which only replays TODAY's
+        already-elapsed candles for late starts (no-op for an on-time
+        9:00 AM start, since there are no elapsed candles yet). This seeds
+        yesterday's close-of-session data so today's first live candle
+        isn't starting cold.
+
+        There is a genuine overnight gap between the last seeded bar and
+        the first live 9:15 bar — EMA/RSI self-correct within a few live
+        bars, an accepted tradeoff (mirrors the BB_STOCH_NIFTY historical
+        seeding fix already used elsewhere).
+
+        Fails safe: if kite is unavailable, the fetch errors, or no data
+        comes back, this silently falls back to the old live-only warmup
+        path (no regression — the strategy just trades a bit later that
+        day, exactly as it did before this fix).
+        """
+        kite = getattr(self._hub, "kite", None)
+        if kite is None:
+            log.warning(
+                f"[{self.name}] No kite handle on hub — cannot seed "
+                f"historical candles, falling back to live-only warmup "
+                f"(~{(CFG['ema_slow'] + 2) * 5}min)"
+            )
+            return
+
+        needed = self._buf.maxlen or (CFG["ema_slow"] + 10)
+        today  = _now_ist().date()
+
+        try:
+            raw = kite.historical_data(
+                instrument_token = self.INDEX_TOKEN,
+                from_date        = datetime.combine(today - timedelta(days=7), dtime(9, 15)),
+                to_date          = datetime.combine(today - timedelta(days=1), dtime(15, 30)),
+                interval         = "5minute",
+            )
+        except Exception as e:
+            log.warning(
+                f"[{self.name}] Historical seed fetch failed: {e} — "
+                f"falling back to live-only warmup "
+                f"(~{(CFG['ema_slow'] + 2) * 5}min)"
+            )
+            return
+
+        if not raw:
+            log.warning(
+                f"[{self.name}] Historical seed returned no candles — "
+                f"falling back to live-only warmup "
+                f"(~{(CFG['ema_slow'] + 2) * 5}min)"
+            )
+            return
+
+        tail = raw[-needed:]
+        with self._lock:
+            self._buf.clear()
+            for bar in tail:
+                try:
+                    self._buf.append({
+                        "ts"     : bar["date"],
+                        "open"   : float(bar["open"]),
+                        "high"   : float(bar["high"]),
+                        "low"    : float(bar["low"]),
+                        "close"  : float(bar["close"]),
+                        "volume" : float(bar.get("volume", 0)),
+                    })
+                except (KeyError, TypeError, ValueError) as e:
+                    log.warning(f"[{self.name}] Skipping malformed seed bar {bar}: {e}")
+
+        if self._buf:
+            log.info(
+                f"[{self.name}] Seeded {len(self._buf)} prior-session 5-min "
+                f"candles ({tail[0].get('date', '?')} -> {tail[-1].get('date', '?')}) "
+                f"— EMA9/20/50 + RSI warm from first live tick, "
+                f"no {(CFG['ema_slow'] + 2) * 5}min wait"
+            )
+        else:
+            log.warning(
+                f"[{self.name}] Seed buffer empty after load — "
+                f"falling back to live-only warmup"
+            )
 
     # ── on_tick ───────────────────────────────────────────────────────────────
 
