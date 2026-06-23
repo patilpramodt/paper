@@ -335,14 +335,12 @@ def compute_stochastic(df: pd.DataFrame,
     Stochastic oscillator (Slow Stochastic) on OHLC data.
 
     Returns dict:
-      k      : current smoothed %K value (0-100)
-      d      : current %D signal line value (0-100)
-      prev_k : previous bar K
-      prev_d : previous bar D
-      ready  : False when insufficient data
+      k     : current smoothed %K value (0-100)
+      d     : current %D signal line value (0-100)
+      ready : False when insufficient data
     """
     min_bars = k_period + k_smooth + d_smooth - 2
-    insufficient = {"k": 50.0, "d": 50.0, "prev_k": 50.0, "prev_d": 50.0, "ready": False}
+    insufficient = {"k": 50.0, "d": 50.0, "ready": False}
     if len(df) < min_bars:
         return insufficient
 
@@ -360,12 +358,10 @@ def compute_stochastic(df: pd.DataFrame,
     k_series = raw_k.rolling(k_smooth).mean()
     d_series = k_series.rolling(d_smooth).mean()
 
-    k      = float(round(k_series.iloc[-1], 2))
-    d      = float(round(d_series.iloc[-1], 2))
-    prev_k = float(round(k_series.iloc[-2], 2))
-    prev_d = float(round(d_series.iloc[-2], 2))
+    k = float(round(k_series.iloc[-1], 2))
+    d = float(round(d_series.iloc[-1], 2))
 
-    return {"k": k, "d": d, "prev_k": prev_k, "prev_d": prev_d, "ready": True}
+    return {"k": k, "d": d, "ready": True}
 
 
 
@@ -391,8 +387,8 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
 
     stoch      = compute_stochastic(df, CFG["stoch_k_period"],
                                     CFG["stoch_k_smooth"], CFG["stoch_d_smooth"])
-    k_cross_up = stoch["prev_k"] <= stoch["prev_d"] and stoch["k"] > stoch["d"]
-    k_cross_dn = stoch["prev_k"] >= stoch["prev_d"] and stoch["k"] < stoch["d"]
+    k_cross_up = stoch["k"] > stoch["d"]
+    k_cross_dn = stoch["k"] < stoch["d"]
 
     base = {
         "bb": bb, "vol_ratio": vol_ratio, "atr": atr,
