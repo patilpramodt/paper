@@ -4,12 +4,8 @@ strategies/bb_stoch_nifty_strategy.py
 BBStochNiftyStrategy -- Nifty 50 options scalper using:
   * Bollinger Bands  (BB)       -- identifies breakout / volatility expansion
   * Volume Filter               -- confirms genuine institutional participation
-  * Supertrend trend filter     -- prevents counter-trend entries
-                                   Supertrend(10, 3) computed on a 5-min
-                                   candle buffer that is now SEEDED from the
-                                   prior session at pre_market() (Bug 14) --
-                                   it no longer needs ~60 live minutes to
-                                   warm up from empty.
+  * Stochastic momentum filter  -- confirms momentum direction at band touch
+                                   Stochastic(5, 3, 3) on 5-min candle buffer.
 
 SIGNAL LOGIC (all filters must agree before entry):
 --------------------------------------------------------------
@@ -19,14 +15,14 @@ SIGNAL LOGIC (all filters must agree before entry):
        OR BB Middle : last close crosses ABOVE the BB middle band
     2. Volume     : current bar volume >= VOL_MULT * rolling avg vol
     3. VWAP       : close above session VWAP
-    4. Supertrend : direction == 1 (bullish) -- ST(10,3) computed from
-                    live 5-min candle buffer, accurate once >= ST_PERIOD+2
-                    bars are available.
+    4. Stochastic : K < 80 (not overbought) AND K crosses above D
+                    (momentum turning up at/near band touch)
     5. Session    : only between SESSION_START and ENTRY_CUTOFF
 
   PE entry (buy put):
     Mirror of the above -- BB break below lower band, bounce below upper
-    band, or middle band cross DOWN; Supertrend direction == -1 (bearish).
+    band, or middle band cross DOWN; K > 20 (not oversold) AND K crosses
+    below D (momentum turning down).
 
 NIFTY-SPECIFIC DETAILS:
 --------------------------------------------------------------
@@ -122,7 +118,7 @@ NEW FIXES (this revision):
             so far (not just breakeven), re-locking at each new stage.
             See _update_trail().
   Bug 14 -- No historical seeding: _buf_5m started empty every session and
-            needed min_bars=12 (~60 live minutes from 9:15) before the
+            needed min_bars=10 (~50 live minutes from 9:15) before the
             first possible signal, missing the most volatile opening hour
             every single day. Fix: pre_market() now seeds _buf_5m with the
             prior session's last N 5-min candles via
@@ -239,13 +235,16 @@ CFG = {
     "persistence"        : 1,
 
     # Minimum 5-min bars before first signal.
-    # Supertrend(10,3) needs period+2 = 12 bars minimum.
-    # 12 bars = 60 min from 9:15 → first signal ~10:15 AM.
-    "min_bars"           : 12,
+    # Stochastic(5,3,3) needs k_period+d_smooth-1 = 7 bars minimum.
+    # 10 bars = 50 min from 9:15 → first signal ~10:05 AM.
+    "min_bars"           : 10,
 
-    # Supertrend trend filter
-    "st_period"          : 10,
-    "st_multiplier"      : 3.0,
+    # Stochastic momentum filter -- replaces SuperTrend
+    "stoch_k_period"     : 5,
+    "stoch_k_smooth"     : 3,
+    "stoch_d_smooth"     : 3,
+    "stoch_ob"           : 80,   # overbought ceiling for CE entries
+    "stoch_os"           : 20,   # oversold floor for PE entries
 
     # CSV paths
     "entry_csv"          : "logs/bb_stoch_nifty_entry.csv",
@@ -328,68 +327,46 @@ def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
     return round(current / avg, 3)
 
 
-def compute_supertrend(df: pd.DataFrame,
-                       period: int = 10,
-                       multiplier: float = 3.0) -> dict:
+def compute_stochastic(df: pd.DataFrame,
+                       k_period: int = 5,
+                       k_smooth: int = 3,
+                       d_smooth: int = 3) -> dict:
     """
-    Supertrend(period, multiplier) on OHLC data.
+    Stochastic oscillator (Slow Stochastic) on OHLC data.
 
     Returns dict:
-      direction      : 1 (bullish) | -1 (bearish) | 0 (insufficient data)
-      value          : Supertrend line value
-      prev_direction : direction of the previous bar
+      k      : current smoothed %K value (0-100)
+      d      : current %D signal line value (0-100)
+      prev_k : previous bar K
+      prev_d : previous bar D
+      ready  : False when insufficient data
     """
-    insufficient = {"direction": 0, "value": 0.0, "prev_direction": 0}
-    if len(df) < period + 2:
+    min_bars = k_period + k_smooth + d_smooth - 2
+    insufficient = {"k": 50.0, "d": 50.0, "prev_k": 50.0, "prev_d": 50.0, "ready": False}
+    if len(df) < min_bars:
         return insufficient
 
     high  = df["high"].astype(float)
     low   = df["low"].astype(float)
     close = df["close"].astype(float)
 
-    prev_c = close.shift(1)
-    tr     = pd.concat([
-                 high - low,
-                 (high - prev_c).abs(),
-                 (low  - prev_c).abs(),
-             ], axis=1).max(axis=1)
-    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    lowest_low   = low.rolling(k_period).min()
+    highest_high = high.rolling(k_period).max()
+    denom        = highest_high - lowest_low
+    raw_k = pd.Series(
+        np.where(denom > 0, 100.0 * (close - lowest_low) / denom, 50.0),
+        index=close.index,
+    )
+    k_series = raw_k.rolling(k_smooth).mean()
+    d_series = k_series.rolling(d_smooth).mean()
 
-    hl2         = (high + low) / 2.0
-    basic_upper = (hl2 + multiplier * atr).values
-    basic_lower = (hl2 - multiplier * atr).values
-    close_v     = close.values
+    k      = float(round(k_series.iloc[-1], 2))
+    d      = float(round(d_series.iloc[-1], 2))
+    prev_k = float(round(k_series.iloc[-2], 2))
+    prev_d = float(round(d_series.iloc[-2], 2))
 
-    n           = len(df)
-    final_upper = basic_upper.copy()
-    final_lower = basic_lower.copy()
-    direction   = np.ones(n, dtype=int)
+    return {"k": k, "d": d, "prev_k": prev_k, "prev_d": prev_d, "ready": True}
 
-    for i in range(1, n):
-        if basic_upper[i] < final_upper[i - 1] or close_v[i - 1] > final_upper[i - 1]:
-            final_upper[i] = basic_upper[i]
-        else:
-            final_upper[i] = final_upper[i - 1]
-
-        if basic_lower[i] > final_lower[i - 1] or close_v[i - 1] < final_lower[i - 1]:
-            final_lower[i] = basic_lower[i]
-        else:
-            final_lower[i] = final_lower[i - 1]
-
-        if direction[i - 1] == -1:
-            direction[i] = 1 if close_v[i] > final_upper[i] else -1
-        else:
-            direction[i] = -1 if close_v[i] < final_lower[i] else 1
-
-    cur_dir  = int(direction[-1])
-    prev_dir = int(direction[-2])
-    st_value = float(final_lower[-1]) if cur_dir == 1 else float(final_upper[-1])
-
-    return {
-        "direction"      : cur_dir,
-        "value"          : round(st_value, 2),
-        "prev_direction" : prev_dir,
-    }
 
 
 # ============================================================
@@ -412,17 +389,18 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     atr       = _compute_atr(df, CFG["atr_period"])
     close     = float(df["close"].iloc[-1])
 
-    st      = compute_supertrend(df, CFG["st_period"], CFG["st_multiplier"])
-    st_bull = st["direction"] == 1
-    st_bear = st["direction"] == -1
+    stoch      = compute_stochastic(df, CFG["stoch_k_period"],
+                                    CFG["stoch_k_smooth"], CFG["stoch_d_smooth"])
+    k_cross_up = stoch["prev_k"] <= stoch["prev_d"] and stoch["k"] > stoch["d"]
+    k_cross_dn = stoch["prev_k"] >= stoch["prev_d"] and stoch["k"] < stoch["d"]
 
     base = {
         "bb": bb, "vol_ratio": vol_ratio, "atr": atr,
-        "close": close, "st_direction": st["direction"], "st_value": st["value"],
+        "close": close, "stoch_k": stoch["k"], "stoch_d": stoch["d"],
     }
 
-    if st["direction"] == 0:
-        return {"action": "HOLD", "blocked_by": "st_warmup", **base}
+    if not stoch["ready"]:
+        return {"action": "HOLD", "blocked_by": "stoch_warmup", **base}
 
     if bb["squeeze"]:
         return {"action": "HOLD", "blocked_by": "bb_squeeze", **base}
@@ -447,10 +425,12 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     bb_bounce_up    = close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
     bb_mid_cross_up = close > bb["mid"]   and bb["prev_close"] <= bb["prev_mid"]
     ce_bb_trigger   = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
+    stoch_ce_ok     = stoch["k"] < CFG["stoch_ob"] and k_cross_up
 
     if ce_bb_trigger and above_vwap:
-        if not st_bull:
-            return {"action": "HOLD", "blocked_by": "st_trend_ce", **base}
+        if not stoch_ce_ok:
+            reason = "stoch_ob" if stoch["k"] >= CFG["stoch_ob"] else "stoch_no_cross_ce"
+            return {"action": "HOLD", "blocked_by": reason, **base}
         if bb_breakout_up:
             if bb["bw_pct"] < CFG["bb_min_bw_breakout"]:
                 return {"action": "HOLD", "blocked_by": "bw_squeeze", **base}
@@ -467,10 +447,12 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     bb_bounce_dn    = close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
     bb_mid_cross_dn = close < bb["mid"]   and bb["prev_close"] >= bb["prev_mid"]
     pe_bb_trigger   = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
+    stoch_pe_ok     = stoch["k"] > CFG["stoch_os"] and k_cross_dn
 
     if pe_bb_trigger and below_vwap:
-        if not st_bear:
-            return {"action": "HOLD", "blocked_by": "st_trend_pe", **base}
+        if not stoch_pe_ok:
+            reason = "stoch_os" if stoch["k"] <= CFG["stoch_os"] else "stoch_no_cross_pe"
+            return {"action": "HOLD", "blocked_by": reason, **base}
         if bb_breakout_dn:
             if bb["bw_pct"] < CFG["bb_min_bw_breakout"]:
                 return {"action": "HOLD", "blocked_by": "bw_squeeze", **base}
@@ -486,13 +468,15 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
     if ce_bb_trigger:
         if not above_vwap:
             return {"action": "HOLD", "blocked_by": "below_vwap", **base}
-        if not st_bull:
-            return {"action": "HOLD", "blocked_by": "st_trend_ce", **base}
+        if not stoch_ce_ok:
+            reason = "stoch_ob" if stoch["k"] >= CFG["stoch_ob"] else "stoch_no_cross_ce"
+            return {"action": "HOLD", "blocked_by": reason, **base}
     if pe_bb_trigger:
         if not below_vwap:
             return {"action": "HOLD", "blocked_by": "above_vwap", **base}
-        if not st_bear:
-            return {"action": "HOLD", "blocked_by": "st_trend_pe", **base}
+        if not stoch_pe_ok:
+            reason = "stoch_os" if stoch["k"] <= CFG["stoch_os"] else "stoch_no_cross_pe"
+            return {"action": "HOLD", "blocked_by": reason, **base}
 
     return {"action": "HOLD", "blocked_by": "no_setup", **base}
 
@@ -576,7 +560,7 @@ class BBStochNiftyStrategy(BaseStrategy):
         super().__init__(market_hub)
 
         # 5-min candle buffer — size covers BB and Supertrend lookbacks + headroom
-        buf_size = max(CFG["bb_period"], CFG["st_period"]) + 20
+        buf_size = max(CFG["bb_period"], CFG["stoch_k_period"]) + 20
         self._buf_5m: deque = deque(maxlen=buf_size)
 
         # Internal Nifty 5-min candle builder (MarketHub builds BankNifty candles)
@@ -746,7 +730,7 @@ class BBStochNiftyStrategy(BaseStrategy):
             )
             return
 
-        needed = self._buf_5m.maxlen or (CFG["bb_period"] + CFG["st_period"] + 10)
+        needed = self._buf_5m.maxlen or (CFG["bb_period"] + CFG["stoch_k_period"] + 10)
         today  = _now_ist().date()
 
         try:
@@ -1057,12 +1041,9 @@ class BBStochNiftyStrategy(BaseStrategy):
         vwap_str      = f"{vwap:.2f}" if vwap is not None else "N/A"
         vol_ratio_val = sig.get("vol_ratio", -1)
         vol_str       = f"{vol_ratio_val:.2f}x" if vol_ratio_val >= 0 else "N/A(no-data)"
-        st_dir        = sig.get("st_direction", 0)
-        st_val        = sig.get("st_value", 0)
-        st_str        = (
-            f"{'BULL' if st_dir == 1 else ('BEAR' if st_dir == -1 else 'WAIT')} "
-            f"val={st_val:.2f}"
-        )
+        stoch_k_val   = sig.get("stoch_k", 50.0)
+        stoch_d_val   = sig.get("stoch_d", 50.0)
+        stoch_str     = f"K={stoch_k_val:.1f} D={stoch_d_val:.1f}"
 
         log.info(
             f"[BB_STOCH_NIFTY] {action:8s} | "
@@ -1070,7 +1051,7 @@ class BBStochNiftyStrategy(BaseStrategy):
             f"BB=[{bb.get('lower', 0):.1f}~{bb.get('upper', 0):.1f}] "
             f"BW={bb.get('bw_pct', 0)*100:.2f}% | "
             f"Vol={vol_str} | VWAP(Nifty)={vwap_str} | "
-            f"ST={st_str} | "
+            f"Stoch={stoch_str} | "
             f"Block={sig.get('blocked_by') or 'none'} | Persist={confirmed} | "
             f"PnL={self._daily_pnl:+.1f}Rs T={self._trades_today}/{CFG['max_trades_day']}"
         )
@@ -1244,8 +1225,8 @@ class BBStochNiftyStrategy(BaseStrategy):
             "bb_mid"           : bb.get("mid", ""),
             "bb_lower"         : bb.get("lower", ""),
             "bb_bw_pct"        : bb.get("bw_pct", ""),
-            "st_direction"     : sig.get("st_direction", ""),
-            "st_value"         : sig.get("st_value", ""),
+            "stoch_k"          : sig.get("stoch_k", ""),
+            "stoch_d"          : sig.get("stoch_d", ""),
             "vol_ratio"        : sig.get("vol_ratio", ""),
             "vwap"             : (self._nifty_vwap.value
                                   if self._nifty_vwap.value is not None else "N/A"),
@@ -1512,8 +1493,8 @@ class BBStochNiftyStrategy(BaseStrategy):
             "bb_lower"     : bb.get("lower", ""),
             "bb_bw_pct"    : bb.get("bw_pct", ""),
             "bb_squeeze"   : bb.get("squeeze", ""),
-            "st_direction" : sig.get("st_direction", ""),
-            "st_value"     : sig.get("st_value", ""),
+            "stoch_k"      : sig.get("stoch_k", ""),
+            "stoch_d"      : sig.get("stoch_d", ""),
             "vol_ratio"    : sig.get("vol_ratio", ""),
             "atr"          : sig.get("atr", ""),
             "vwap"         : (self._nifty_vwap.value
@@ -1556,7 +1537,7 @@ class BBStochNiftyStrategy(BaseStrategy):
             f"WinRate={win_pct*100:.1f}% Expect={exp:+.3f}pts "
             f"DayPnL={self._daily_pnl:+.2f}Rs | "
             f"5m-bars={len(self._buf_5m)} | "
-            f"ST({CFG['st_period']},{CFG['st_multiplier']})-trend-filter=ACTIVE"
+            f"Stoch({CFG['stoch_k_period']},{CFG['stoch_k_smooth']},{CFG['stoch_d_smooth']})-momentum-filter=ACTIVE"
         )
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
