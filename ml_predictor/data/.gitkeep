@@ -1,0 +1,3 @@
+# This folder holds nifty_5min.csv, banknifty_5min.csv, vix_5min.csv
+# Already present on the VPS — not included in this code-only package.
+# Run data_fetcher.py here if starting fresh.

@@ -7,10 +7,10 @@ Saves to ml_predictor/data/*.csv and supports --append mode for daily updates.
 
 Usage:
     # First-time full fetch (2018 → today):
-    python ml_predictor/data_fetcher.py
+    python3 ml_predictor/data_fetcher.py
 
     # Daily append (cron at 15:40):
-    python ml_predictor/data_fetcher.py --append
+    python3 ml_predictor/data_fetcher.py --append
 
 Reuses your existing token.json — no separate login needed.
 """
@@ -53,7 +53,11 @@ INSTRUMENTS = {
 }
 
 CHUNK_DAYS   = 90    # stay under Kite's 100-day limit
-SLEEP_BETWEEN_CALLS = 0.4   # 3 req/sec max → stay safe at ~2.5/sec
+SLEEP_BETWEEN_CALLS = 0.6   # Historical Data API is capped at 2 req/sec
+                            # (not the general 10 req/sec "all other endpoints"
+                            # limit — confirmed on Zerodha's own developer forum:
+                            # /instruments/historical = max 120 req/min = 2/sec).
+                            # 0.6s/call -> ~1.67 req/sec, safe margin under that cap.
 START_DATE   = datetime(2018, 1, 1)
 
 
@@ -95,12 +99,26 @@ def _load_kite():
 
 # ── Core fetch logic ──────────────────────────────────────────────────────────
 
-def fetch_chunks(kite, token: int, from_dt: datetime, to_dt: datetime) -> pd.DataFrame:
+def fetch_chunks(kite, token: int, from_dt: datetime, to_dt: datetime,
+                  max_retries: int = 3) -> pd.DataFrame:
     """
     Fetch 5-min candles in 90-day chunks between from_dt and to_dt.
     Returns combined DataFrame sorted by datetime index.
+
+    Retries each chunk up to max_retries times (with backoff) before giving
+    up. Previously, ANY exception (a single transient network blip, a
+    429 rate-limit response, anything) silently skipped the entire 90-day
+    chunk with just a log.warning — no retry, and nothing in the returned
+    DataFrame to indicate a gap exists. Confirmed: a downstream training
+    run on a CSV with a chunk-shaped hole in it would see fewer rows for
+    that period with no error, indistinguishable from "the market was
+    closed." This now retries transient failures, and if a chunk still
+    fails after all retries, the gap is collected and raised/logged loudly
+    via self.failed_chunks (checked by fetch_full/fetch_append) instead of
+    disappearing silently.
     """
     all_records = []
+    failed_chunks = []
     chunk_start = from_dt
 
     while chunk_start < to_dt:
@@ -108,25 +126,53 @@ def fetch_chunks(kite, token: int, from_dt: datetime, to_dt: datetime) -> pd.Dat
 
         log.info(f"  Fetching token={token} | {chunk_start.date()} → {chunk_end.date()}")
 
-        try:
-            records = kite.historical_data(
-                instrument_token=token,
-                from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
-                to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
-                interval="5minute",
-                continuous=False,
-                oi=False,
-            )
+        records = None
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                records = kite.historical_data(
+                    instrument_token=token,
+                    from_date=chunk_start.strftime("%Y-%m-%d %H:%M:%S"),
+                    to_date=chunk_end.strftime("%Y-%m-%d %H:%M:%S"),
+                    interval="5minute",
+                    continuous=False,
+                    oi=False,
+                )
+                break  # success
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    backoff = SLEEP_BETWEEN_CALLS * (2 ** attempt)  # exponential backoff
+                    log.warning(f"    → Fetch error (attempt {attempt}/{max_retries}, "
+                                f"retrying in {backoff:.1f}s): {e}")
+                    time.sleep(backoff)
+                else:
+                    log.error(f"    → Fetch FAILED after {max_retries} attempts: {e}")
+
+        if records is not None:
             all_records.extend(records)
             log.info(f"    → {len(records)} candles fetched")
-        except Exception as e:
-            log.warning(f"    → Fetch error (skipping chunk): {e}")
+        else:
+            failed_chunks.append((chunk_start, chunk_end, str(last_error)))
+            log.error(
+                f"    → GAP CREATED: {chunk_start.date()} to {chunk_end.date()} "
+                f"could not be fetched after {max_retries} attempts. This window "
+                f"will be MISSING from the resulting data."
+            )
 
         chunk_start = chunk_end
         time.sleep(SLEEP_BETWEEN_CALLS)
 
+    if failed_chunks:
+        log.error(f"  ⚠ {len(failed_chunks)} chunk(s) failed for token={token} — "
+                  f"resulting data has gaps. Re-run fetch for these windows:")
+        for cs, ce, err in failed_chunks:
+            log.error(f"      {cs.date()} to {ce.date()}  (error: {err})")
+
     if not all_records:
-        return pd.DataFrame()
+        df = pd.DataFrame()
+        df.attrs["failed_chunks"] = failed_chunks
+        return df
 
     df = pd.DataFrame(all_records)
     df.rename(columns={"date": "datetime"}, inplace=True)
@@ -134,12 +180,29 @@ def fetch_chunks(kite, token: int, from_dt: datetime, to_dt: datetime) -> pd.Dat
     df.set_index("datetime", inplace=True)
     df.sort_index(inplace=True)
 
+    # Strip timezone immediately. Kite's historical_data returns ISO8601
+    # timestamps with a +05:30 offset, so pd.to_datetime above produces a
+    # tz-AWARE index. Every existing CSV on disk was written by an earlier
+    # run as tz-NAIVE (pd.read_csv with parse_dates doesn't preserve offset
+    # info the same way, and the very first fetch_full() run already had
+    # this problem). fetch_append() later does
+    # pd.concat([existing_tz_naive, df_new_tz_aware]) — mixing the two
+    # silently degrades the index to dtype=object (confirmed: pandas gives
+    # no warning here), and writing THAT to CSV produces a file pandas
+    # can no longer even parse as datetimes on the next read (falls back
+    # to a plain string Index). Stripping tz here, at the earliest possible
+    # point, guarantees every DataFrame this function returns is tz-naive,
+    # so it's always safe to concat with existing on-disk data.
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
+
     # Market hours only 09:15–15:30
     df = df.between_time("09:15", "15:30")
 
     # Drop duplicates (chunk boundaries can overlap)
     df = df[~df.index.duplicated(keep="last")]
 
+    df.attrs["failed_chunks"] = failed_chunks
     return df
 
 
@@ -158,6 +221,11 @@ def fetch_full(kite) -> dict:
         if df.empty:
             log.warning(f"  No data fetched for {name}")
             continue
+
+        if df.attrs.get("failed_chunks"):
+            log.error(f"  ⚠ {name}: {len(df.attrs['failed_chunks'])} chunk(s) "
+                      f"permanently missing — see errors above. Saved CSV WILL "
+                      f"have gaps. Re-run fetch_full for {name} to retry.")
 
         csv_path = os.path.join(DATA_DIR, cfg["csv"])
         df.to_csv(csv_path)
@@ -181,6 +249,9 @@ def fetch_append(kite) -> dict:
         if not os.path.exists(csv_path):
             log.info(f"  {name}: no CSV found — running full fetch")
             df_new = fetch_chunks(kite, cfg["token"], START_DATE, to_dt)
+            if df_new.attrs.get("failed_chunks"):
+                log.error(f"  ⚠ {name}: {len(df_new.attrs['failed_chunks'])} chunk(s) "
+                          f"failed during initial full fetch — CSV will have gaps.")
         else:
             existing = pd.read_csv(csv_path, index_col=0, parse_dates=True)
             last_dt  = existing.index.max()
@@ -193,6 +264,15 @@ def fetch_append(kite) -> dict:
 
             log.info(f"  {name}: appending from {from_dt.date()} to {to_dt.date()}")
             df_new = fetch_chunks(kite, cfg["token"], from_dt, to_dt)
+
+            if df_new.attrs.get("failed_chunks"):
+                log.error(
+                    f"  ⚠ {name}: today's append FAILED after retries — "
+                    f"{from_dt.date()} to {to_dt.date()} will be MISSING from "
+                    f"the CSV. Tomorrow's append will resume from the last "
+                    f"SUCCESSFUL row ({last_dt}), permanently skipping this gap "
+                    f"unless you manually re-run fetch_append for this window."
+                )
 
             if df_new.empty:
                 log.info(f"  {name}: no new candles")
@@ -253,9 +333,29 @@ if __name__ == "__main__":
 
     if args.append:
         log.info("MODE: Append (fetching new candles only)")
-        fetch_append(kite)
+        results = fetch_append(kite)
     else:
         log.info("MODE: Full fetch (2018 → today)")
-        fetch_full(kite)
+        results = fetch_full(kite)
 
-    log.info("\nDone.")
+    # Exit non-zero if ANY instrument had a chunk that failed permanently
+    # (after retries — see fetch_chunks's max_retries logic). Previously
+    # this script always exited 0 regardless of fetch outcome, so cron
+    # would report "success" even when a 90-day (full fetch) or single-day
+    # (append) window was silently missing from the CSV — the failure was
+    # only visible to someone who actively read the log file. A non-zero
+    # exit here means cron's own job-failure tracking (mail, monitoring,
+    # whatever you have wired to cron) catches this without anyone needing
+    # to read logs/ml_data.log proactively.
+    any_failures = False
+    for name, df in results.items():
+        failed = df.attrs.get("failed_chunks") if hasattr(df, "attrs") else None
+        if failed:
+            any_failures = True
+            log.error(f"⚠ {name}: {len(failed)} chunk(s) permanently failed "
+                      f"this run — data has gaps.")
+
+    log.info("\nDone." if not any_failures else "\nCompleted WITH ERRORS (see above).")
+
+    if any_failures:
+        sys.exit(1)

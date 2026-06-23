@@ -1,0 +1,6 @@
+# Trained model artifacts land here after running train.py:
+#   scaler_<instrument>.pkl
+#   xgb_<instrument>_A.json / _B.json / _C.json
+#   lstm_<instrument>.keras
+#   metrics.json
+# Empty until you run: python3 ml_predictor/train.py
