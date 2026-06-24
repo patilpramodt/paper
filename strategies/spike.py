@@ -75,6 +75,29 @@ BUG FIXES IN THIS VERSION
     The slot stays locked throughout. On success or exchange close
     confirmation, slot is released and PnL is logged normally.
 
+  BUG FIX 6 — Spike window gate: entries blocked after 9:30.
+    Previously: if no signal fired in 9:15–9:30 window, _trade_done
+    remained False and _trade remained None all day. on_tick() would
+    continue calling _check_2candle_signal() until 15:15, allowing a
+    signal at e.g. 11:00 AM to enter a real position.
+    Fix: on_tick() sets _trade_done=True as soon as spike_exit_time
+    is reached with no open trade, permanently blocking further entries.
+
+  BUG FIX 7 — Pending entry overwrite by subsequent candle signal.
+    Previously: if _pending_entry was set (option had no valid price yet)
+    and the next 8s candle fired a new signal, _pending_entry was
+    silently overwritten — potentially switching CE→PE or vice versa.
+    Fix: on_tick() checks _pending_entry is None before calling
+    _check_2candle_signal().
+
+  BUG FIX 8 — Pending entry resolved after spike window closes.
+    Previously: if _pending_entry was set at 9:29:58 and the option tick
+    arrived at 9:30:02 (after _trade_done was set True by BUG FIX 6),
+    on_option_tick() would still call _build_entry() and enter a position
+    outside the spike window.
+    Fix: on_option_tick() pending entry resolution also checks
+    not self._trade_done before calling _build_entry().
+
   OTHER (pre-existing fixes retained):
   - pre_market() subscribes ATM CE+PE even when prev_close is None.
   - on_tick() subscribes ATM options on very first market tick if
@@ -197,7 +220,7 @@ class SpikeStrategy(BaseStrategy):
         self._expiry_date       = pm.expiry_date
 
         log.info(f"[SPIKE] Pre-market | "
-                 f"body=[{self._prev_body_low}  {self._prev_body_high}] "
+                 f"body=[{self._prev_body_low} – {self._prev_body_high}] "
                  f"prev_close={pm.prev_close} | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
 
         ref_price = pm.prev_close or pm.prev_last5m_close
@@ -256,9 +279,19 @@ class SpikeStrategy(BaseStrategy):
             self._determine_gap_direction(price)
             self._gap_filter_done = True
 
-        # All entries (gap or no gap) go through the 2x8s candle signal.
+        # BUG FIX 6: Close spike window when time passes 9:30 with no trade.
+        # Without this guard, _check_2candle_signal is called all day until
+        # 15:15, and any signal at e.g. 11:00 AM would trigger a real entry.
+        if not self._trade_done and self._trade is None and t >= CFG["spike_exit_time"]:
+            log.info("[SPIKE] Spike window closed (9:30) with no trade — done for today.")
+            self._trade_done = True
+
+        # BUG FIX 7: Guard _pending_entry so a second candle signal cannot
+        # overwrite a pending entry that has not been resolved yet.
+        # All entries go through the 2x8s candle signal.
         if (not self._trade_done and
                 self._trade is None and
+                self._pending_entry is None and   # BUG FIX 7
                 closed_8s is not None):
             self._check_2candle_signal(closed_8s, price, ts)
 
@@ -290,9 +323,17 @@ class SpikeStrategy(BaseStrategy):
           When _do_exit() is executing (or emergency exit thread is running),
           _exit_in_progress is True. on_option_tick() skips SL checks entirely
           to prevent concurrent duplicate exit attempts from rapid tick delivery.
+
+        BUG FIX 8 — Pending entry not resolved after spike window closes:
+          _trade_done is also checked before resolving pending entry so that
+          a pending entry set at 9:29:58 is not entered after the window closes.
         """
-        # Job 1: resolve pending gap entry
-        if self._pending_entry and token == self._pending_entry["token"] and not self._trade:
+        # Job 1: resolve pending entry
+        # BUG FIX 8: added "not self._trade_done" to block post-window resolution
+        if (self._pending_entry and
+                token == self._pending_entry["token"] and
+                not self._trade and
+                not self._trade_done):           # BUG FIX 8
             p = self._pending_entry
             self._pending_entry = None
             log.info(f"[SPIKE] Pending entry resolved — first live tick for {p['sym']} "
@@ -762,8 +803,9 @@ class SpikeStrategy(BaseStrategy):
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
-    def _check_signal(self, c1: dict, c2: dict) -> Optional[str]:
-        if self._is_doji(c1) or self._is_doji(c2):
+    @staticmethod
+    def _check_signal(c1: dict, c2: dict) -> Optional[str]:
+        if SpikeStrategy._is_doji(c1) or SpikeStrategy._is_doji(c2):
             return None
         if c1["close"] > c1["open"] and c2["close"] > c2["open"]:
             return "CE"
