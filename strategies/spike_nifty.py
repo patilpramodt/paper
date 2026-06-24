@@ -6,10 +6,12 @@ Mirrors SPIKE (BankNifty) but with Nifty-specific parameters.
 
 ENTRY LOGIC (updated):
   No direct gap entry. Regardless of gap direction, wait for the first
-  closed 8-second (2-tick) candle after 9:15.
-    - Candle is RED   (close < open)  → take PE
-    - Candle is GREEN (close > open)  → take CE
-    - Doji (close ≈ open)             → skip, wait for next candle
+  TWO CONSECUTIVE closed 8-second (2-tick) candles after 9:15 that agree
+  in direction:
+    - Both candles RED   (close < open) → take PE
+    - Both candles GREEN (close > open) → take CE
+    - Either candle is a doji, or the two disagree → no signal, wait
+      for the next pair
   Gap direction is still logged for reference but does NOT trigger entry.
 
 INDEX
@@ -281,10 +283,11 @@ class SpikeNiftyStrategy(BaseStrategy):
         Entry logic:
           Gap direction is detected on the first tick and logged, but does NOT
           trigger an immediate entry. All entries — gap or no gap — wait for
-          the first closed 8-second (2-tick) candle after 9:15.
-            GREEN candle → CE
-            RED   candle → PE
-            Doji         → skip, wait for next candle
+          the first two consecutive closed 8-second (2-tick) candles after
+          9:15 that agree in direction.
+            Both candles GREEN → CE
+            Both candles RED   → PE
+            Doji, or disagreement → skip, wait for next pair
         """
         t = ts.time()
 
@@ -463,38 +466,34 @@ class SpikeNiftyStrategy(BaseStrategy):
             self._gap_direction = "BOTH"
             log.info(f"[{self.name}]  NO GAP (fallback): open inside [{bl:.0f}–{bh:.0f}]")
 
-    # ── 2-tick candle signal ──────────────────────────────────────────────────
+    # ── 2x8s candle signal ─────────────────────────────────────────────────────
 
     def _check_2candle_signal(self, latest_closed: dict, index_price: float, ts: datetime):
         """
-        Entry signal based on the FIRST closed 8-second (2-tick) candle after 9:15.
-          - Candle is GREEN (close > open) → take CE
-          - Candle is RED   (close < open) → take PE
-          - Doji (close ≈ open)            → skip, wait for next candle
+        Entry signal based on the last TWO closed 8-second (2-tick) candles
+        after 9:15 — they must agree in direction:
+          - Both candles GREEN (close > open) → take CE
+          - Both candles RED   (close < open) → take PE
+          - Either candle is a doji, or they disagree → no signal, wait
+            for the next pair
 
         This logic applies regardless of gap direction.
         Gap direction is ignored for the entry decision.
         """
-        c = latest_closed  # most recent closed 8s candle
-
-        if self._is_doji(c):
-            log.info(
-                f"[{self.name}] 8s candle is doji — skipping "
-                f"(o={c['open']:.1f} c={c['close']:.1f})"
-            )
+        last_two = self._index_8s.last_n_closed(2)
+        if len(last_two) < 2:
             return
 
-        if c["close"] > c["open"]:
-            signal = "CE"
-            color  = "GREEN"
-        else:
-            signal = "PE"
-            color  = "RED"
+        c1, c2 = last_two[-2], last_two[-1]
+        signal = self._check_signal(c1, c2)
+        if not signal:
+            return
 
         log.info(
-            f"[{self.name}] 2-tick candle signal: {color} → {signal} "
+            f"[{self.name}] 2x8s candle signal: {signal} "
             f"at {ts.strftime('%H:%M:%S')} "
-            f"(o={c['open']:.1f} c={c['close']:.1f})"
+            f"(c1 o={c1['open']:.1f} c={c1['close']:.1f} | "
+            f"c2 o={c2['open']:.1f} c={c2['close']:.1f})"
         )
 
         if signal == "CE" and self._pre_ce_token:
@@ -683,6 +682,22 @@ class SpikeNiftyStrategy(BaseStrategy):
         self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _check_signal(c1: dict, c2: dict) -> Optional[str]:
+        """
+        Two consecutive 8-second candles must agree in direction:
+          both GREEN (close > open) → CE
+          both RED   (close < open) → PE
+          either is a doji, or they disagree → None (no signal)
+        """
+        if SpikeNiftyStrategy._is_doji(c1) or SpikeNiftyStrategy._is_doji(c2):
+            return None
+        if c1["close"] > c1["open"] and c2["close"] > c2["open"]:
+            return "CE"
+        if c1["close"] < c1["open"] and c2["close"] < c2["open"]:
+            return "PE"
+        return None
 
     @staticmethod
     def _is_doji(c: dict) -> bool:
