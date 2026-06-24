@@ -70,15 +70,75 @@ INSTRUMENTS
   t.py loads a separate InstrumentStore and PreMarketData for this strategy
   using index_token=256265, and calls pre_market(nifty_pm, nifty_instruments).
 
-FIXES INHERITED FROM SPIKE (BankNifty)
+BUG FIXES IN THIS VERSION
+──────────────────────────
+  BUG FIX 1 — NameError: color (CRITICAL — strategy was never trading):
+    _check_2candle_signal() used an undefined variable `color` in the
+    _build_entry() reason string. This crashed on every valid signal, so
+    SPIKE_NIFTY has never executed a trade.
+    Fix: replaced with the literal string "2x8s_signal".
+
+  BUG FIX 2 — _do_exit() state guard with _exit_in_progress flag:
+    Previously: t["state"] = "CLOSED" was set BEFORE the SELL executed.
+    If the SELL failed, state was permanently CLOSED and _do_exit() could
+    never be re-entered. Position stayed open in Zerodha with no software
+    awareness. Slot was also released unconditionally (BUG FIX 3).
+    Fix: state is only set CLOSED after SELL confirm. _exit_in_progress
+    prevents duplicate concurrent exit attempts.
+
+  BUG FIX 3 — Slot not released when SELL fails with position still open:
+    Slot is now released ONLY when position is confirmed closed. If SELL
+    fails with position still open, slot stays LOCKED and emergency exit
+    thread takes over.
+
+  BUG FIX 4 — No _exit_in_progress guard in on_option_tick():
+    Previously: on_option_tick() SL check had no guard against _exit_in_progress.
+    Rapid tick bursts could enter _do_exit() concurrently, placing two sell orders.
+    Fix: added _exit_in_progress check before the SL branch (matches spike.py).
+
+  BUG FIX 5 — Emergency exit background thread (ported from spike.py):
+    After all 3 SELL retries fail with position confirmed still open,
+    a daemon thread retries the SELL every 30 seconds for up to 15 min.
+    The slot stays locked throughout.
+
+  BUG FIX 6 — Spike window gate: entries blocked after 9:30:
+    If no signal fired in 9:15–9:30 window, _trade_done remained False
+    all day, allowing entries at e.g. 11:00 AM.
+    Fix: on_tick() sets _trade_done=True when spike_exit_time is reached
+    with no open trade.
+
+  BUG FIX 7 — Pending entry overwritten by subsequent candle signal:
+    If _pending_entry was set and the next 8s candle fired a new signal,
+    _pending_entry was silently overwritten.
+    Fix: on_tick() checks _pending_entry is None before calling
+    _check_2candle_signal().
+
+  BUG FIX 8 — Pending entry resolved after spike window closes:
+    If _pending_entry was set at 9:29:58 and the option tick arrived after
+    9:30 (after _trade_done was set True by BUG FIX 6), on_option_tick()
+    would still call _build_entry() and enter a post-window position.
+    Fix: on_option_tick() pending entry resolution checks not self._trade_done.
+
+  BUG FIX 9 — Missing import time as _time_mod:
+    Emergency exit thread uses _time_mod.sleep(). The import was present in
+    spike.py but missing here.
+    Fix: added "import time as _time_mod".
+
+  BUG FIX 10 — Missing emergency retry config keys:
+    CFG was missing "emergency_retry_sec" and "emergency_max_attempts" needed
+    by the emergency exit thread.
+    Fix: both keys added to CFG.
+
+  BUG FIX 11 — _check_signal was @staticmethod calling SpikeNiftyStrategy
+    directly (self-reference on _is_doji). Already correct — retained as-is.
+
+  OTHER (pre-existing fixes retained):
   - pre_market() pre-subscribes ATM CE+PE even when prev_close is None.
   - on_tick() subscribes ATM options on very first market tick if
     pre-subscription failed.
   - Pending entry mechanism for stale/missing pre-9:15 option prices.
-  - SL grace period: SL check suppressed for SL_GRACE_SECONDS after entry
-    to prevent stale/volatile ticks immediately after BUY confirm from
-    triggering a false SL exit.
-  - Unused option unsubscribed after entry.
+  - SL grace period: SL check suppressed for sl_grace_seconds after entry.
+  - Unused option leg unsubscribed after entry.
   - SL calculated from actual exchange fill price, not pre-order LTP.
 """
 
@@ -86,6 +146,7 @@ import csv
 import logging
 import os
 import threading
+import time as _time_mod          # BUG FIX 9: needed by emergency exit thread
 from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 
@@ -146,6 +207,12 @@ CFG = {
     # from the ~15s _confirm_order() polling window. At 9:15 AM these can
     # easily be below the SL. Suppress SL checks for this many seconds.
     "sl_grace_seconds"       : 10,
+
+    # ── Emergency exit (BUG FIX 10: keys were missing) ───────────────────────
+    # emergency_retry_sec    : seconds between emergency SELL retry attempts
+    # emergency_max_attempts : max retries before giving up (30×30s = 15 min)
+    "emergency_retry_sec"    : 30,
+    "emergency_max_attempts" : 30,
 }
 
 
@@ -229,7 +296,7 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         log.info(
             f"[{self.name}] Pre-market | "
-            f"body=[{self._prev_body_low}  {self._prev_body_high}] "
+            f"body=[{self._prev_body_low} – {self._prev_body_high}] "
             f"prev_close={pm.prev_close} expiry={pm.expiry_date} "
             f"mode={'LIVE' if LIVE_MODE else 'PAPER'}"
         )
@@ -309,17 +376,29 @@ class SpikeNiftyStrategy(BaseStrategy):
             self._determine_gap_direction(price)
             self._gap_filter_done = True
 
+        # BUG FIX 6: Close spike window when time passes 9:30 with no trade.
+        # Without this guard, _check_2candle_signal is called all day until
+        # 15:15, and any signal at e.g. 11:00 AM would trigger a real entry.
+        if not self._trade_done and self._trade is None and t >= CFG["spike_exit_time"]:
+            log.info(f"[{self.name}] Spike window closed (9:30) with no trade — done for today.")
+            self._trade_done = True
+
+        # BUG FIX 7: Guard _pending_entry so a second candle signal cannot
+        # overwrite a pending entry that has not been resolved yet.
         # All entries (gap or no gap) go through the first 2-tick candle signal.
         if (not self._trade_done and
                 self._trade is None and
+                self._pending_entry is None and   # BUG FIX 7
                 closed_8s is not None):
             self._check_2candle_signal(closed_8s, price, ts)
 
-        if self._trade and self._trade["state"] == "OPEN":
+        # BUG FIX 2 + BUG FIX 4: only attempt time-exit if no exit already in progress
+        if (self._trade and
+                self._trade["state"] == "OPEN" and
+                not self._trade.get("_exit_in_progress")):   # BUG FIX 4
             if t >= CFG["spike_exit_time"]:
                 opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
                 self._do_exit(opt_price, "SPIKE_WINDOW_END", ts)
-                return
 
     def on_candle(self, candle: dict, ts: datetime):
         pass
@@ -340,9 +419,22 @@ class SpikeNiftyStrategy(BaseStrategy):
         Job 3 — SL grace period:
           SL checks are suppressed for sl_grace_seconds after entry fill to
           prevent stale buffered ticks from causing an immediate false exit.
+
+        BUG FIX 4 — _exit_in_progress guard:
+          When _do_exit() is executing (or emergency exit thread is running),
+          _exit_in_progress is True. on_option_tick() skips SL checks entirely
+          to prevent concurrent duplicate exit attempts from rapid tick delivery.
+
+        BUG FIX 8 — Pending entry not resolved after spike window closes:
+          Also checks not self._trade_done so that a pending entry set at
+          9:29:58 is not entered after the window has already closed.
         """
         # ── Job 1: Resolve pending entry ──────────────────────────────────────
-        if self._pending_entry and token == self._pending_entry["token"] and not self._trade:
+        # BUG FIX 8: added "not self._trade_done" to block post-window resolution
+        if (self._pending_entry and
+                token == self._pending_entry["token"] and
+                not self._trade and
+                not self._trade_done):             # BUG FIX 8
             p = self._pending_entry
             self._pending_entry = None
             log.info(
@@ -362,7 +454,8 @@ class SpikeNiftyStrategy(BaseStrategy):
         use_ts = tick_ts if tick_ts else ts
         self._opt_8s.feed_tick(price, use_ts)
 
-        if self._trade["state"] != "OPEN":
+        # BUG FIX 4: skip all SL logic when exit is already being handled
+        if self._trade["state"] != "OPEN" or self._trade.get("_exit_in_progress"):
             return
 
         # Update highest seen
@@ -515,7 +608,8 @@ class SpikeNiftyStrategy(BaseStrategy):
             return
 
         self.subscribe_option(token)
-        self._build_entry(sym, token, signal, ts, reason=f"2tick_candle_{color.lower()}")
+        # BUG FIX 1: was `f"2tick_candle_{color.lower()}"` — `color` was never defined.
+        self._build_entry(sym, token, signal, ts, reason="2x8s_signal")
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
@@ -580,18 +674,20 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         self._opt_8s = SecondCandleBuilder(seconds=CFG["bucket_sec"])
         self._trade = {
-            "state"         : "OPEN",
-            "symbol"        : sym,
-            "token"         : token,
-            "signal"        : signal,
-            "entry"         : fill_price,
-            "sl"            : sl,
-            "highest_seen"  : fill_price,
-            "entry_time"    : ts,
-            "sl_active_from": sl_active_from,
-            "gap_direction" : self._gap_direction,
-            "order_id"      : order_id,
-            "qty"           : CFG["quantity"],
+            "state"            : "OPEN",
+            "symbol"           : sym,
+            "token"            : token,
+            "signal"           : signal,
+            "entry"            : fill_price,
+            "sl"               : sl,
+            "highest_seen"     : fill_price,
+            "entry_time"       : ts,
+            "sl_active_from"   : sl_active_from,
+            "gap_direction"    : self._gap_direction,
+            "order_id"         : order_id,
+            "qty"              : CFG["quantity"],
+            # BUG FIX 2: exit guard flag — was absent in original spike_nifty.py
+            "_exit_in_progress": False,
         }
 
         # Unsubscribe the unused option leg to prevent stale ticks
@@ -629,32 +725,190 @@ class SpikeNiftyStrategy(BaseStrategy):
 
     def _do_exit(self, exit_price: float, reason: str, ts: datetime):
         """
-        Close the open position via place_sell_with_retry (up to 3 attempts).
-        PnL is calculated from the confirmed exchange fill price.
-        Releases the global live trade slot after exit.
+        Close the open position.
+
+        BUG FIX 2 — _exit_in_progress guard:
+          Set _exit_in_progress = True at the top so concurrent on_option_tick
+          calls (WebSocket tick bursts) cannot enter here simultaneously.
+          state is only set to "CLOSED" AFTER the SELL is confirmed —
+          not before (the original bug). This preserves re-entry ability if
+          SELL fails transiently.
+
+        BUG FIX 3 — Slot management:
+          Slot is released ONLY when the position is confirmed closed.
+          If SELL fails with position still open, slot stays LOCKED and
+          an emergency exit thread takes over. This prevents another live
+          strategy from entering while the position is unresolved.
+
+        Flow:
+          success  → state=CLOSED, release_slot, _finalize_exit
+          fail + position closed by exchange → state=CLOSED,
+                  release_slot, _finalize_exit (with AUTO_CLOSED reason)
+          fail + position still open → _exit_in_progress stays True,
+                  slot LOCKED, _start_emergency_exit() thread launched
         """
         t = self._trade
         if not t or t["state"] != "OPEN":
             return
-        t["state"] = "CLOSED"
+        # BUG FIX 2: prevent duplicate concurrent exit attempts
+        if t.get("_exit_in_progress"):
+            return
+        t["_exit_in_progress"] = True
 
         result = self._place_sell_with_retry(
             t["symbol"], t["token"], t["qty"], exit_price, max_retries=3
         )
-        if result is None:
-            if LIVE_MODE:
-                log.error(
-                    f"[{self.name}] SELL FAILED for {t['symbol']} — "
-                    f"marked closed in software but may still be open in Zerodha! "
-                    f"SQUARE OFF MANUALLY."
-                )
-            sell_price = exit_price
-            order_id   = None
-        else:
+
+        if result is not None:
+            # ── SUCCESS: SELL confirmed ────────────────────────────────────────
             order_id, sell_price = result
+            t["state"] = "CLOSED"       # BUG FIX 2: only set CLOSED after confirm
+            self._release_slot()        # BUG FIX 3: released only on success
+            self._finalize_exit(t, sell_price, order_id, reason, ts)
+            return
 
+        # ── ALL 3 RETRIES FAILED ───────────────────────────────────────────────
+        if LIVE_MODE:
+            still_open = self._hub.order_router._is_position_open(t["symbol"])
+
+            if not still_open:
+                # Position closed by exchange (auto square-off or phantom fill)
+                log.warning(
+                    f"[{self.name}] SELL failed after 3 retries but position confirmed "
+                    f"CLOSED by exchange (auto square-off or phantom fill). "
+                    f"Treating as closed."
+                )
+                t["state"] = "CLOSED"
+                self._release_slot()
+                self._finalize_exit(t, exit_price, None, f"{reason}_EXCHANGE_CLOSED", ts)
+                return
+
+            # Position confirmed still OPEN — keep slot locked, start emergency thread
+            log.error(
+                f"\n{'!'*60}\n"
+                f"[{self.name}] CRITICAL: SELL failed after 3 retries — "
+                f"position STILL OPEN for {t['symbol']}!\n"
+                f"  Slot is LOCKED — no other strategy can enter.\n"
+                f"  Emergency exit thread starting (retry every "
+                f"{CFG['emergency_retry_sec']}s for up to "
+                f"{CFG['emergency_max_attempts'] * CFG['emergency_retry_sec'] // 60} min).\n"
+                f"  *** CHECK ZERODHA CONSOLE IF EMERGENCY EXIT ALSO FAILS! ***\n"
+                f"{'!'*60}"
+            )
+            # _exit_in_progress stays True — prevents on_option_tick re-entering.
+            # Emergency thread is now the sole manager of this position.
+            self._start_emergency_exit(t, exit_price, reason, ts)
+            return
+
+        # Paper mode: paper sell never fails, but handle gracefully
+        t["state"] = "CLOSED"
         self._release_slot()
+        self._finalize_exit(t, exit_price, None, reason, ts)
 
+    # ── Emergency exit (background thread) ───────────────────────────────────
+
+    def _start_emergency_exit(
+        self, t: dict, ref_price: float, reason: str, ts: datetime
+    ):
+        """
+        BUG FIX 5: Launch a daemon thread that retries SELL every
+        emergency_retry_sec seconds for up to emergency_max_attempts attempts.
+
+        The global trade slot stays LOCKED throughout to prevent other
+        live strategies from entering while this position is unresolved.
+
+        Terminates when:
+          a) SELL succeeds       → finalize, release slot
+          b) Position confirmed closed by exchange → finalize, release slot
+          c) Max attempts reached → log CRITICAL, force-release slot
+
+        The main WebSocket loop is unaffected — this runs independently.
+        """
+        def _loop():
+            max_attempts = CFG["emergency_max_attempts"]
+            retry_sec    = CFG["emergency_retry_sec"]
+
+            for attempt in range(1, max_attempts + 1):
+                _time_mod.sleep(retry_sec)
+
+                log.error(
+                    f"[{self.name}] Emergency exit attempt {attempt}/{max_attempts} | "
+                    f"{t['symbol']} | slot LOCKED"
+                )
+
+                # Check if exchange already closed the position
+                still_open = self._hub.order_router._is_position_open(t["symbol"])
+                if not still_open:
+                    log.info(
+                        f"[{self.name}] Emergency exit: {t['symbol']} confirmed CLOSED "
+                        f"by exchange on attempt {attempt}"
+                    )
+                    t["state"] = "CLOSED"
+                    self._release_slot()
+                    now = _now_ist()
+                    self._finalize_exit(t, ref_price, None,
+                                        f"{reason}_EXCHANGE_CLOSED", now)
+                    return
+
+                # Refresh LTP and try SELL
+                ltp = self.get_price(t["token"]) or ref_price
+                result = self._hub.order_router.place_sell(
+                    self.name, t["symbol"], t["token"], t["qty"], ltp, LIVE_MODE
+                )
+
+                if result:
+                    order_id, sell_price = result
+                    t["state"] = "CLOSED"
+                    self._release_slot()
+                    log.info(
+                        f"[{self.name}] Emergency exit SUCCESS on attempt {attempt} "
+                        f"@ {sell_price:.0f}"
+                    )
+                    now = _now_ist()
+                    self._finalize_exit(t, sell_price, order_id,
+                                        f"{reason}_EMERGENCY", now)
+                    return
+
+                log.error(
+                    f"[{self.name}] Emergency exit attempt {attempt}/{max_attempts} FAILED | "
+                    f"{t['symbol']} | ltp={ltp:.0f}"
+                )
+
+            # All attempts exhausted
+            log.error(
+                f"\n{'!'*60}\n"
+                f"[{self.name}] GAVE UP emergency exit for {t['symbol']} after "
+                f"{max_attempts} attempts ({max_attempts * retry_sec // 60} min).\n"
+                f"  *** SQUARE OFF MANUALLY IN ZERODHA CONSOLE IMMEDIATELY! ***\n"
+                f"  Force-releasing slot to prevent indefinite lock.\n"
+                f"{'!'*60}"
+            )
+            t["state"] = "CLOSED"
+            self._release_slot()
+            self._trade_done = True
+
+        thread = threading.Thread(
+            target=_loop,
+            name="spike-nifty-emergency-exit",
+            daemon=True,
+        )
+        thread.start()
+        log.info(f"[{self.name}] Emergency exit thread started for {t['symbol']}")
+
+    # ── Exit finalize (shared by normal + emergency paths) ────────────────────
+
+    def _finalize_exit(
+        self,
+        t:          dict,
+        sell_price: float,
+        order_id:   Optional[str],
+        reason:     str,
+        ts:         datetime,
+    ):
+        """
+        Record PnL, log, write CSV. Called after position is confirmed closed
+        by either the normal exit path or the emergency exit thread.
+        """
         pnl = (sell_price - t["entry"]) * t["qty"]
         self._today_pnl += pnl
         self._trade_done = True
@@ -679,7 +933,12 @@ class SpikeNiftyStrategy(BaseStrategy):
             "mode"         : mode_tag,
             "order_id"     : order_id,
         })
-        self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
+        self._completed.append({
+            **t,
+            "exit_price"  : sell_price,
+            "exit_reason" : reason,
+            "pnl"         : pnl,
+        })
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
