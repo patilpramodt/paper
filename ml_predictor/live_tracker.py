@@ -74,6 +74,19 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 sys.path.insert(0, ROOT_DIR)
 
+# t.py loads config_secrets.env via load_dotenv() before auto_login() ever
+# runs, so ZERODHA_* env vars are guaranteed present by the time _load_kite()
+# needs them. This file is launched as a SEPARATE process (its whole design
+# point — "no changes to any strategy file needed"), so it cannot assume it
+# inherited t.py's environment. Without this, auto_login()'s os.environ[...]
+# lookups raise KeyError on any standalone/cron launch that doesn't happen to
+# run in a shell where these were already exported.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(ROOT_DIR, "config_secrets.env"))
+except ImportError:
+    pass   # python-dotenv not installed — env vars must already be exported
+
 from ml_predictor.targets import FORWARD_CANDLES, DEADBAND
 # Imported (not redefined) so this file can never drift from targets.py's
 # actual target shape. Previously these were hardcoded local constants here
