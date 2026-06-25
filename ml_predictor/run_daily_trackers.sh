@@ -20,11 +20,20 @@
 # itself to ml_predictor/data/predictions_<instrument>_<date>.csv
 #
 # CRON SETUP (run `crontab -e` and add):
-#   15 9 * * 1-5  /full/path/to/paper-main/ml_predictor/run_daily_trackers.sh >> /full/path/to/paper-main/ml_predictor/data/cron.log 2>&1
+#   15 9 * * 1-5  /root/paper/ml_predictor/run_daily_trackers.sh >> /root/paper/ml_predictor/data/cron.log 2>&1
 #
-# 9:15 IST, Mon-Fri only (1-5 = Mon-Fri). Adjust the path and cron server's
-# timezone (`timedatectl` to check) — if the cron server is NOT already in
-# IST, change "15 9" to the equivalent in the server's local time.
+# 9:15 IST, Mon-Fri only (1-5 = Mon-Fri). If TZ=Asia/Kolkata is set at the
+# top of the crontab (as it is here), "15 9" is already IST — no offset
+# needed. If your crontab does NOT set TZ, check the server's local time
+# with `timedatectl` and adjust "15 9" to the equivalent.
+#
+# IMPORTANT: this script REPLACES any direct
+#   ... python3 ml_predictor/live_tracker.py --instrument NIFTY50 ...
+#   ... python3 ml_predictor/live_tracker.py --instrument BANKNIFTY ...
+# lines you may have added by hand earlier. Keep only ONE launch path —
+# either the two direct lines, OR this single wrapper line. Running both
+# launches each instrument's tracker twice, and the second copy will fight
+# the first over the same prediction CSV for that day.
 
 set -uo pipefail
 
