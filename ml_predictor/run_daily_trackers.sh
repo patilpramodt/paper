@@ -65,6 +65,19 @@ launch_one() {
 }
 
 launch_one "NIFTY50"
+
+# STAGGER: this VM has only 1 CPU core (confirmed via `nproc`). Both trackers
+# load TensorFlow/Keras for their LSTM model, and TF's native oneDNN backend
+# initializes its own thread pool on load. Launching both processes within
+# the same second makes them fight over that single core during this native
+# init window, which has been confirmed (June 25 2026) to corrupt the heap —
+# both processes crashed with "free(): invalid pointer" at the identical
+# point, right after "LSTM loaded", every time they were launched together.
+# Logs showed ~10-11s from launch to that crash point, so 30s of separation
+# comfortably clears it. Do not remove this sleep unless the VM is upgraded
+# to 2+ cores — see the bug writeup, dated June 25 2026, before changing.
+sleep 30
+
 launch_one "BANKNIFTY"
 
 echo "[$(date '+%H:%M:%S')] Both trackers dispatched. Check with: screen -list"
