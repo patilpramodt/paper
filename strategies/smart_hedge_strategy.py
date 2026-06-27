@@ -56,6 +56,13 @@ TRADE STRUCTURES:
     BUY  PE at (ATM - long_offset)    ← hedge
     Profits when BANKNIFTY stays inside [short_pe – short_ce] range
 
+  CHANGED 2026-06-27: short_offset 200->400, long_offset 500->700 (spread
+  width unchanged at 300pts/side). A review of 6 paper sessions found the
+  200pt short strike was touched on 5/6 days by ordinary 180-240pt intraday
+  noise, not real directional moves -- the position never got a chance to
+  collect theta. 400pts gives meaningfully more room while keeping the same
+  max-loss profile per lot.
+
 ENTRY FILTERS (all three trade types):
 ──────────────────────────────────────
   Time window  : 9:35 AM – 10:15 AM (after first candle is available)
@@ -70,10 +77,19 @@ EXIT RULES (same for all three):
                 → keep 50% of credit collected
   SL          : exit when current net value ≥ net_credit × 2.0
                 → position has doubled in cost against us
-  BREACH      : emergency exit when spot crosses the short strike(s)
+  BREACH      : exit when the short strike(s) are breached on a CONFIRMED
+                5-min candle CLOSE, not a single tick touch.
                 Condor: breach of either short_CE or short_PE
                 Bull Put: breach below short_PE
                 Bear Call: breach above short_CE
+                CHANGED 2026-06-27: previously closed instantly on the
+                first tick that touched the strike, which meant a single
+                wick could stop the trade out with no chance to recover.
+                Now a tick touch only ARMS a pending flag (see on_tick);
+                the close only fires once the candle's CLOSE confirms
+                price is still beyond the strike (see on_candle). A wick
+                that touches and reverts within the same 5-min candle is
+                ignored and the position stays open.
   TIME STOP   : force close at 3:10 PM
   EOD         : hard close if still open at eod_summary()
 
@@ -127,8 +143,16 @@ CFG = {
     # short_offset → the leg we SELL (closer to ATM, collects more premium)
     # long_offset  → the leg we BUY  (farther OTM, limits max loss)
     # Spread width = long_offset - short_offset = 300 pts per side
-    "short_offset"      : 200,      # pts OTM from ATM for sold leg
-    "long_offset"       : 500,      # pts OTM from ATM for hedge leg
+    #
+    # CHANGED 2026-06-27: short_offset 200 -> 400.
+    # Backtest review of 6 paper sessions (Jun 18-25) showed the short strike
+    # was touched on 5 of 6 days, always by a 180-240pt move (0.3-0.4% of
+    # spot) -- ordinary intraday noise on BANKNIFTY, not a real directional
+    # break. 200pts OTM left almost no room. long_offset widened to 700 to
+    # keep spread_width (and therefore max_loss per lot) in the same range
+    # as before (300pts wide either way).
+    "short_offset"      : 400,      # pts OTM from ATM for sold leg
+    "long_offset"       : 700,      # pts OTM from ATM for hedge leg
 
     # Entry window
     "entry_start"       : dtime(9, 35),   # after first candle, so signal 4 is ready
@@ -311,6 +335,16 @@ class SmartHedgeStrategy(BaseStrategy):
         self._squareoff_done  = False
         self._close_in_flight = False
 
+        # Breach confirmation state.
+        # CHANGED 2026-06-27: breach no longer closes on the first tick that
+        # touches the short strike (a single wick was enough to stop out
+        # on 5 of 6 backtested sessions). Instead a tick touch arms a
+        # "pending" flag, and the breach is only acted on once a closed
+        # 5-min candle confirms price is still beyond the strike. A wick
+        # that touches and reverts within the same candle is ignored.
+        self._breach_pending_side = None   # None | "CE" | "PE"
+        self._breach_armed_ts     = None   # ts when the tick touch happened
+
         # Premarket data
         self._pm            = None
         self._instruments   = None
@@ -390,7 +424,9 @@ class SmartHedgeStrategy(BaseStrategy):
                     self._initiate_close("TIME_STOP", ts)
             return
 
-        # ── Strike Breach ──────────────────────────────────────────────────
+        # ── Strike Breach — tick touch ARMS pending flag, does not close ────
+        # (Confirmation happens in on_candle() once the 5-min candle closes.
+        #  This avoids stopping out on a single wick that reverts.)
         with self._lock:
             trade = self._trade
             if trade is None or self._squareoff_done:
@@ -398,21 +434,44 @@ class SmartHedgeStrategy(BaseStrategy):
 
             if trade.trade_type in (IRON_CONDOR, BEAR_CALL):
                 if trade.short_ce_token and price >= trade.short_ce_strike:
-                    log.warning(
-                        f"[SMART_HEDGE] 🚨 BREACH CE | spot={price:.0f} ≥ "
-                        f"short_CE={trade.short_ce_strike} | type={trade.trade_type}"
-                    )
-                    self._initiate_close("BREACH_CE", ts)
+                    if self._breach_pending_side != "CE":
+                        self._breach_pending_side = "CE"
+                        self._breach_armed_ts     = ts
+                        log.warning(
+                            f"[SMART_HEDGE] ⚠️  BREACH-ARM CE | spot={price:.0f} ≥ "
+                            f"short_CE={trade.short_ce_strike} | type={trade.trade_type} | "
+                            f"waiting for candle close to confirm"
+                        )
                     return
 
             if trade.trade_type in (IRON_CONDOR, BULL_PUT):
                 if trade.short_pe_token and price <= trade.short_pe_strike:
-                    log.warning(
-                        f"[SMART_HEDGE] 🚨 BREACH PE | spot={price:.0f} ≤ "
-                        f"short_PE={trade.short_pe_strike} | type={trade.trade_type}"
-                    )
-                    self._initiate_close("BREACH_PE", ts)
+                    if self._breach_pending_side != "PE":
+                        self._breach_pending_side = "PE"
+                        self._breach_armed_ts     = ts
+                        log.warning(
+                            f"[SMART_HEDGE] ⚠️  BREACH-ARM PE | spot={price:.0f} ≤ "
+                            f"short_PE={trade.short_pe_strike} | type={trade.trade_type} | "
+                            f"waiting for candle close to confirm"
+                        )
                     return
+
+            # Price back inside both strikes → disarm any pending breach.
+            if self._breach_pending_side is not None:
+                still_breached = False
+                if (self._breach_pending_side == "CE" and trade.short_ce_token
+                        and price >= trade.short_ce_strike):
+                    still_breached = True
+                if (self._breach_pending_side == "PE" and trade.short_pe_token
+                        and price <= trade.short_pe_strike):
+                    still_breached = True
+                if not still_breached:
+                    log.info(
+                        f"[SMART_HEDGE] ✅ BREACH-DISARM {self._breach_pending_side} | "
+                        f"spot={price:.0f} back inside strike | wick ignored"
+                    )
+                    self._breach_pending_side = None
+                    self._breach_armed_ts     = None
 
         # ── Gap refresh subscription ────────────────────────────────────────
         if ts.time() >= dtime(9, 20) and len(self._subscribed_tokens) < 4:
@@ -446,6 +505,39 @@ class SmartHedgeStrategy(BaseStrategy):
                 f"[SMART_HEDGE] First candle recorded | "
                 f"open={candle['open']:.0f} close={candle['close']:.0f} → {candle_dir}"
             )
+
+        # ── Breach confirmation — runs every candle, all day ────────────────
+        # A tick touch in on_tick() only ARMS the pending side. We only act
+        # on it here, once this candle's CLOSE confirms price is still beyond
+        # the short strike. This must run regardless of the entry window,
+        # so it sits above the entry_start/entry_cutoff check below.
+        with self._lock:
+            trade = self._trade
+            pending = self._breach_pending_side
+            if trade is not None and pending is not None and not self._squareoff_done:
+                close = candle["close"]
+                confirmed = False
+                if pending == "CE" and trade.short_ce_token and close >= trade.short_ce_strike:
+                    confirmed = True
+                if pending == "PE" and trade.short_pe_token and close <= trade.short_pe_strike:
+                    confirmed = True
+
+                if confirmed:
+                    log.warning(
+                        f"[SMART_HEDGE] 🚨 BREACH CONFIRMED {pending} | "
+                        f"candle_close={close:.0f} | short_CE={trade.short_ce_strike} "
+                        f"short_PE={trade.short_pe_strike} | type={trade.trade_type}"
+                    )
+                    self._breach_pending_side = None
+                    self._breach_armed_ts     = None
+                    self._initiate_close(f"BREACH_{pending}", ts)
+                else:
+                    log.info(
+                        f"[SMART_HEDGE] ✅ BREACH-DISARM {pending} (candle close) | "
+                        f"candle_close={close:.0f} back inside strike | wick ignored"
+                    )
+                    self._breach_pending_side = None
+                    self._breach_armed_ts     = None
 
         # Entry window check
         if not (CFG["entry_start"] <= t < CFG["entry_cutoff"]):
@@ -735,46 +827,80 @@ class SmartHedgeStrategy(BaseStrategy):
             log.info("[SMART_HEDGE]   SLOT BLOCKED — another live strategy has active position")
             return
 
-        # ── Place orders ───────────────────────────────────────────────────
+        # ── Place orders ─────────────────────────────────────────────────────
+        # BUG FIX 2026-06-27: _place_buy()/_place_sell() return
+        # Optional[Tuple[order_id, fill_price]], not a bare order_id. The
+        # previous code stored the raw tuple in oid_* and only ever used it
+        # as a truthy/None check, then built the trade from the PRE-TRADE
+        # reference LTP (sc_ltp/sp_ltp/...) instead of the real fill price.
+        # In paper mode fill_price == ltp so this was silently harmless, but
+        # if LIVE_MODE is ever flipped True, P&L/target/SL would be computed
+        # off stale quotes instead of actual fills. Now we unpack properly
+        # and use the real fill price everywhere below.
         if trade_type == BULL_PUT:
-            oid_sp = self._place_sell(sp_sym, sp_tok, qty, sp_ltp)
-            oid_lp = self._place_buy( lp_sym, lp_tok, qty, lp_ltp)
-            if None in (oid_sp, oid_lp):
+            res_sp = self._place_sell(sp_sym, sp_tok, qty, sp_ltp)
+            res_lp = self._place_buy( lp_sym, lp_tok, qty, lp_ltp)
+            if res_sp is None or res_lp is None:
                 log.error("[SMART_HEDGE]   BULL_PUT order FAILED — rolling back placed legs")
-                if oid_sp: self._place_buy( sp_sym, sp_tok, qty, self.get_price(sp_tok) or sp_ltp)
-                if oid_lp: self._place_sell(lp_sym, lp_tok, qty, self.get_price(lp_tok) or lp_ltp)
+                if res_sp is not None:
+                    self._place_buy( sp_sym, sp_tok, qty, self.get_price(sp_tok) or sp_ltp)
+                if res_lp is not None:
+                    self._place_sell(lp_sym, lp_tok, qty, self.get_price(lp_tok) or lp_ltp)
                 self._release_slot()
                 with self._lock:
                     self._done_today = True
                 return
+            _, sp_ltp = res_sp
+            _, lp_ltp = res_lp
 
         elif trade_type == BEAR_CALL:
-            oid_sc = self._place_sell(sc_sym, sc_tok, qty, sc_ltp)
-            oid_lc = self._place_buy( lc_sym, lc_tok, qty, lc_ltp)
-            if None in (oid_sc, oid_lc):
+            res_sc = self._place_sell(sc_sym, sc_tok, qty, sc_ltp)
+            res_lc = self._place_buy( lc_sym, lc_tok, qty, lc_ltp)
+            if res_sc is None or res_lc is None:
                 log.error("[SMART_HEDGE]   BEAR_CALL order FAILED — rolling back placed legs")
-                if oid_sc: self._place_buy( sc_sym, sc_tok, qty, self.get_price(sc_tok) or sc_ltp)
-                if oid_lc: self._place_sell(lc_sym, lc_tok, qty, self.get_price(lc_tok) or lc_ltp)
+                if res_sc is not None:
+                    self._place_buy( sc_sym, sc_tok, qty, self.get_price(sc_tok) or sc_ltp)
+                if res_lc is not None:
+                    self._place_sell(lc_sym, lc_tok, qty, self.get_price(lc_tok) or lc_ltp)
                 self._release_slot()
                 with self._lock:
                     self._done_today = True
                 return
+            _, sc_ltp = res_sc
+            _, lc_ltp = res_lc
 
         else:  # IRON_CONDOR
-            oid_sc = self._place_sell(sc_sym, sc_tok, qty, sc_ltp)
-            oid_sp = self._place_sell(sp_sym, sp_tok, qty, sp_ltp)
-            oid_lc = self._place_buy( lc_sym, lc_tok, qty, lc_ltp)
-            oid_lp = self._place_buy( lp_sym, lp_tok, qty, lp_ltp)
-            if None in (oid_sc, oid_sp, oid_lc, oid_lp):
+            res_sc = self._place_sell(sc_sym, sc_tok, qty, sc_ltp)
+            res_sp = self._place_sell(sp_sym, sp_tok, qty, sp_ltp)
+            res_lc = self._place_buy( lc_sym, lc_tok, qty, lc_ltp)
+            res_lp = self._place_buy( lp_sym, lp_tok, qty, lp_ltp)
+            if None in (res_sc, res_sp, res_lc, res_lp):
                 log.error("[SMART_HEDGE]   IRON_CONDOR order FAILED — rolling back placed legs")
-                if oid_sc: self._place_buy( sc_sym, sc_tok, qty, self.get_price(sc_tok) or sc_ltp)
-                if oid_sp: self._place_buy( sp_sym, sp_tok, qty, self.get_price(sp_tok) or sp_ltp)
-                if oid_lc: self._place_sell(lc_sym, lc_tok, qty, self.get_price(lc_tok) or lc_ltp)
-                if oid_lp: self._place_sell(lp_sym, lp_tok, qty, self.get_price(lp_tok) or lp_ltp)
+                if res_sc is not None:
+                    self._place_buy( sc_sym, sc_tok, qty, self.get_price(sc_tok) or sc_ltp)
+                if res_sp is not None:
+                    self._place_buy( sp_sym, sp_tok, qty, self.get_price(sp_tok) or sp_ltp)
+                if res_lc is not None:
+                    self._place_sell(lc_sym, lc_tok, qty, self.get_price(lc_tok) or lc_ltp)
+                if res_lp is not None:
+                    self._place_sell(lp_sym, lp_tok, qty, self.get_price(lp_tok) or lp_ltp)
                 self._release_slot()
                 with self._lock:
                     self._done_today = True
                 return
+            _, sc_ltp = res_sc
+            _, sp_ltp = res_sp
+            _, lc_ltp = res_lc
+            _, lp_ltp = res_lp
+
+        # ── Recompute credit/target/SL from ACTUAL fill prices ─────────────
+        # (No-op in paper mode since fill_price == ltp there; matters once
+        # LIVE_MODE=True and real fills can differ from the pre-trade quote.)
+        sold_premium   = (sc_ltp or 0.0) + (sp_ltp or 0.0)
+        bought_premium = (lc_ltp or 0.0) + (lp_ltp or 0.0)
+        net_credit     = sold_premium - bought_premium
+        profit_target  = net_credit * (1.0 - CFG["profit_target_pct"])
+        sl_level       = net_credit * CFG["sl_multiplier"]
 
         # ── Build trade object ─────────────────────────────────────────────
         trade = SmartHedgeTrade(
@@ -797,8 +923,10 @@ class SmartHedgeStrategy(BaseStrategy):
         )
 
         with self._lock:
-            self._trade      = trade
-            self._done_today = True
+            self._trade               = trade
+            self._done_today          = True
+            self._breach_pending_side = None
+            self._breach_armed_ts     = None
 
         # Log the successful signal too (with ENTERED status)
         self._log_signal_audit(
@@ -933,7 +1061,12 @@ class SmartHedgeStrategy(BaseStrategy):
         exit_net  = (sc_exit + sp_exit) - (lc_exit + lp_exit)
         total_pnl = (trade.net_credit - exit_net) * trade.qty
         outcome   = "WIN" if total_pnl > 0 else ("LOSS" if total_pnl < 0 else "BE")
-        duration  = (exit_ts - trade.entry_time).seconds // 60
+        # BUG FIX 2026-06-27: timedelta.seconds only returns the seconds
+        # component (0-86399), NOT the total elapsed time -- if entry/exit
+        # ever crossed midnight or entry_time/exit_ts came from different
+        # clocks this silently produces a wrong (usually too-small) minute
+        # count. total_seconds() is the correct elapsed-time calculation.
+        duration  = int((exit_ts - trade.entry_time).total_seconds() // 60)
 
         log.info(
             f"[SMART_HEDGE] {'✅' if outcome == 'WIN' else '❌'} CLOSED | "
@@ -1015,7 +1148,7 @@ class SmartHedgeStrategy(BaseStrategy):
     ):
         spread_width = CFG["long_offset"] - CFG["short_offset"]
         pnl_per_unit = trade.net_credit - exit_net
-        duration     = (exit_ts - trade.entry_time).seconds // 60
+        duration     = int((exit_ts - trade.entry_time).total_seconds() // 60)
         atm_approx   = (
             trade.short_ce_strike - CFG["short_offset"]
             if trade.short_ce_strike else
