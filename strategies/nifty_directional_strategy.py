@@ -613,11 +613,19 @@ class NiftyDirectionalStrategy(BaseStrategy):
         )
 
         # FIX 3: per-condition DEBUG log
+        # BUG FIX: ternary inside a format spec ({vwap:.0f if vwap else 'N/A'})
+        # is invalid syntax — Python treats everything after ':' in an f-string
+        # as a literal format spec, not an expression. This raised ValueError
+        # on every call, silently killing on_tick() for every Mode A candle
+        # (caught by MarketHub's per-tick try/except and logged only to
+        # core.log, invisible in this strategy's own log file). Pre-format
+        # the value as a plain string before interpolating instead.
+        vwap_disp = f"{vwap:.0f}" if vwap else "N/A"
         log.debug(
             f"[{self.name}] [ModeA] {ts.strftime('%H:%M')} CE check | "
             f"EMA_stack={'✓' if ema_stack_ce else '✗'}({e9:.0f}>{e20:.0f}>{e50:.0f}) "
             f"RSI={'✓' if rsi_ok_ce else '✗'}({rsi:.1f} in [{CFG['rsi_ce_min']}-{CFG['rsi_ce_max']}]) "
-            f"VWAP={'✓' if vwap_ok_ce else '✗'}(close={close:.0f} vwap={vwap:.0f if vwap else 'N/A'}) "
+            f"VWAP={'✓' if vwap_ok_ce else '✗'}(close={close:.0f} vwap={vwap_disp}) "
             f"Pullback={'✓' if pullback_ce else '✗'}"
         )
 
