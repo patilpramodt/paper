@@ -54,7 +54,7 @@ FIXES APPLIED:
 import logging
 import threading
 from collections import deque
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -68,9 +68,25 @@ from scalper_v7_core.paper_engine import PaperEngine, PaperTrade
 from scalper_v7_core.state_manager import save_state, load_state, clear_state
 from scalper_v7_core.config import (
     CANDLE_1M_USE, CANDLE_5M_USE, QUANTITY,
+    CANDLE_1M_INTERVAL, CANDLE_5M_INTERVAL,
 )
 
 log = logging.getLogger("strategy.scalper_v7")
+
+# IST FIX: GitHub Actions runners are UTC — bare datetime.now() returns UTC.
+# Same pattern already used in scalper_v7_core/signal_logic.py and risk_manager.py.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _now_ist() -> datetime:
+    return datetime.now(tz=_IST).replace(tzinfo=None)
+
+
+# BankNifty index instrument token (Zerodha fixed token) — same constant
+# market_hub.py uses internally (_BANKNIFTY_TOKEN). Needed here only for the
+# historical_data() seed fetch in pre_market(); not used for live ticks
+# (those arrive via MarketHub.on_tick()).
+BANKNIFTY_INDEX_TOKEN = 260105
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  LIVE MODE FLAG
@@ -157,6 +173,13 @@ class ScalperV7Strategy(BaseStrategy):
         self._expiry_date = premarket_data.expiry_date
         self._risk.reset_day()
 
+        # Bug 16 fix: seed _buf_1m / _buf_5m with the prior session's candles
+        # so indicators (esp. 5-min ATR14, which needs 15 bars = 75 live min)
+        # are already warm at market open instead of starting empty every
+        # day. Same pattern as the Bug 14 fix already applied to
+        # NiftyDirectionalStrategy / NiftyFutDirectionalStrategy.
+        self._seed_historical_buffers()
+
         # Crash recovery — restore any trade open from previous run
         recovered = load_state()
         if recovered:
@@ -191,6 +214,108 @@ class ScalperV7Strategy(BaseStrategy):
             f"Expiry={premarket_data.expiry_date} DTE={premarket_data.dte_days}"
         )
         return True
+
+    # ── Historical candle seeding (Bug 16 fix, prior-session warmup) ──────────
+
+    def _seed_historical_buffers(self):
+        """
+        Fetch the prior session's last N 1-min and 5-min BankNifty index
+        candles via hub.kite.historical_data() and load them into _buf_1m /
+        _buf_5m, so indicators are valid from the first live tick instead of
+        accumulating from empty every day.
+
+        Without this, two separate warmups happen live every single morning:
+          - _evaluate_signal() needs len(candles_1m) >= 15 before it runs
+            at all (~15 live min wait).
+          - 5-min ATR14 specifically needs 15 *5-min* candles before it's
+            nonzero (75 live min = ~10:30 AM), during which is_trending
+            relies on the fixed-gap fallback (see Bug 15 fix in
+            indicators.py) rather than the real ATR-scaled threshold.
+        Seeding both buffers removes both waits — ATR/EMA/RSI are computed
+        on real (if slightly stale) data from minute one.
+
+        This is separate from MarketHub.backfill(), which only replays
+        TODAY's already-elapsed candles for a late start (a no-op on a
+        normal on-time 9:00 AM boot, since nothing has elapsed yet). This
+        seeds *yesterday's* close-of-session data so today's first live
+        candle isn't starting cold. Mirrors the Bug 14 fix already applied
+        to NiftyDirectionalStrategy / NiftyFutDirectionalStrategy.
+
+        There is a genuine overnight gap between the last seeded bar and
+        the first live 9:15 bar — indicators self-correct within a few
+        live bars, an accepted tradeoff.
+
+        Fails safe: if kite is unavailable, the fetch errors, or no data
+        comes back, this logs a warning and leaves the buffers empty —
+        the strategy just falls back to the old live-only warmup for that
+        one timeframe (no regression).
+        """
+        kite = getattr(self._hub, "kite", None)
+        if kite is None:
+            log.warning(
+                "[ScalperV7] No kite handle on hub — cannot seed historical "
+                "candles, falling back to live-only warmup (~75min for 5m ATR)"
+            )
+            return
+
+        today = _now_ist().date()
+        from_date = datetime.combine(today - timedelta(days=7), dtime(9, 15))
+        to_date   = datetime.combine(today - timedelta(days=1), dtime(15, 30))
+
+        self._seed_one_buffer(
+            kite, self._buf_1m, CANDLE_1M_INTERVAL, CANDLE_1M_USE,
+            from_date, to_date, label="1-min",
+        )
+        self._seed_one_buffer(
+            kite, self._buf_5m, CANDLE_5M_INTERVAL, CANDLE_5M_USE,
+            from_date, to_date, label="5-min",
+        )
+
+    def _seed_one_buffer(
+        self, kite, buf: deque, interval: str, needed: int,
+        from_date: datetime, to_date: datetime, label: str,
+    ):
+        try:
+            raw = kite.historical_data(
+                instrument_token = BANKNIFTY_INDEX_TOKEN,
+                from_date        = from_date,
+                to_date          = to_date,
+                interval         = interval,
+            )
+        except Exception as e:
+            log.warning(f"[ScalperV7] {label} historical seed fetch failed: {e} — "
+                        f"falling back to live-only warmup for this timeframe")
+            return
+
+        if not raw:
+            log.warning(f"[ScalperV7] {label} historical seed returned no candles — "
+                        f"falling back to live-only warmup for this timeframe")
+            return
+
+        tail = raw[-needed:]
+        with self._lock:
+            buf.clear()
+            for bar in tail:
+                try:
+                    buf.append({
+                        "ts"     : bar["date"],
+                        "open"   : float(bar["open"]),
+                        "high"   : float(bar["high"]),
+                        "low"    : float(bar["low"]),
+                        "close"  : float(bar["close"]),
+                        "volume" : float(bar.get("volume", 0)),
+                    })
+                except (KeyError, TypeError, ValueError) as e:
+                    log.warning(f"[ScalperV7] Skipping malformed {label} seed bar {bar}: {e}")
+
+        if buf:
+            log.info(
+                f"[ScalperV7] Seeded {len(buf)} prior-session {label} candles "
+                f"({tail[0].get('date', '?')} -> {tail[-1].get('date', '?')}) — "
+                f"warm from first live tick"
+            )
+        else:
+            log.warning(f"[ScalperV7] {label} seed buffer empty after load")
 
     # ── on_tick: raw index tick → build 1-min candles ─────────────────────────
 
