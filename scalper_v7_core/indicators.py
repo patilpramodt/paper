@@ -21,7 +21,7 @@ from scalper_v7_core.config import (
     STRUCTURE_LOOKBACK,
     ATR_MIN_PCT, ATR_STRONG_PCT,
     REGIME_EMA_ATR_RATIO, REGIME_EMA_ATR_RATIO_1M,
-    ATR_VOL_RATIO_WINDOW,
+    ATR_VOL_RATIO_WINDOW, EMA_GAP_5M_FIXED,
 )
 
 
@@ -259,17 +259,38 @@ def compute_indicators(df: pd.DataFrame, timeframe: str = "5m") -> dict:
     # is driven purely by the EMA-gap/ATR ratio test — same test as
     # _get_5m_regime() — so is_trending agrees with trend_bias by construction.
     # WEAK (dead market / no ATR) is reported separately.
-    ratio = REGIME_EMA_ATR_RATIO if timeframe == "5m" else REGIME_EMA_ATR_RATIO_1M
+    #
+    # BUG 15 FIX: the "atr <= 0" branch above still disagreed with
+    # _get_5m_regime() in one case the previous fix missed — atr14 (5m)
+    # requires len(df) >= 15 (75 min of 5-min candles) before it's nonzero,
+    # so for ~25 min every single morning (confirmed identical clock window
+    # 10:01-10:25 across 4 days of live logs, once len(df_5m) is 10-14)
+    # atr14 == 0 here, forcing is_trending=False unconditionally — while
+    # _get_5m_regime() falls back to a FIXED gap threshold (EMA_GAP_5M_FIXED,
+    # or 3.0 pts on 1m) instead of refusing to call a trend. trend_bias could
+    # therefore read BULL/BEAR off a real, large EMA gap while is_trending
+    # stayed hard-wired False, blocking every entry via "5m_not_trending" —
+    # this single-handedly ate the cleanest trend of the whole 4-day sample
+    # (June 24, 10:01-10:18: RSI 67->77, Rz up to 1.35, MACD hist up to +22).
+    # Fix: when atr<=0, use the SAME fixed-gap fallback as _get_5m_regime()
+    # to decide is_trending, instead of forcing False.
+    ratio       = REGIME_EMA_ATR_RATIO if timeframe == "5m" else REGIME_EMA_ATR_RATIO_1M
+    fixed_gap   = EMA_GAP_5M_FIXED if timeframe == "5m" else 3.0
     atr = out["atr14"]
     gap = abs(out["ema_gap"])
 
-    if atr <= 0:
-        out["regime"]      = "WEAK"
-        out["is_trending"] = False
-    elif gap / atr >= ratio:
+    if atr > 0:
+        trending = (gap / atr) >= ratio
+    else:
+        trending = gap >= fixed_gap  # mirrors _get_5m_regime()'s own atr<=0 fallback
+
+    if trending:
         out["regime"]      = "TRENDING"
         out["is_trending"] = True
-    elif out["atr_pct"] < ATR_MIN_PCT:
+    elif atr > 0 and out["atr_pct"] < ATR_MIN_PCT:
+        out["regime"]      = "WEAK"
+        out["is_trending"] = False
+    elif atr <= 0:
         out["regime"]      = "WEAK"
         out["is_trending"] = False
     else:
@@ -277,3 +298,4 @@ def compute_indicators(df: pd.DataFrame, timeframe: str = "5m") -> dict:
         out["is_trending"] = False
 
     return out
+
