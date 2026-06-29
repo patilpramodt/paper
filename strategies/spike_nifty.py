@@ -6,7 +6,7 @@ Mirrors SPIKE (BankNifty) but with Nifty-specific parameters.
 
 ENTRY LOGIC (updated):
   No direct gap entry. Regardless of gap direction, wait for the first
-  TWO CONSECUTIVE closed 8-second (2-tick) candles after 9:15 that agree
+  TWO CONSECUTIVE closed 10-second (2-tick) candles after 9:15 that agree
   in direction:
     - Both candles RED   (close < open) → take PE
     - Both candles GREEN (close > open) → take CE
@@ -76,7 +76,7 @@ BUG FIXES IN THIS VERSION
     _check_2candle_signal() used an undefined variable `color` in the
     _build_entry() reason string. This crashed on every valid signal, so
     SPIKE_NIFTY has never executed a trade.
-    Fix: replaced with the literal string "2x8s_signal".
+    Fix: replaced with the literal string "2x10s_signal".
 
   BUG FIX 2 — _do_exit() state guard with _exit_in_progress flag:
     Previously: t["state"] = "CLOSED" was set BEFORE the SELL executed.
@@ -108,7 +108,7 @@ BUG FIXES IN THIS VERSION
     with no open trade.
 
   BUG FIX 7 — Pending entry overwritten by subsequent candle signal:
-    If _pending_entry was set and the next 8s candle fired a new signal,
+    If _pending_entry was set and the next 10s candle fired a new signal,
     _pending_entry was silently overwritten.
     Fix: on_tick() checks _pending_entry is None before calling
     _check_2candle_signal().
@@ -196,7 +196,7 @@ CFG = {
 
     # ── Signal filters ────────────────────────────────────────────────────────
     "doji_threshold"         : 0.10,
-    "bucket_sec"             : 8,
+    "bucket_sec"             : 10,
     "min_candles_before_mom" : 2,
 
     # ── Output ────────────────────────────────────────────────────────────────
@@ -350,7 +350,7 @@ class SpikeNiftyStrategy(BaseStrategy):
         Entry logic:
           Gap direction is detected on the first tick and logged, but does NOT
           trigger an immediate entry. All entries — gap or no gap — wait for
-          the first two consecutive closed 8-second (2-tick) candles after
+          the first two consecutive closed 10-second (2-tick) candles after
           9:15 that agree in direction.
             Both candles GREEN → CE
             Both candles RED   → PE
@@ -559,11 +559,11 @@ class SpikeNiftyStrategy(BaseStrategy):
             self._gap_direction = "BOTH"
             log.info(f"[{self.name}]  NO GAP (fallback): open inside [{bl:.0f}–{bh:.0f}]")
 
-    # ── 2x8s candle signal ─────────────────────────────────────────────────────
+    # ── 2x10s candle signal ─────────────────────────────────────────────────────
 
     def _check_2candle_signal(self, latest_closed: dict, index_price: float, ts: datetime):
         """
-        Entry signal based on the last TWO closed 8-second (2-tick) candles
+        Entry signal based on the last TWO closed 10-second (2-tick) candles
         after 9:15 — they must agree in direction:
           - Both candles GREEN (close > open) → take CE
           - Both candles RED   (close < open) → take PE
@@ -583,7 +583,7 @@ class SpikeNiftyStrategy(BaseStrategy):
             return
 
         log.info(
-            f"[{self.name}] 2x8s candle signal: {signal} "
+            f"[{self.name}] 2x10s candle signal: {signal} "
             f"at {ts.strftime('%H:%M:%S')} "
             f"(c1 o={c1['open']:.1f} c={c1['close']:.1f} | "
             f"c2 o={c2['open']:.1f} c={c2['close']:.1f})"
@@ -609,7 +609,7 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         self.subscribe_option(token)
         # BUG FIX 1: was `f"2tick_candle_{color.lower()}"` — `color` was never defined.
-        self._build_entry(sym, token, signal, ts, reason="2x8s_signal")
+        self._build_entry(sym, token, signal, ts, reason="2x10s_signal")
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
@@ -945,7 +945,7 @@ class SpikeNiftyStrategy(BaseStrategy):
     @staticmethod
     def _check_signal(c1: dict, c2: dict) -> Optional[str]:
         """
-        Two consecutive 8-second candles must agree in direction:
+        Two consecutive 10-second candles must agree in direction:
           both GREEN (close > open) → CE
           both RED   (close < open) → PE
           either is a doji, or they disagree → None (no signal)
@@ -1005,3 +1005,4 @@ class SpikeNiftyStrategy(BaseStrategy):
             )
         log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
