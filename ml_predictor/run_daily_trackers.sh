@@ -44,6 +44,23 @@ TODAY="$(date +%Y-%m-%d)"
 
 mkdir -p "$DATA_DIR"
 
+# SSL SYMBOL CLASH FIX (confirmed June 29 2026): TensorFlow statically
+# links its own private copy of BoringSSL inside libtensorflow_framework.so
+# and exports its symbols globally. The `cryptography` package (used by
+# kiteconnect -> requests -> urllib3 -> cryptography for the Kite API
+# connection) dynamically links the system's libssl.so.3 / OpenSSL 3.x.
+# When both are loaded in the same process, an SSL object created via the
+# system OpenSSL can get destroyed using TensorFlow's BoringSSL destructor
+# instead (confirmed via gdb backtrace: SSL_CTX_free() inside
+# libtensorflow_framework.so, called from cryptography's Rust bindings).
+# Freeing memory with the wrong allocator's layout corrupts the heap ->
+# "free(): invalid pointer", crashing right after "LSTM loaded" every time.
+# Fix: force the dynamic linker to resolve ALL SSL symbols to the system
+# OpenSSL FIRST, before TensorFlow ever loads, so its bundled BoringSSL
+# symbols never get the chance to shadow them. Do not remove this unless
+# TensorFlow is upgraded/rebuilt without a statically-linked SSL stack.
+export LD_PRELOAD="/lib/x86_64-linux-gnu/libssl.so.3:/lib/x86_64-linux-gnu/libcrypto.so.3"
+
 is_running() {
     # Checks for an existing screen session with this exact name.
     screen -list 2>/dev/null | grep -q "\.$1[[:space:]]"
