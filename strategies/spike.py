@@ -4,7 +4,7 @@ strategies/spike.py
 SPIKE Strategy — 9:15 spike trade on BankNifty, exits by 9:30.
 
 ENTRY LOGIC:
-  No direct gap entry. Wait for the first two consecutive closed 8-second
+  No direct gap entry. Wait for the first two consecutive closed 10-second
   (2-tick) candles after 9:15 that agree in direction:
     - Both candles GREEN (close > open) → take CE
     - Both candles RED   (close < open) → take PE
@@ -85,7 +85,7 @@ BUG FIXES IN THIS VERSION
 
   BUG FIX 7 — Pending entry overwrite by subsequent candle signal.
     Previously: if _pending_entry was set (option had no valid price yet)
-    and the next 8s candle fired a new signal, _pending_entry was
+    and the next 10s candle fired a new signal, _pending_entry was
     silently overwritten — potentially switching CE→PE or vice versa.
     Fix: on_tick() checks _pending_entry is None before calling
     _check_2candle_signal().
@@ -144,7 +144,7 @@ CFG = {
     "trail_trigger_pts"      : 50,
     "trail_distance"         : 25,
     "doji_threshold"         : 0.10,
-    "bucket_sec"             : 8,
+    "bucket_sec"             : 10,
     "min_candles_before_mom" : 2,
     "csv_file"               : "spike_trades.csv",
     # SL grace period: seconds after entry fill before SL checks activate.
@@ -288,7 +288,7 @@ class SpikeStrategy(BaseStrategy):
 
         # BUG FIX 7: Guard _pending_entry so a second candle signal cannot
         # overwrite a pending entry that has not been resolved yet.
-        # All entries go through the 2x8s candle signal.
+        # All entries go through the 2x10s candle signal.
         if (not self._trade_done and
                 self._trade is None and
                 self._pending_entry is None and   # BUG FIX 7
@@ -411,7 +411,7 @@ class SpikeStrategy(BaseStrategy):
         """
         Classify today's open vs prev day's last 5-min range (or body).
         Result is stored in self._gap_direction for logging/CSV reference only.
-        It does NOT control entry — the 2x8s candle signal does.
+        It does NOT control entry — the 2x10s candle signal does.
         """
         h5, l5 = self._prev_last5m_high, self._prev_last5m_low
 
