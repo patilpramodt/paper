@@ -85,6 +85,39 @@ import pandas as pd
 from core.base_strategy import BaseStrategy
 from core.instruments import get_atm_strike
 
+# BankNifty NSE index token — fixed Zerodha instrument token (260105).
+# Used exclusively in _seed_historical_buffer() to fetch prior-session
+# 5-min OHLC candles via kite.historical_data().
+#
+# BUG FIX (routing collision): this MUST be a plain module-level constant,
+# NOT a class-level `INDEX_TOKEN` attribute on the strategy. MarketHub's
+# _handle_index_tick() treats any strategy with a non-None `INDEX_TOKEN`
+# class attribute as tracking a *different* (secondary) index — e.g.
+# BBStochNiftyStrategy sets INDEX_TOKEN=256265 so it gets routed Nifty
+# ticks/candles via _handle_extra_index_tick() instead of the main
+# BankNifty feed. Because this strategy previously set
+# `INDEX_TOKEN = 260105` (BankNifty's OWN token) as a class attribute,
+# MarketHub's broadcast loop:
+#     strat_index = getattr(strat, "INDEX_TOKEN", None)
+#     if strat_index is not None:
+#         continue   # "tracks a different index" — WRONG for this strategy
+# silently skipped this strategy on every single BankNifty on_tick() and
+# on_candle() call, all day, with no error or warning logged. The token
+# also isn't in MarketHub._extra_index_tokens (that set is only populated
+# for genuinely secondary indices), so it was never routed anywhere —
+# fully orphaned despite successful pre_market() init and option
+# subscriptions. Result: zero HOLD logs, zero entries, EOD Trades=0,
+# every session, with no diagnostic trace.
+#
+# scalper_v7_strategy.py already uses the correct pattern for the same
+# need (BANKNIFTY_INDEX_TOKEN module constant, no class attribute) —
+# mirrored here. This strategy now has no class-level INDEX_TOKEN
+# attribute, so `getattr(strat, "INDEX_TOKEN", None)` correctly returns
+# None for it, and it receives the main BankNifty tick/candle broadcast
+# exactly like every other primary-index strategy (SPIKE, ORB_v2,
+# ScalperV7, etc).
+BANKNIFTY_INDEX_TOKEN = 260105
+
 # IST FIX: GitHub Actions runners are UTC.
 _IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -500,11 +533,17 @@ class BBStochStrategy(BaseStrategy):
 
     LIVE_MODE = LIVE_MODE
 
-    # BankNifty NSE index token — fixed Zerodha instrument token (260105).
-    # Used exclusively in _seed_historical_buffer() to fetch prior-session
-    # 5-min OHLC candles.  MarketHub also uses this token internally as its
-    # main index feed; it is safe to pass it to kite.historical_data() here.
-    INDEX_TOKEN = 260105
+    # No class-level INDEX_TOKEN attribute here, deliberately.
+    # This strategy tracks the MAIN BankNifty index, the same one MarketHub
+    # treats as primary. Strategies that track a secondary index (e.g.
+    # BBStochNiftyStrategy → Nifty 50) set INDEX_TOKEN as a class attribute
+    # so MarketHub routes them via _handle_extra_index_tick() instead of the
+    # main broadcast. Setting INDEX_TOKEN here (even to BankNifty's own
+    # token) would make MarketHub treat this strategy as secondary and skip
+    # it from every BankNifty on_tick()/on_candle() call — see the
+    # BANKNIFTY_INDEX_TOKEN module constant above for the historical bug
+    # this caused. The module-level constant covers the one place this
+    # strategy actually needs the raw token: the historical_data() seed call.
 
     @property
     def name(self) -> str:
@@ -672,7 +711,7 @@ class BBStochStrategy(BaseStrategy):
 
         try:
             raw = kite.historical_data(
-                instrument_token = self.INDEX_TOKEN,
+                instrument_token = BANKNIFTY_INDEX_TOKEN,
                 from_date        = datetime.combine(today - timedelta(days=7), dtime(9, 15)),
                 to_date          = datetime.combine(today - timedelta(days=1), dtime(15, 30)),
                 interval         = "5minute",
