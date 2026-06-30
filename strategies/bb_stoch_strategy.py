@@ -68,6 +68,24 @@ FIXES APPLIED:
              every single day.  Fix: pre_market() now seeds _buf_5m with
              the prior session's last N BankNifty 5-min candles via
              hub.kite.historical_data(). See _seed_historical_buffer().
+  Bug 15 -- ATR unit mismatch: _compute_sl_tp() used raw 5-min BankNifty
+             INDEX-point ATR (typically 60-150+) directly as the option's
+             SL/TP distance in premium points. atr*atr_sl_mult almost always
+             exceeded the old sl_max=50 ceiling, so SL was effectively a
+             flat 50pt premium stop every day regardless of real option
+             volatility -- the "ATR-adaptive" sizing was never adaptive.
+             Fix: scale index-point ATR to premium-point ATR via
+             premium_atr_scale (0.45) before sizing, and recalibrate
+             sl_min/sl_max/tp_min/tp_max to the new range. Mirrors the
+             same fix already validated in bb_stoch_nifty_strategy.py.
+  Bug 16 -- Routing collision: a class-level `INDEX_TOKEN = 260105`
+             attribute (BankNifty's OWN token) made MarketHub treat this
+             strategy as tracking a *secondary* index and skip it from
+             every BankNifty on_tick()/on_candle() broadcast, with no
+             error logged. Fix: removed the class attribute; the BankNifty
+             token is now only a module-level constant
+             (BANKNIFTY_INDEX_TOKEN) used solely for the historical_data()
+             seed call. See comment above BANKNIFTY_INDEX_TOKEN below.
 """
 
 import csv
@@ -160,10 +178,24 @@ CFG = {
     "atr_period"         : 14,
     "atr_sl_mult"        : 0.8,
     "atr_tp_mult"        : 2.0,
-    "sl_min"             : 20.0,
-    "sl_max"             : 50.0,
-    "tp_min"             : 30.0,
-    "tp_max"             : 120.0,
+    # BUG FIX (ATR unit mismatch): `atr` computed by _compute_atr(df, ...) is
+    # measured on the 5-min BankNifty INDEX candle buffer, i.e. raw index
+    # points (typically 60-150+ on BankNifty) -- NOT option premium points.
+    # _compute_sl_tp() previously used this index-point ATR directly as the
+    # option's SL/TP distance in premium points. Since atr*atr_sl_mult
+    # (≈48-120) almost always exceeded the old sl_max=50 ceiling, SL was
+    # effectively pinned to a flat 50pt premium stop every day regardless of
+    # real option volatility -- the "ATR-adaptive" sizing was never actually
+    # adaptive. Same issue for TP, usually pinned near the old tp_max=120.
+    # Fix: scale index-point ATR down to an approximate premium-point ATR
+    # before sizing, mirroring the same fix already applied and validated
+    # in bb_stoch_nifty_strategy.py. sl_min/sl_max/tp_min/tp_max recalibrated
+    # to match the new (correctly-scaled) premium ATR range.
+    "premium_atr_scale"  : 0.45,
+    "sl_min"             : 8.0,
+    "sl_max"             : 35.0,
+    "tp_min"             : 15.0,
+    "tp_max"             : 90.0,
     "trail_arm"          : 25.0,    # move SL to BE when profit >= this
     "trail_step"         : 12.0,    # then trail every N pts
     "slippage"           : 1.5,
@@ -1390,15 +1422,19 @@ class BBStochStrategy(BaseStrategy):
     # ----------------------------------------------------------
 
     def _compute_sl_tp(self, ltp: float, atr: float) -> Tuple[float, float]:
-        sl_pts = float(atr * CFG["atr_sl_mult"]) if atr > 0 else CFG["sl_min"]
-        tp_pts = float(atr * CFG["atr_tp_mult"]) if atr > 0 else CFG["tp_min"]
+        # BUG FIX: `atr` is raw 5-min BankNifty INDEX-point ATR, not option
+        # premium-point ATR. Scale it down before using it as a premium SL/TP
+        # distance -- see premium_atr_scale comment in CFG above.
+        premium_atr = atr * CFG["premium_atr_scale"] if atr > 0 else 0.0
+        sl_pts = float(premium_atr * CFG["atr_sl_mult"]) if premium_atr > 0 else CFG["sl_min"]
+        tp_pts = float(premium_atr * CFG["atr_tp_mult"]) if premium_atr > 0 else CFG["tp_min"]
         sl_pts = max(CFG["sl_min"], min(sl_pts, CFG["sl_max"]))
         tp_pts = max(CFG["tp_min"], min(tp_pts, CFG["tp_max"]))
         if self._dte == 0:
             tp_pts = max(CFG["tp_min"], tp_pts * 0.75)
         rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
         log.info(
-            f"[BB_STOCH] SL/TP | ATR={atr:.1f} "
+            f"[BB_STOCH] SL/TP | ATR={atr:.1f} PremiumATR={premium_atr:.1f} "
             f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} RR=1:{rr}"
         )
         return sl_pts, tp_pts
