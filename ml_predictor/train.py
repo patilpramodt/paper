@@ -455,10 +455,15 @@ def train_lstm(instrument: str, df_feat: pd.DataFrame) -> dict:
     IMPORTANT — two different "val" numbers reported here, do not confuse them:
     1. val_accuracy (from the 80/20 chronological split below) — this is
        what EarlyStopping/ModelCheckpoint actually use during training to
-       decide when to stop and which weights to keep. On ~8 years of data
-       this 20% split is itself ~1.5-2 YEARS wide (confirmed: 418 trading
-       days on real data), so it's a legitimate training-control signal but
-       NOT a recent-conditions estimate.
+       decide when to stop and which weights to keep. It is now computed
+       WEIGHTED (val_sample_weights=w_te passed via validation_data), using
+       the same time-decay × inverse-class-frequency weights as the training
+       loss — previously this was unweighted, which meant checkpoint
+       selection silently favored FLAT-majority epochs regardless of how
+       the model was actually trained. On ~8 years of data this 20% split is
+       itself ~1.5-2 YEARS wide (confirmed: 418 trading days on real data),
+       so it's a legitimate training-control signal but NOT a
+       recent-conditions estimate.
     2. recent_holdout_INSAMPLE_NOT_STRICT_OOS (computed AFTER training, on
        the last RECENT_HOLDOUT_DAYS trading days specifically) — uses the
        SAME WINDOW as XGBoost's evaluate_recent_holdout(), fixing the
@@ -509,7 +514,17 @@ def train_lstm(instrument: str, df_feat: pd.DataFrame) -> dict:
     split = int(len(X_seq) * 0.80)
     X_tr, X_te = X_seq[:split], X_seq[split:]
     y_tr, y_te = y_seq[:split], y_seq[split:]
-    w_tr       = seq_weights[:split]
+    w_tr, w_te = seq_weights[:split], seq_weights[split:]
+    # BUG FIX: w_te previously wasn't computed/passed, so val_accuracy (used
+    # by EarlyStopping/ModelCheckpoint below) was calculated UNWEIGHTED by
+    # Keras — while training loss WAS weighted via sample_weight=w_tr. On a
+    # ~70-80% FLAT target, raw unweighted val_accuracy is maximized by
+    # whichever epoch predicts FLAT most often, so checkpoint selection was
+    # silently re-introducing the exact FLAT bias the class weighting was
+    # meant to correct. Passing w_te as the 3rd element of validation_data
+    # makes Keras apply the same sample weights to val loss AND val_accuracy,
+    # so the metric driving early stopping / checkpointing is now consistent
+    # with what the model is actually being trained to optimize.
 
     n_features = X_seq.shape[2]
     log.info(f"  Sequences: {len(X_seq):,} | Features: {n_features} | Lookback: {LOOKBACK}")
@@ -546,7 +561,7 @@ def train_lstm(instrument: str, df_feat: pd.DataFrame) -> dict:
     history = model.fit(
         X_tr, y_tr,
         sample_weight=w_tr,
-        validation_data=(X_te, y_te),
+        validation_data=(X_te, y_te, w_te),
         epochs=60,
         batch_size=64,
         callbacks=callbacks,
