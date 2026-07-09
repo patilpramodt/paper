@@ -116,7 +116,7 @@ CFG = {
     # ── Candle pattern parameters ─────────────────────────────────────────────
     "bucket_10s"             : 10,
     "bucket_5s"              : 5,
-    "min_body_pts"           : 10.0,   # body must be strictly greater than this
+    "min_body_pts"           : 6.0,   # body must be strictly greater than this
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
     "sl_points"              : 10.0,
