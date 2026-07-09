@@ -104,6 +104,7 @@ from strategies.banknifty_expiry_momentum_strategy  import BankNiftyExpiryMoment
 from strategies.nifty_directional_strategy          import NiftyDirectionalStrategy
 from strategies.nifty_fut_directional_strategy      import NiftyFutDirectionalStrategy
 from strategies.nifty_candle_breakout_strategy       import NiftyCandleBreakoutStrategy
+from strategies.banknifty_candle_breakout_strategy    import BankNiftyCandleBreakoutStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -123,6 +124,7 @@ ACTIVE_STRATEGIES = [
     NiftyDirectionalStrategy,         # Nifty Directional:         9:30-14:30  CE/PE buy on directional days, Mode A+B
     NiftyFutDirectionalStrategy,      # Nifty Fut Directional:     9:30-14:30  Nifty FUTURES LONG on directional days, Mode A+B
     NiftyCandleBreakoutStrategy,      # Nifty Candle Breakout:     9:15-15:15  10s marubozu + 5s confirm + tick breakout
+    BankNiftyCandleBreakoutStrategy,  # BankNifty Candle Breakout: 9:15-15:15  20pt marubozu + 5s confirm + tick breakout
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +199,7 @@ def setup_logging():
         "strategy.nifty_directional":            "nifty_directional.log",
         "strategy.nifty_fut_directional":        "nifty_fut_directional.log",
         "strategy.nifty_candle_breakout":        "nifty_candle_breakout.log",
+        "strategy.banknifty_candle_breakout":     "banknifty_candle_breakout.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
