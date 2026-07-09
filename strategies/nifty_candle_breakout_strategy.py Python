@@ -7,9 +7,10 @@ REQUIREMENTS (as given)
 ────────────────────────
   1. Nifty only.
   2. Watch every closed 10-second index candle. A candle qualifies as a
-     "trigger" (C1) if it has NO wick (open/close occupy the full
-     high-low range, within a small tolerance) AND its body
-     (|close - open|) is strictly greater than 10 points.
+     "trigger" (C1) if its body (|close - open|) is strictly greater
+     than 10 points. (Wick length is NOT checked — removed per user
+     request; a candle with a normal wick can still trigger as long as
+     the body threshold is met.)
   3. After C1 closes, watch the very next 5-second candle (the first
      half of the following 10s bucket). If it closes the SAME color as
      C1 → confirmed, otherwise the setup is abandoned.
@@ -41,8 +42,6 @@ ASSUMPTIONS (stated — not covered by the spec, flag if wrong)
   - This strategy is NOT limited to the 9:15 open like SPIKE/SPIKE_NIFTY.
     It scans all day (09:15–15:00 for new setups, force-exits any open
     trade by 15:15) and can take MULTIPLE trades per day, one at a time.
-  - "No wick" allows a small tolerance (wick_tolerance_pts, default 0.5)
-    since real tick data essentially never produces an exact-zero wick.
   - ATM strike is recomputed at the moment of each signal (not fixed at
     market open), since this strategy can fire at any time of day and
     spot may have drifted from the pre-market ATM. This mirrors the
@@ -118,7 +117,6 @@ CFG = {
     "bucket_10s"             : 10,
     "bucket_5s"              : 5,
     "min_body_pts"           : 10.0,   # body must be strictly greater than this
-    "wick_tolerance_pts"     : 0.5,    # "no wick" allowed tolerance
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
     "sl_points"              : 10.0,
@@ -175,7 +173,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         mode_tag = "[LIVE]" if LIVE_MODE else "[PAPER]"
         log.info(
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
-            f"min_body={CFG['min_body_pts']}pts wick_tol={CFG['wick_tolerance_pts']}pts "
+            f"min_body={CFG['min_body_pts']}pts "
             f"SL=-{CFG['sl_points']} TP=+{CFG['tp_points']}"
         )
 
@@ -288,15 +286,12 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
 
     def _check_trigger_candle(self, c: dict):
         """
-        Rule 2: no-wick 10s candle with body strictly > min_body_pts.
+        Rule 2: 10s candle with body strictly > min_body_pts.
+        (No-wick condition removed per user request — wick length is no
+        longer checked; only the body-size threshold matters now.)
         """
         body = c["close"] - c["open"]
         if abs(body) <= CFG["min_body_pts"]:
-            return
-
-        upper_wick = c["high"] - max(c["open"], c["close"])
-        lower_wick = min(c["open"], c["close"]) - c["low"]
-        if upper_wick > CFG["wick_tolerance_pts"] or lower_wick > CFG["wick_tolerance_pts"]:
             return
 
         color = "GREEN" if body > 0 else "RED"
@@ -612,3 +607,4 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             )
         log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
