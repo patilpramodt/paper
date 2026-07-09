@@ -103,6 +103,7 @@ from strategies.nifty_expiry_straddle_strategy     import NiftyExpiryStraddleStr
 from strategies.banknifty_expiry_momentum_strategy  import BankNiftyExpiryMomentumStrategy
 from strategies.nifty_directional_strategy          import NiftyDirectionalStrategy
 from strategies.nifty_fut_directional_strategy      import NiftyFutDirectionalStrategy
+from strategies.nifty_candle_breakout_strategy       import NiftyCandleBreakoutStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -121,6 +122,7 @@ ACTIVE_STRATEGIES = [
     BankNiftyExpiryMomentumStrategy,  # BankNifty Expiry Momentum: 14:00-15:20 directional buy, BankNifty MONTHLY expiry only
     NiftyDirectionalStrategy,         # Nifty Directional:         9:30-14:30  CE/PE buy on directional days, Mode A+B
     NiftyFutDirectionalStrategy,      # Nifty Fut Directional:     9:30-14:30  Nifty FUTURES LONG on directional days, Mode A+B
+    NiftyCandleBreakoutStrategy,      # Nifty Candle Breakout:     9:15-15:15  10s marubozu + 5s confirm + tick breakout
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -194,6 +196,7 @@ def setup_logging():
         "strategy.banknifty_expiry_momentum":   "banknifty_expiry_momentum.log",
         "strategy.nifty_directional":            "nifty_directional.log",
         "strategy.nifty_fut_directional":        "nifty_fut_directional.log",
+        "strategy.nifty_candle_breakout":        "nifty_candle_breakout.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -247,6 +250,7 @@ def main():
   + BANKNIFTY EXPIRY MOMENTUM  (BankNifty monthly expiry only, 14:00–15:20)
   + NIFTY DIRECTIONAL  (Nifty CE/PE buy, Mode A+B, 9:30–14:30)
   + NIFTY FUT DIRECTIONAL  (Nifty Futures LONG, Mode A+B, 9:30–14:30)
+  + NIFTY CANDLE BREAKOUT  (10s marubozu + 5s confirm + tick breakout, 9:15–15:15)
   (paper mode)
 
 """)
@@ -474,7 +478,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
