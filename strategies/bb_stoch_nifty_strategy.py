@@ -123,6 +123,37 @@ NEW FIXES (this revision):
             every single day. Fix: pre_market() now seeds _buf_5m with the
             prior session's last N 5-min candles via
             hub.kite.historical_data(). See _seed_historical_buffer().
+  Bug 15 -- Spread filter used a flat `ltp * 0.03` guess (shared verbatim
+            with bb_stoch_strategy.py) against a TP capped in absolute
+            premium points. This constant almost never binds here because
+            Nifty ATM premiums (~130-150) make 3% only ~4 pts, but the
+            identical code in the BankNifty file (~900+ premiums) blocked
+            every real trade there -- see bb_stoch_strategy.py Bug 17 for
+            the full mechanism. Fixed here too for consistency, since
+            future DTE/strike changes could push Nifty premiums into the
+            range where this constant starts silently blocking trades the
+            same way it already did on BankNifty.
+            Fix: replaced with _estimate_spread() -- percentage of premium
+            WITH an absolute point cap. See CFG["spread_pct"] /
+            CFG["spread_cap_pts"].
+  Bug 16 -- Flat CFG["slippage"]=1.5 constant used for both entry markup
+            and exit markdown regardless of the option's actual premium.
+            On 2026-07-09 this contributed a flat 1.5pt debit on TOP of
+            whatever real tick-to-tick gap already occurred at the SL
+            level (entry 137.05, SL=127.51, but the triggering tick was
+            127.10 -- only a genuine 0.41pt gap -- yet the logged exit was
+            125.60, i.e. 1.91pts worse than the SL level, 1.5 of which was
+            this flat constant, not market movement). Sized correctly for
+            Nifty's own premium level in isolation, but not scaled to what
+            was actually traded, and not shared/consistent with the same
+            constant's use in bb_stoch_strategy.py's BankNifty trail math.
+            Fix: BBTrade now carries a per-trade `slip` computed once at
+            entry from _estimate_spread(entry_ltp)/2 (floored at
+            CFG["slippage_min"]), stored and reused at exit so the two
+            numbers are always consistent with each other and with what
+            was actually filled. Exit logs now also show the raw
+            triggering tick separately from the modeled slip, so real
+            market gap vs modeled cost can be told apart at a glance.
 """
 
 import csv
@@ -211,7 +242,16 @@ CFG = {
     "trail_arm"          : 15.0,    # arm trail once profit >= this
     "trail_lock_pct"     : 0.5,     # lock this fraction of profit reached
     "trail_step"         : 8.0,     # re-lock every N pts of profit after arming
-    "slippage"           : 1.5,
+
+    # Bug 15/16 fix: spread/slippage now modeled from the option's own
+    # premium instead of a single flat constant. Real bid-ask spreads on
+    # liquid near-ATM index options are bounded by tick size /
+    # market-maker competition, not premium magnitude -- so this is a
+    # modest percentage WITH an absolute cap, not a pure %.
+    # See _estimate_spread().
+    "spread_pct"         : 0.012,   # assumed spread as % of premium
+    "spread_cap_pts"     : 8.0,     # absolute cap on assumed spread (pts)
+    "slippage_min"       : 1.0,     # floor for exit-slippage modeling
     "exit_cooldown"      : 2.0,
 
     # Risk
@@ -251,6 +291,35 @@ CFG = {
     "exit_csv"           : "logs/bb_stoch_nifty_exit.csv",
     "signal_csv"         : "logs/bb_stoch_nifty_signals.csv",
 }
+
+
+# ============================================================
+# SPREAD / SLIPPAGE MODEL  (Bug 15/16 fix)
+# ============================================================
+
+def _estimate_spread(ltp: float) -> float:
+    """
+    Realistic bid-ask spread estimate for a near-ATM weekly index option,
+    expressed in premium points.
+
+    BUG FIX: the old model was a flat `ltp * 0.03` with no cap. On Nifty
+    (~130-150 ATM premium) this only ever produces ~4 pts, so it rarely
+    binds -- but the identical constant in bb_stoch_strategy.py blocks
+    every real BankNifty trade (~900+ premium), because that file's TP is
+    capped in ABSOLUTE premium points regardless of premium size. Fixed
+    here too for consistency and to protect against future DTE/strike
+    changes pushing Nifty premiums into the range where this constant
+    would start silently blocking trades.
+
+    Fix: model spread as a modest percentage of premium WITH an absolute
+    cap. Real spreads on liquid near-ATM index options don't keep growing
+    linearly with premium -- they're bounded by tick size and
+    market-maker competition, not premium magnitude.
+    """
+    if ltp <= 0:
+        return 0.0
+    pct_component = ltp * CFG["spread_pct"]
+    return round(min(pct_component, CFG["spread_cap_pts"]), 2)
 
 
 # ============================================================
@@ -486,12 +555,16 @@ class BBTrade:
         "symbol", "token", "option_type", "qty",
         "entry", "sl", "target", "sl_pts", "tp_pts",
         "trail_stage", "spot", "atr", "timestamp",
-        "exit_pending", "last_exit_ts", "order_id",
+        "exit_pending", "last_exit_ts", "order_id", "slip",
     )
 
     def __init__(self, symbol, token, opt_type, ltp, qty,
-                 spot, sl_pts, tp_pts, atr):
-        slip             = CFG["slippage"]
+                 spot, sl_pts, tp_pts, atr, slip):
+        # Bug 16 fix: `slip` is computed by the caller (_execute_fill)
+        # from _estimate_spread(ltp)/2, floored at CFG["slippage_min"] --
+        # not a flat constant. Stored on the trade so _close_trade()
+        # reuses the exact value this trade was priced with.
+        self.slip        = slip
         self.symbol      = symbol
         self.token       = token
         self.option_type = opt_type
@@ -1146,7 +1219,10 @@ class BBStochNiftyStrategy(BaseStrategy):
 
         sl_pts, tp_pts = self._compute_sl_tp(ltp, atr)
 
-        est_spread = ltp * 0.03
+        # Bug 15 fix: was `ltp * 0.03` uncapped -- see _estimate_spread()
+        # for why that's wrong once premium size varies across strikes/
+        # instruments (mirrors bb_stoch_strategy.py Bug 17).
+        est_spread = _estimate_spread(ltp)
         if tp_pts > 0 and (est_spread / tp_pts) > 0.40:
             log.warning(
                 f"[BB_STOCH_NIFTY] Spread {est_spread:.1f} too large vs TP {tp_pts:.1f} -- skipping"
@@ -1166,6 +1242,10 @@ class BBStochNiftyStrategy(BaseStrategy):
             self.unsubscribe_option(token)
             return
 
+        # Bug 16 fix: per-trade half-spread, sized to what was actually
+        # traded (not a flat constant shared across BankNifty/Nifty).
+        slip = max(CFG["slippage_min"], _estimate_spread(ltp) / 2)
+
         trade = BBTrade(
             symbol   = tsym,
             token    = token,
@@ -1176,6 +1256,7 @@ class BBStochNiftyStrategy(BaseStrategy):
             sl_pts   = sl_pts,
             tp_pts   = tp_pts,
             atr      = atr,
+            slip     = slip,
         )
         trade.order_id = buy_order_id
 
@@ -1342,7 +1423,9 @@ class BBStochNiftyStrategy(BaseStrategy):
         trade.exit_pending = True
         trade.last_exit_ts = time_module.time()
 
-        slip    = CFG["slippage"]
+        # Bug 16 fix: use this trade's own stored slip, not a flat
+        # constant borrowed from a different instrument's premium scale.
+        slip    = trade.slip
         exit_px = round(ltp - slip, 2)
         pnl_pts = round(exit_px - trade.entry, 2)
         pnl_rs  = round(pnl_pts * trade.qty, 2)
@@ -1362,7 +1445,8 @@ class BBStochNiftyStrategy(BaseStrategy):
         tag      = "[TARGET]" if reason == "TARGET" else ("[SL]" if reason == "SL" else "[EXIT]")
         log.info(
             f"[BB_STOCH_NIFTY] [{mode_tag}] {tag} {trade.option_type} | {trade.symbol} | {reason} | "
-            f"Exit={exit_px:.2f} | PnL={pnl_pts:+.2f}pts ({pnl_rs:+.2f}Rs) | "
+            f"RawTick={ltp:.2f} Slip={slip:.2f} Exit={exit_px:.2f} | "
+            f"PnL={pnl_pts:+.2f}pts ({pnl_rs:+.2f}Rs) | "
             f"RR={rr_act:+.2f} | DayPnL={self._daily_pnl:+.2f}Rs | "
             f"sell_order={sell_order_id}"
         )
@@ -1374,6 +1458,8 @@ class BBStochNiftyStrategy(BaseStrategy):
             "qty"         : trade.qty,
             "entry"       : trade.entry,
             "exit"        : exit_px,
+            "raw_tick"    : ltp,
+            "slip_pts"    : slip,
             "pnl_pts"     : pnl_pts,
             "pnl_rs"      : pnl_rs,
             "rr_actual"   : rr_act,
