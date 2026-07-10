@@ -97,10 +97,9 @@ from strategies.orb_v2               import ORBStrategy
 from strategies.scalper_v7_strategy  import ScalperV7Strategy
 from strategies.bb_stoch_strategy         import BBStochStrategy
 from strategies.bb_stoch_nifty_strategy  import BBStochNiftyStrategy
-from strategies.hedged_sell_strategy import HedgedSellStrategy
 from strategies.smart_hedge_strategy import SmartHedgeStrategy
-from strategies.nifty_expiry_straddle_strategy     import NiftyExpiryStraddleStrategy
 from strategies.banknifty_expiry_momentum_strategy  import BankNiftyExpiryMomentumStrategy
+# HedgedSellStrategy and NiftyExpiryStraddleStrategy — DISABLED (idle, not imported, zero RAM/CPU footprint)
 from strategies.nifty_directional_strategy          import NiftyDirectionalStrategy
 from strategies.nifty_fut_directional_strategy      import NiftyFutDirectionalStrategy
 from strategies.nifty_candle_breakout_strategy       import NiftyCandleBreakoutStrategy
@@ -117,9 +116,9 @@ ACTIVE_STRATEGIES = [
     ScalperV7Strategy,                # Scalper V7:               all-day     11-filter momentum scalper
     BBStochStrategy,                  # BB+Stoch BankNifty:       all-day     Bollinger+Stoch+Volume
     BBStochNiftyStrategy,             # BB+Stoch Nifty:           all-day     Bollinger+Stoch+Volume (Nifty)
-    HedgedSellStrategy,               # Hedged Sell:              9:30-10:15  Iron Condor classic
+    # HedgedSellStrategy,              # DISABLED — Iron Condor classic (idle, not instantiated)
     SmartHedgeStrategy,               # Smart Hedge:              9:35-10:15  directional spread auto-pick
-    NiftyExpiryStraddleStrategy,      # Nifty Expiry Straddle:    9:20-11:30  SHORT straddle, Nifty WEEKLY expiry only
+    # NiftyExpiryStraddleStrategy,     # DISABLED — SHORT straddle, Nifty WEEKLY expiry only (idle, not instantiated)
     BankNiftyExpiryMomentumStrategy,  # BankNifty Expiry Momentum: 14:00-15:20 directional buy, BankNifty MONTHLY expiry only
     NiftyDirectionalStrategy,         # Nifty Directional:         9:30-14:30  CE/PE buy on directional days, Mode A+B
     NiftyFutDirectionalStrategy,      # Nifty Fut Directional:     9:30-14:30  Nifty FUTURES LONG on directional days, Mode A+B
@@ -192,9 +191,9 @@ def setup_logging():
         "strategy.scalper_v7":                  "scalper_v7.log",
         "strategy.bb_stoch":                    "bb_stoch.log",
         "strategy.bb_stoch_nifty":              "bb_stoch_nifty.log",
-        "strategy.hedged_sell":                 "hedged_sell.log",
+        # "strategy.hedged_sell":               DISABLED — no logger needed, strategy not loaded
         "strategy.smart_hedge":                 "smart_hedge.log",
-        "strategy.nifty_expiry_straddle":       "nifty_expiry_straddle.log",
+        # "strategy.nifty_expiry_straddle":      DISABLED — no logger needed, strategy not loaded
         "strategy.banknifty_expiry_momentum":   "banknifty_expiry_momentum.log",
         "strategy.nifty_directional":            "nifty_directional.log",
         "strategy.nifty_fut_directional":        "nifty_fut_directional.log",
