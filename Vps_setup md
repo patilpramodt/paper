@@ -1,0 +1,181 @@
+# Algo Trading System — New VPS Setup
+
+Migration notes for `paper-main` (multi-strategy NSE options trading bot).
+Old VPS: `srv1757489` (Hostinger, Mumbai, 1 CPU core, root user, project at `/root/paper`).
+
+---
+
+## 1. Provision the VPS
+
+- Match or exceed old VPS specs. Old VPS has **1 CPU core** — this matters because
+  `ml_predictor/run_daily_trackers.sh` has a hardcoded 30-second stagger between
+  launching the Nifty/BankNifty trackers to avoid a TensorFlow heap-corruption bug
+  seen when both trackers init on the same core simultaneously. Keep the stagger
+  even if you upgrade to more cores.
+- Set timezone:
+  ```bash
+  sudo timedatectl set-timezone Asia/Kolkata
+  ```
+
+## 2. Install dependencies
+
+```bash
+sudo apt update && sudo apt install -y python3.11 python3-pip screen git
+```
+
+## 3. Clone the repo
+
+```bash
+cd /root
+git clone <your-repo-url> paper
+cd paper
+```
+
+## 4. Install Python packages
+
+```bash
+pip install -r requirements.txt --break-system-packages
+pip install -r ml_predictor/requirements_ml.txt --break-system-packages
+```
+
+## 5. Copy secrets (manual)
+
+Not in git — copy by hand.
+
+On **old VPS**:
+```bash
+cat /root/paper/config_secrets.env
+```
+
+On **new VPS**:
+```bash
+nano /root/paper/config_secrets.env
+```
+Paste the 5 values, save, then lock permissions:
+```bash
+chmod 600 /root/paper/config_secrets.env
+```
+
+Contains:
+- `ZERODHA_API_KEY`
+- `ZERODHA_API_SECRET`
+- `ZERODHA_USER_ID`
+- `ZERODHA_PASSWORD`
+- `ZERODHA_TOTP_SECRET` ← easiest to mistype, verify carefully
+
+**Do not copy `token.json`** — it's a daily session cache, regenerates automatically.
+
+## 6. Verify login
+
+```bash
+python3 -c "from core.auto_login import auto_login; auto_login()"
+```
+Success = `token.json` created in `/root/paper/`.
+
+## 7. Rebuild ML data + models (retrain from scratch)
+
+Not copied from old VPS — regenerated fresh.
+
+```bash
+cd /root/paper
+python3 ml_predictor/data_fetcher.py      # full history, 2018 → today
+python3 ml_predictor/train.py             # trains XGBoost + LSTM ensemble
+```
+Confirm output in `ml_predictor/models/`:
+`scaler_*.pkl`, `xgb_*_A.json`, `xgb_*_B.json`, `xgb_*_C.json`, `lstm_*.keras`, `metrics.json`
+
+## 8. systemd service
+
+Not in git — OS-level config, copied manually from old VPS (`systemctl cat algo`).
+
+```bash
+sudo nano /etc/systemd/system/algo.service
+```
+
+Paste:
+```ini
+[Unit]
+Description=Algo Trading System
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/paper
+ExecStart=/usr/bin/python3 /root/paper/t.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/root/paper/trader.log
+StandardError=append:/root/paper/trader.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Register:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable algo
+```
+
+Test manually before trusting cron:
+```bash
+sudo systemctl start algo
+sudo systemctl status algo
+tail -f /root/paper/trader.log
+sudo systemctl stop algo
+```
+
+## 9. Crontab
+
+```bash
+crontab -e
+```
+
+Paste exactly:
+```cron
+TZ=Asia/Kolkata
+
+# Algo trading system
+# Start algo at 9:00 AM IST weekdays
+0 9 * * 1-5 systemctl start algo >> /root/paper/logs/cron.log 2>&1
+# Stop algo at 3:35 PM IST weekdays
+35 15 * * 1-5 systemctl stop algo >> /root/paper/logs/cron.log 2>&1
+
+# ML predictor
+# Daily candle append at 3:40 PM IST weekdays
+40 15 * * 1-5 cd /root/paper && python3 ml_predictor/data_fetcher.py --append >> /root/paper/logs/ml_data.log 2>&1
+# Weekly fine-tune Sunday 10 PM IST
+0 22 * * 0 cd /root/paper && python3 ml_predictor/retrain.py >> /root/paper/logs/ml_retrain.log 2>&1
+# Monthly full retrain 1st Saturday 9 PM IST
+0 21 1-7 * 6 cd /root/paper && python3 ml_predictor/retrain.py --full >> /root/paper/logs/ml_retrain.log 2>&1
+# Live tracker — runs during market hours
+15 9 * * 1-5 cd /root/paper && ./ml_predictor/run_daily_trackers.sh >> /root/paper/ml_predictor/data/cron.log 2>&1
+```
+
+Verify:
+```bash
+crontab -l
+```
+
+## 10. Pre-flight checklist
+
+- [ ] `python3 --version` → 3.11, matches old VPS
+- [ ] `which python3` → resolves to `/usr/bin/python3` (matches `ExecStart=` in service file)
+- [ ] `nproc` → core count matches old VPS (stagger logic assumption)
+- [ ] `/root/paper/config_secrets.env` exists, `chmod 600`, all 5 values verified via successful `auto_login()`
+- [ ] `ml_predictor/models/` populated after `train.py` run
+- [ ] `systemctl status algo` shows clean start/stop when triggered manually
+- [ ] `crontab -l` matches old VPS, all paths point to `/root/paper`
+- [ ] `timedatectl` confirms `Asia/Kolkata`
+
+## Notes / things deliberately NOT copied
+
+| Item | Why skipped |
+|---|---|
+| `token.json` | Regenerates daily via `auto_login.py` |
+| `ml_predictor/models/*.pkl,*.keras` | Retraining from scratch (Step 7) |
+| `ml_predictor/data/*.csv` | Re-fetched fresh from Kite historical API (Step 7) |
+| `logs/`, `spike_trades.csv`, `trader.pid` | Daily-generated, not required for operation |
+| `logs/state.json` | Scalper V7 crash-recovery file; resets each trading day anyway |
+
