@@ -78,7 +78,7 @@ launch_one() {
 
     echo "[$(date '+%H:%M:%S')] Launching $session_name → log: $log_file"
     cd "$ROOT_DIR" || exit 1
-    screen -dmS "$session_name" bash -c "python3 ml_predictor/live_tracker.py --instrument $instrument >> '$log_file' 2>&1"
+    screen -dmS "$session_name" bash -c "/root/paper/venv/bin/python3 ml_predictor/live_tracker.py --instrument $instrument >> '$log_file' 2>&1"
 }
 
 launch_one "NIFTY50"
