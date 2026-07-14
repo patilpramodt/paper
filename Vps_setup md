@@ -1,46 +1,96 @@
-# Algo Trading System — New VPS Setup
+# Algo Trading System — VPS Migration Runbook
 
-Migration notes for `paper-main` (multi-strategy NSE options trading bot).
-Old VPS: `srv1757489` (Hostinger, Mumbai, 1 CPU core, root user, project at `/root/paper`).
+Battle-tested step-by-step log from an actual migration (old VPS `srv1757489` →
+new VPS `srv1826092`, both Hostinger, both 1 CPU core). Every command below was
+actually run and confirmed working. Follow in order.
 
 ---
 
-## 1. Provision the VPS
+## 1. Gather info from the OLD VPS first
 
-- Match or exceed old VPS specs. Old VPS has **1 CPU core** — this matters because
-  `ml_predictor/run_daily_trackers.sh` has a hardcoded 30-second stagger between
-  launching the Nifty/BankNifty trackers to avoid a TensorFlow heap-corruption bug
-  seen when both trackers init on the same core simultaneously. Keep the stagger
-  even if you upgrade to more cores.
-- Set timezone:
-  ```bash
-  sudo timedatectl set-timezone Asia/Kolkata
-  ```
-
-## 2. Install dependencies
+Before touching the new VPS, pull these from the old one:
 
 ```bash
-sudo apt update && sudo apt install -y python3.11 python3-pip screen git
+# Crontab — save exactly as shown
+crontab -l
+
+# systemd service definition
+systemctl cat algo
+
+# Secrets file location + contents
+find / -name "config_secrets.env" 2>/dev/null
+cat /root/paper/config_secrets.env
+
+# Core count (determines if the ML tracker stagger logic still applies)
+nproc
 ```
+
+Keep all four outputs handy — you'll paste pieces of them back in on the new VPS.
+
+---
+
+## 2. New VPS: base setup
+
+```bash
+timedatectl set-timezone Asia/Kolkata
+apt update
+apt install -y software-properties-common
+add-apt-repository -y ppa:deadsnakes/ppa
+apt update
+apt install -y python3.11 python3.11-venv python3.11-dev python3-pip screen git
+python3.11 --version      # confirm 3.11.x
+nproc                     # confirm matches old VPS core count
+```
+
+**Why deadsnakes:** Ubuntu 24.04's default repo only ships Python 3.12. If the
+old VPS/codebase was built against 3.11, install it explicitly via this PPA —
+don't assume 3.12 is a safe swap.
+
+---
 
 ## 3. Clone the repo
 
 ```bash
 cd /root
-git clone <your-repo-url> paper
-cd paper
+git clone https://github.com/<user>/<repo>.git paper
+cd /root/paper
+ls    # sanity check: t.py, core/, strategies/, scalper_v7_core/, ml_predictor/, requirements.txt
 ```
 
-## 4. Install Python packages
+Repo was public — no auth needed for clone (push later does need a token, see
+Step 10).
+
+---
+
+## 4. Python dependencies — use a venv, not `--break-system-packages`
+
+**Do NOT** use `pip install --break-system-packages` directly against the
+system Python — on Ubuntu 24.04 this collides with apt-managed packages
+(`cryptography`, `typing_extensions` etc. throw "Cannot uninstall ... RECORD
+file not found" errors and the install silently stops partway through).
+
+Use a venv instead:
 
 ```bash
-pip install -r requirements.txt --break-system-packages
-pip install -r ml_predictor/requirements_ml.txt --break-system-packages
+cd /root/paper
+python3.11 -m venv venv
+source venv/bin/activate          # prompt now shows (venv)
+pip install --upgrade pip
+pip install -r requirements.txt
+pip install -r ml_predictor/requirements_ml.txt
 ```
 
-## 5. Copy secrets (manual)
+Both installs completed clean with zero conflicts inside the venv. The ML
+requirements file pulls in TensorFlow (~570MB download) — expect this step to
+take a few minutes.
 
-Not in git — copy by hand.
+**Everything from here on must use `venv/bin/python3` explicitly wherever the
+old setup used plain `python3`** — system-level cron and systemd don't
+auto-activate the venv.
+
+---
+
+## 5. Copy secrets (manual copy-paste, not scp)
 
 On **old VPS**:
 ```bash
@@ -50,49 +100,80 @@ cat /root/paper/config_secrets.env
 On **new VPS**:
 ```bash
 nano /root/paper/config_secrets.env
-```
-Paste the 5 values, save, then lock permissions:
-```bash
+# paste the 5 ZERODHA_* values, save (Ctrl+O, Enter, Ctrl+X)
 chmod 600 /root/paper/config_secrets.env
 ```
 
-Contains:
-- `ZERODHA_API_KEY`
-- `ZERODHA_API_SECRET`
-- `ZERODHA_USER_ID`
-- `ZERODHA_PASSWORD`
-- `ZERODHA_TOTP_SECRET` ← easiest to mistype, verify carefully
+Do **not** copy `token.json` — it's a daily session cache and regenerates
+automatically.
 
-**Do not copy `token.json`** — it's a daily session cache, regenerates automatically.
+---
 
-## 6. Verify login
-
-```bash
-python3 -c "from core.auto_login import auto_login; auto_login()"
-```
-Success = `token.json` created in `/root/paper/`.
-
-## 7. Rebuild ML data + models (retrain from scratch)
-
-Not copied from old VPS — regenerated fresh.
+## 6. Verify login works
 
 ```bash
 cd /root/paper
-python3 ml_predictor/data_fetcher.py      # full history, 2018 → today
-python3 ml_predictor/train.py             # trains XGBoost + LSTM ensemble
+source venv/bin/activate
+python3 -c "from dotenv import load_dotenv; load_dotenv('config_secrets.env'); from core.auto_login import auto_login; auto_login()"
+ls -la token.json
+cat token.json
 ```
-Confirm output in `ml_predictor/models/`:
-`scaler_*.pkl`, `xgb_*_A.json`, `xgb_*_B.json`, `xgb_*_C.json`, `lstm_*.keras`, `metrics.json`
+
+**Important:** `auto_login.py` reads straight from `os.environ` — it does
+**not** load the `.env` file itself. Only `t.py` does that at startup. Calling
+`auto_login()` standalone requires manually loading the env file first (as
+shown above), otherwise you'll get `KeyError: 'ZERODHA_API_KEY'`.
+
+Success = `token.json` created with `api_key`, `access_token`, and today's
+`date`.
+
+---
+
+## 7. Rebuild ML data + retrain from scratch
+
+Not copied from old VPS — deliberately regenerated fresh.
+
+```bash
+cd /root/paper
+source venv/bin/activate
+python3 ml_predictor/data_fetcher.py       # full history 2018 → today, ~few min
+python3 ml_predictor/train.py              # trains XGBoost + LSTM ensemble
+```
+
+Training on this 1-core VPS took a while (LSTM epochs ran ~43s each, several
+epochs per instrument) — consider running inside `screen` if your SSH session
+might drop:
+```bash
+screen -S train
+source venv/bin/activate
+python3 ml_predictor/train.py
+# Ctrl+A then D to detach; screen -r train to reattach
+```
+
+Confirm all 12 output files exist:
+```bash
+ls -la ml_predictor/models/
+```
+Expected: `scaler_nifty50.pkl`, `scaler_banknifty.pkl`, `xgb_nifty50_A/B/C.json`,
+`xgb_banknifty_A/B/C.json`, `lstm_nifty50.keras`, `lstm_banknifty.keras`,
+`metrics.json`.
+
+**Note on `volume=0` in the fetched CSVs:** this is expected, not a bug. Nifty,
+BankNifty, and VIX are indices, not tradable instruments, so Kite never reports
+volume for them. `features.py` and `core/vwap.py` both already account for this
+(volume-based features dropped; VWAP falls back to equal-weighting).
+
+---
 
 ## 8. systemd service
 
-Not in git — OS-level config, copied manually from old VPS (`systemctl cat algo`).
+Not in git — OS-level config, copied manually via `systemctl cat algo` on the
+old VPS.
 
 ```bash
-sudo nano /etc/systemd/system/algo.service
+nano /etc/systemd/system/algo.service
 ```
 
-Paste:
 ```ini
 [Unit]
 Description=Algo Trading System
@@ -102,7 +183,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/root/paper
-ExecStart=/usr/bin/python3 /root/paper/t.py
+ExecStart=/root/paper/venv/bin/python3 /root/paper/t.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:/root/paper/trader.log
@@ -112,70 +193,160 @@ StandardError=append:/root/paper/trader.log
 WantedBy=multi-user.target
 ```
 
-Register:
+**Key difference from the old VPS's unit file:** `ExecStart` uses
+`/root/paper/venv/bin/python3`, not `/usr/bin/python3`. The old VPS installed
+packages system-wide; this one uses a venv, so the service must point directly
+at the venv's interpreter or it'll fail with `ModuleNotFoundError`.
+
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable algo
+systemctl daemon-reload
+systemctl enable algo
 ```
 
-Test manually before trusting cron:
+**Test manually before trusting cron:**
 ```bash
-sudo systemctl start algo
-sudo systemctl status algo
-tail -f /root/paper/trader.log
-sudo systemctl stop algo
+systemctl start algo
+systemctl status algo      # expect: active (running), correct PID/path
+tail -30 /root/paper/trader.log
+systemctl stop algo
 ```
 
-## 9. Crontab
+Confirmed-good output looks like: successful login, all strategies
+initializing (`NIFTY_FUT_DIRECTIONAL`, `NIFTY_CANDLE_BREAKOUT`,
+`BANKNIFTY_CANDLE_BREAKOUT`, etc.), correct current futures contract resolved
+(e.g. `NIFTY26JULFUT`), live VIX pulled, and a clean `Trader session complete`
+shutdown. `Trades taken: 0` is correct/expected outside market hours.
+
+---
+
+## 9. Fix hardcoded `python3` inside `run_daily_trackers.sh`
+
+**This bit outside the systemd/crontab paths and would have failed silently.**
+The script launches ML live-trackers inside detached `screen` sessions, and
+line ~81 hardcoded plain `python3` (which resolves to system Python, missing
+tensorflow/xgboost) instead of the venv.
+
+Check for it:
+```bash
+cd /root/paper
+grep -n "python3" ml_predictor/run_daily_trackers.sh
+```
+
+Fix it:
+```bash
+sed -i 's|bash -c "python3 ml_predictor/live_tracker.py|bash -c "/root/paper/venv/bin/python3 ml_predictor/live_tracker.py|' ml_predictor/run_daily_trackers.sh
+grep -n "python3" ml_predictor/run_daily_trackers.sh   # confirm the change
+```
+
+**Commit and push this fix** so future migrations don't need to rediscover it:
+```bash
+git status                                    # confirm ONLY this file is staged-worthy
+git add ml_predictor/run_daily_trackers.sh
+git commit -m "Fix live_tracker.py call to use venv python instead of system python3"
+git push
+```
+(Push needs a GitHub Personal Access Token as password if not already
+configured — see Step 10 below. This is a git-remote concern only; the local
+fix on disk works immediately regardless of push status, since cron/systemd
+read the local file, not GitHub.)
+
+**Note:** `git status` will show a lot of noise here — old committed runtime
+files (`trader.log`, some `logs/*.csv`) showing as "modified" simply because
+running the bot changes them, plus untracked `__pycache__/`, `venv/`, and
+(correctly) the gitignored secrets/models/data files. Only ever stage the
+actual code fix, not these.
+
+---
+
+## 10. GitHub push authentication (if needed)
+
+GitHub no longer accepts account passwords for git operations. If `git push`
+prompts for a password and you don't have a token:
+
+1. Go to `https://github.com/settings/tokens` → **Generate new token (classic)**
+2. Name it, set an expiry, check the **`repo`** scope
+3. Copy the token immediately (shown once)
+4. On push prompt: username = GitHub username, password = paste the token
+5. Optional, to avoid re-entering it every time:
+   ```bash
+   git config --global credential.helper store
+   ```
+
+---
+
+## 11. Crontab
 
 ```bash
 crontab -e
 ```
 
-Paste exactly:
 ```cron
 TZ=Asia/Kolkata
 
 # Algo trading system
-# Start algo at 9:00 AM IST weekdays
 0 9 * * 1-5 systemctl start algo >> /root/paper/logs/cron.log 2>&1
-# Stop algo at 3:35 PM IST weekdays
 35 15 * * 1-5 systemctl stop algo >> /root/paper/logs/cron.log 2>&1
 
 # ML predictor
-# Daily candle append at 3:40 PM IST weekdays
-40 15 * * 1-5 cd /root/paper && python3 ml_predictor/data_fetcher.py --append >> /root/paper/logs/ml_data.log 2>&1
-# Weekly fine-tune Sunday 10 PM IST
-0 22 * * 0 cd /root/paper && python3 ml_predictor/retrain.py >> /root/paper/logs/ml_retrain.log 2>&1
-# Monthly full retrain 1st Saturday 9 PM IST
-0 21 1-7 * 6 cd /root/paper && python3 ml_predictor/retrain.py --full >> /root/paper/logs/ml_retrain.log 2>&1
-# Live tracker — runs during market hours
+40 15 * * 1-5 cd /root/paper && ./venv/bin/python3 ml_predictor/data_fetcher.py --append >> /root/paper/logs/ml_data.log 2>&1
+0 22 * * 0 cd /root/paper && ./venv/bin/python3 ml_predictor/retrain.py >> /root/paper/logs/ml_retrain.log 2>&1
+0 21 1-7 * 6 cd /root/paper && ./venv/bin/python3 ml_predictor/retrain.py --full >> /root/paper/logs/ml_retrain.log 2>&1
 15 9 * * 1-5 cd /root/paper && ./ml_predictor/run_daily_trackers.sh >> /root/paper/ml_predictor/data/cron.log 2>&1
 ```
+
+**Every Python-invoking line uses `./venv/bin/python3`, not plain `python3`.**
+Cron does not activate the venv automatically — omitting this causes
+`ModuleNotFoundError` even though manual (activated-shell) test runs work fine.
 
 Verify:
 ```bash
 crontab -l
 ```
 
-## 10. Pre-flight checklist
+---
 
-- [ ] `python3 --version` → 3.11, matches old VPS
-- [ ] `which python3` → resolves to `/usr/bin/python3` (matches `ExecStart=` in service file)
-- [ ] `nproc` → core count matches old VPS (stagger logic assumption)
-- [ ] `/root/paper/config_secrets.env` exists, `chmod 600`, all 5 values verified via successful `auto_login()`
-- [ ] `ml_predictor/models/` populated after `train.py` run
-- [ ] `systemctl status algo` shows clean start/stop when triggered manually
-- [ ] `crontab -l` matches old VPS, all paths point to `/root/paper`
-- [ ] `timedatectl` confirms `Asia/Kolkata`
+## 12. First live day — watch it once
 
-## Notes / things deliberately NOT copied
+The next weekday's 9:00 AM cron-triggered start is the first fully unattended
+run. Watch it:
+```bash
+tail -f /root/paper/trader.log
+```
+around 9:00–9:15 AM IST to confirm scheduled start behaves the same as the
+manual test in Step 8. After one clean day, trust it fully.
 
-| Item | Why skipped |
+---
+
+## Pre-flight checklist
+
+- [ ] `python3.11 --version` → 3.11.x
+- [ ] venv points to it: `/root/paper/venv/bin/python3 --version`
+- [ ] `nproc` → matches old VPS (stagger logic assumption in `run_daily_trackers.sh`)
+- [ ] `config_secrets.env` present, `chmod 600`, login verified via `token.json`
+- [ ] `ml_predictor/models/` has all 12 files after `train.py`
+- [ ] `systemctl status algo` → clean manual start/stop, log shows full session
+- [ ] `crontab -l` → matches, all Python lines use `venv/bin/python3`
+- [ ] `run_daily_trackers.sh` internal `python3` call also uses venv path
+- [ ] Fix pushed to GitHub (or at least committed locally) so next migration inherits it
+- [ ] First live cron-triggered day watched manually via `tail -f trader.log`
+
+---
+
+## Things deliberately NOT copied from old VPS
+
+| Item | Why |
 |---|---|
 | `token.json` | Regenerates daily via `auto_login.py` |
-| `ml_predictor/models/*.pkl,*.keras` | Retraining from scratch (Step 7) |
+| `ml_predictor/models/*.pkl,*.keras,metrics.json` | Retrained from scratch (Step 7) |
 | `ml_predictor/data/*.csv` | Re-fetched fresh from Kite historical API (Step 7) |
 | `logs/`, `spike_trades.csv`, `trader.pid` | Daily-generated, not required for operation |
 | `logs/state.json` | Scalper V7 crash-recovery file; resets each trading day anyway |
 
+## Things that ARE new-VPS-specific and must be redone each migration
+
+| Item | Why it doesn't come from git |
+|---|---|
+| `config_secrets.env` | Git-ignored secret, manual copy required |
+| `/etc/systemd/system/algo.service` | OS-level config, not part of repo |
+| Crontab | Per-machine, not part of repo |
+| venv paths in service file, crontab, and `run_daily_trackers.sh` | Only needed if using a venv instead of system-wide pip install (recommended after the 24.04/Python 3.11 conflict seen here) |
