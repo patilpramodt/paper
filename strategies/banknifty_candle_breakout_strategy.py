@@ -53,10 +53,15 @@ ASSUMPTIONS (stated — not covered by the spec, flag if wrong)
 
 INDEX ROUTING
 ──────────────
-  INDEX_TOKEN = 260105 (NSE:NIFTY BANK). MarketHub routes BankNifty ticks
-  here exclusively, same mechanism used by BANKNIFTY_EXPIRY_MOMENTUM /
-  BB_STOCH_BANKNIFTY. Uses the shared banknifty_pm / banknifty_instruments
-  already wired up in t.py for any strategy with this INDEX_TOKEN.
+  NO class-level INDEX_TOKEN attribute (deliberately — see Bug 16 note in
+  bb_stoch_strategy.py). BankNifty (260105) is MarketHub's MAIN index, so
+  strategies tracking it must leave INDEX_TOKEN unset/None to receive the
+  main on_tick()/on_candle() broadcast. Setting INDEX_TOKEN = 260105 here
+  previously caused MarketHub to treat this strategy as tracking a
+  *different* index and silently skip it on every tick — zero candles,
+  zero triggers, all session, with no error logged. Fixed 2026-07-14.
+  Same mechanism/shared banknifty_pm / banknifty_instruments used by
+  BANKNIFTY_EXPIRY_MOMENTUM / BB_STOCH.
 
 LIVE / PAPER MODE
 ─────────────────
@@ -136,10 +141,13 @@ CFG = {
 
 class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
-    # Routes BankNifty index ticks here exclusively (shared with other
-    # BankNifty strategies — MarketHub delivers to every strategy with this token).
-    INDEX_TOKEN = 260105
-
+    # NOTE: deliberately NO class-level INDEX_TOKEN attribute here.
+    # MarketHub's _handle_index_tick() treats any strategy with a non-None
+    # INDEX_TOKEN as tracking a DIFFERENT index and skips it on the main
+    # BankNifty broadcast (see bb_stoch_strategy.py's "Bug 16" comment for
+    # the same historical mistake). Setting INDEX_TOKEN = 260105 here
+    # silently prevented on_tick() from ever being called — zero ticks,
+    # zero candles, zero trigger detections, all session.
     LIVE_MODE = LIVE_MODE
 
     @property
@@ -184,7 +192,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
     def pre_market(self, pm, instruments) -> bool:
         """
         Receives BankNifty-specific PreMarketData + InstrumentStore (routed by
-        t.py because INDEX_TOKEN == 260105). No pre-subscription of a fixed
+        t.py's default/else branch, same as any strategy with no INDEX_TOKEN
+        set). No pre-subscription of a fixed
         ATM pair is done here — ATM drifts through the day and this strategy
         can fire at any time, so the strike is resolved fresh at signal time.
         """
