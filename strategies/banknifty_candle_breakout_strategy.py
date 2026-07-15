@@ -102,6 +102,24 @@ def _now_ist() -> datetime:
     return datetime.now(tz=_IST).replace(tzinfo=None)
 
 
+def strike_from_symbol(sym: str) -> str:
+    """Best-effort strike extraction from an option tradingsymbol for CSV logging."""
+    digits = "".join(ch for ch in sym if ch.isdigit())
+    # tradingsymbols embed the expiry date digits too; strike is the trailing
+    # numeric run right before the CE/PE suffix, so pull it from the raw string.
+    for suffix in ("CE", "PE"):
+        if sym.endswith(suffix):
+            tail = sym[:-2]
+            num = ""
+            for ch in reversed(tail):
+                if ch.isdigit():
+                    num = ch + num
+                else:
+                    break
+            return num
+    return digits
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  LIVE MODE FLAG — change to True only when ready to trade real money.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,6 +189,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         self._trigger_color      = None   # "GREEN" / "RED"
         self._confirm5           = None   # confirm 5s candle dict
         self._breakout_window_ts = None   # ts of the 10s bucket being watched
+
+        self._signal_meta    = None   # metrics collected from C1/confirm/breakout for the next entry
 
         self._trade         = None
         self._pending_entry  = None
@@ -255,6 +275,18 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                     f"[{self.name}] No breakout within watched window "
                     f"({self._breakout_window_ts.strftime('%H:%M:%S')}) — resetting scan"
                 )
+                if self._c1 is not None and self._confirm5 is not None:
+                    self._log_signal_csv({
+                        "timestamp": self._breakout_window_ts.strftime("%Y-%m-%d %H:%M:%S"),
+                        "event"    : "NO_BREAKOUT",
+                        "color"    : self._trigger_color,
+                        "c1_open"  : self._c1["open"], "c1_high": self._c1["high"],
+                        "c1_low"   : self._c1["low"],  "c1_close": self._c1["close"],
+                        "c1_body"  : round(abs(self._c1["close"] - self._c1["open"]), 2),
+                        "confirm_open": self._confirm5["open"], "confirm_high": self._confirm5["high"],
+                        "confirm_low" : self._confirm5["low"],  "confirm_close": self._confirm5["close"],
+                        "breakout_price": "",
+                    })
                 self._reset_pattern_state()
 
     def on_candle(self, candle: dict, ts: datetime):
@@ -317,6 +349,17 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"body={abs(body):.1f} @ {c['ts'].strftime('%H:%M:%S')} — waiting for confirm 5s"
         )
 
+        self._log_signal_csv({
+            "timestamp"  : c["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+            "event"      : "TRIGGER",
+            "color"      : color,
+            "c1_open"    : c["open"], "c1_high": c["high"],
+            "c1_low"     : c["low"],  "c1_close": c["close"],
+            "c1_body"    : round(abs(body), 2),
+            "confirm_open": "", "confirm_high": "", "confirm_low": "", "confirm_close": "",
+            "breakout_price": "",
+        })
+
     def _check_confirm_candle(self, c5: dict, ts: datetime):
         """
         Rule 3: the next 5s candle must close the same color as C1.
@@ -333,6 +376,17 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                 f"[{self.name}] Confirm 5s candle mismatch "
                 f"(C1={self._trigger_color} confirm={color5}) — resetting scan"
             )
+            self._log_signal_csv({
+                "timestamp": c5["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+                "event"    : "CONFIRM_MISMATCH",
+                "color"    : self._trigger_color,
+                "c1_open"  : self._c1["open"], "c1_high": self._c1["high"],
+                "c1_low"   : self._c1["low"],  "c1_close": self._c1["close"],
+                "c1_body"  : round(abs(self._c1["close"] - self._c1["open"]), 2),
+                "confirm_open": c5["open"], "confirm_high": c5["high"],
+                "confirm_low" : c5["low"],  "confirm_close": c5["close"],
+                "breakout_price": "",
+            })
             self._reset_pattern_state()
             return
 
@@ -345,6 +399,17 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"o={c5['open']:.1f} h={c5['high']:.1f} l={c5['low']:.1f} c={c5['close']:.1f} "
             f"@ {c5['ts'].strftime('%H:%M:%S')} — watching breakout in next 10s window"
         )
+        self._log_signal_csv({
+            "timestamp": c5["ts"].strftime("%Y-%m-%d %H:%M:%S"),
+            "event"    : "CONFIRM_MATCH",
+            "color"    : color5,
+            "c1_open"  : self._c1["open"], "c1_high": self._c1["high"],
+            "c1_low"   : self._c1["low"],  "c1_close": self._c1["close"],
+            "c1_body"  : round(abs(self._c1["close"] - self._c1["open"]), 2),
+            "confirm_open": c5["open"], "confirm_high": c5["high"],
+            "confirm_low" : c5["low"],  "confirm_close": c5["close"],
+            "breakout_price": "",
+        })
 
     def _check_breakout_tick(self, price: float, ts: datetime):
         """
@@ -353,14 +418,52 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         breakout, checked explicitly for the stated skip rule).
         """
         c5 = self._confirm5
+        c1 = self._c1
         if self._trigger_color == "GREEN":
             if price > c5["high"] and price > c5["close"]:
+                self._log_signal_csv({
+                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    "event"    : "BREAKOUT_ENTER",
+                    "color"    : self._trigger_color,
+                    "c1_open"  : c1["open"], "c1_high": c1["high"],
+                    "c1_low"   : c1["low"],  "c1_close": c1["close"],
+                    "c1_body"  : round(abs(c1["close"] - c1["open"]), 2),
+                    "confirm_open": c5["open"], "confirm_high": c5["high"],
+                    "confirm_low" : c5["low"],  "confirm_close": c5["close"],
+                    "breakout_price": round(price, 2),
+                })
+                self._signal_meta = self._build_signal_meta(price, ts)
                 self._reset_pattern_state()
                 self._fire_entry("CE", price, ts)
         else:
             if price < c5["low"] and price < c5["close"]:
+                self._log_signal_csv({
+                    "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+                    "event"    : "BREAKOUT_ENTER",
+                    "color"    : self._trigger_color,
+                    "c1_open"  : c1["open"], "c1_high": c1["high"],
+                    "c1_low"   : c1["low"],  "c1_close": c1["close"],
+                    "c1_body"  : round(abs(c1["close"] - c1["open"]), 2),
+                    "confirm_open": c5["open"], "confirm_high": c5["high"],
+                    "confirm_low" : c5["low"],  "confirm_close": c5["close"],
+                    "breakout_price": round(price, 2),
+                })
+                self._signal_meta = self._build_signal_meta(price, ts)
                 self._reset_pattern_state()
                 self._fire_entry("PE", price, ts)
+
+    def _build_signal_meta(self, breakout_price: float, ts: datetime) -> dict:
+        c1, c5 = self._c1, self._confirm5
+        return {
+            "index_price"   : breakout_price,
+            "weekday"       : ts.strftime("%A"),
+            "c1_body"       : round(abs(c1["close"] - c1["open"]), 2),
+            "c1_open"       : c1["open"], "c1_high": c1["high"],
+            "c1_low"        : c1["low"],  "c1_close": c1["close"],
+            "confirm_open"  : c5["open"], "confirm_high": c5["high"],
+            "confirm_low"   : c5["low"],  "confirm_close": c5["close"],
+            "breakout_price": round(breakout_price, 2),
+        }
 
     def _reset_pattern_state(self):
         self._state              = "SCAN"
@@ -413,6 +516,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         tp = fill_price + CFG["tp_points"]
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
 
+        meta = self._signal_meta or {}
+        self._signal_meta = None
         self._trade = {
             "state"            : "OPEN",
             "symbol"           : sym,
@@ -426,6 +531,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "order_id"         : order_id,
             "qty"              : CFG["quantity"],
             "_exit_in_progress": False,
+            "meta"             : meta,
         }
         self._trades_today += 1
 
@@ -436,18 +542,33 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"reason={reason} | order_id={order_id}"
         )
 
+        meta = self._trade.get("meta", {})
         self._log_csv({
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol"   : sym,
-            "action"   : "ENTRY",
-            "price"    : fill_price,
-            "sl"       : round(sl, 2),
-            "tp"       : round(tp, 2),
-            "status"   : "OPEN",
-            "pnl"      : 0,
-            "reason"   : reason,
-            "mode"     : mode_tag,
-            "order_id" : order_id,
+            "timestamp"      : ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol"         : sym,
+            "action"         : "ENTRY",
+            "price"          : fill_price,
+            "sl"             : round(sl, 2),
+            "tp"             : round(tp, 2),
+            "status"         : "OPEN",
+            "pnl"            : 0,
+            "reason"         : reason,
+            "mode"           : mode_tag,
+            "order_id"       : order_id,
+            "weekday"        : meta.get("weekday", ts.strftime("%A")),
+            "strike"         : strike_from_symbol(sym),
+            "c1_body"        : meta.get("c1_body", ""),
+            "c1_open"        : meta.get("c1_open", ""),
+            "c1_high"        : meta.get("c1_high", ""),
+            "c1_low"         : meta.get("c1_low", ""),
+            "c1_close"       : meta.get("c1_close", ""),
+            "confirm_open"   : meta.get("confirm_open", ""),
+            "confirm_high"   : meta.get("confirm_high", ""),
+            "confirm_low"    : meta.get("confirm_low", ""),
+            "confirm_close"  : meta.get("confirm_close", ""),
+            "breakout_price" : meta.get("breakout_price", ""),
+            "time_in_trade_s": "",
+            "sl_tp_slippage" : "",
         })
 
     # ── Exit ──────────────────────────────────────────────────────────────────
@@ -565,25 +686,51 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         pnl = (sell_price - t["entry"]) * t["qty"]
         self._today_pnl += pnl
 
+        time_in_trade_s = round((ts - t["entry_time"]).total_seconds(), 1)
+        # Positive slippage = filled worse than the intended SL/TP level (gap-through);
+        # negative/zero = filled at or better than the level.
+        if "SL_HIT" in reason:
+            sl_tp_slippage = round(t["sl"] - sell_price, 2)
+        elif "TP_HIT" in reason:
+            sl_tp_slippage = round(sell_price - t["tp"], 2)
+        else:
+            sl_tp_slippage = ""
+
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        slip_tag = f" | slip={sl_tp_slippage}" if sl_tp_slippage != "" else ""
         log.info(
             f"[{self.name}] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
             f"| PnL={pnl:.0f} ({pnl / t['qty']:.1f}/unit) | Today={self._today_pnl:.0f} | "
-            f"order_id={order_id}"
+            f"held={time_in_trade_s:.0f}s{slip_tag} | order_id={order_id}"
         )
 
+        meta = t.get("meta", {})
         self._log_csv({
-            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol"   : t["symbol"],
-            "action"   : "EXIT",
-            "price"    : sell_price,
-            "sl"       : round(t["sl"], 2),
-            "tp"       : round(t["tp"], 2),
-            "status"   : "CLOSED",
-            "pnl"      : round(pnl, 2),
-            "reason"   : reason,
-            "mode"     : mode_tag,
-            "order_id" : order_id,
+            "timestamp"      : ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol"         : t["symbol"],
+            "action"         : "EXIT",
+            "price"          : sell_price,
+            "sl"             : round(t["sl"], 2),
+            "tp"             : round(t["tp"], 2),
+            "status"         : "CLOSED",
+            "pnl"            : round(pnl, 2),
+            "reason"         : reason,
+            "mode"           : mode_tag,
+            "order_id"       : order_id,
+            "weekday"        : meta.get("weekday", ts.strftime("%A")),
+            "strike"         : strike_from_symbol(t["symbol"]),
+            "c1_body"        : meta.get("c1_body", ""),
+            "c1_open"        : meta.get("c1_open", ""),
+            "c1_high"        : meta.get("c1_high", ""),
+            "c1_low"         : meta.get("c1_low", ""),
+            "c1_close"       : meta.get("c1_close", ""),
+            "confirm_open"   : meta.get("confirm_open", ""),
+            "confirm_high"   : meta.get("confirm_high", ""),
+            "confirm_low"    : meta.get("confirm_low", ""),
+            "confirm_close"  : meta.get("confirm_close", ""),
+            "breakout_price" : meta.get("breakout_price", ""),
+            "time_in_trade_s": time_in_trade_s,
+            "sl_tp_slippage" : sl_tp_slippage,
         })
         self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
 
@@ -599,6 +746,30 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         fields = [
             "timestamp", "symbol", "action", "price",
             "sl", "tp", "status", "pnl", "reason", "mode", "order_id",
+            "weekday", "strike",
+            "c1_body", "c1_open", "c1_high", "c1_low", "c1_close",
+            "confirm_open", "confirm_high", "confirm_low", "confirm_close",
+            "breakout_price", "time_in_trade_s", "sl_tp_slippage",
+        ]
+        with open(fname, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields)
+            if not exists:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in fields})
+
+    def _log_signal_csv(self, row: dict):
+        """
+        Logs EVERY trigger candle regardless of outcome (mismatched, timed out,
+        or entered) so the C1/confirm thresholds can be tuned from the full
+        population of setups, not just the ones that became trades.
+        """
+        fname  = CFG["csv_file"].replace("_trades.csv", "_signals.csv")
+        exists = os.path.isfile(fname)
+        fields = [
+            "timestamp", "event", "color",
+            "c1_open", "c1_high", "c1_low", "c1_close", "c1_body",
+            "confirm_open", "confirm_high", "confirm_low", "confirm_close",
+            "breakout_price",
         ]
         with open(fname, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
