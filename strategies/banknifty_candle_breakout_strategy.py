@@ -144,8 +144,8 @@ CFG = {
     "min_body_pts"           : 20.0,   # body must be strictly greater than this
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
-    "sl_points"              : 10.0,
-    "tp_points"              : 10.0,
+    "sl_points"              : 20.0,
+    "tp_points"              : 30.0,
     "sl_grace_seconds"       : 5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
