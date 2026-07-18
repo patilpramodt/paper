@@ -130,6 +130,11 @@ class SecondCandleBuilder:
                 }
                 return closed
 
+    def get_current(self):
+        """Return a copy of the still-forming (not yet closed) candle, or None."""
+        with self._lock:
+            return dict(self.current_candle) if self.current_candle else None
+
     def last_n_closed(self, n: int) -> list:
         with self._lock:
             return list(self.closed_candles[-n:]) if len(self.closed_candles) >= n else []
