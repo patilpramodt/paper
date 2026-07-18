@@ -19,6 +19,17 @@ REQUIREMENTS (as given)
      5s candle is the first half of). The moment price breaks the
      confirm candle's high (GREEN → CE) or low (RED → PE), enter
      IMMEDIATELY — no waiting for any candle to close.
+
+  4a. FAST PATH (added per user request, BankNifty only): while scanning
+      for C1 (state SCAN), watch every tick of the currently-forming 10s
+      candle against ITS OWN open. If price moves >= fast_entry_pts
+      (30 points) from that candle's open at any point before it closes,
+      enter IMMEDIATELY — skip the 5s confirm candle and the breakout
+      watch entirely. This runs ahead of the normal flow: if 30 points
+      is never hit intra-candle, the candle still closes and is evaluated
+      by the existing >20pt body + confirm + breakout-watch logic exactly
+      as before. Only ever active in SCAN state (i.e. not while already
+      watching a confirm/breakout for a prior C1).
   5. SL/TP are fixed at 10 points on the OPTION PREMIUM (not the index),
      using the same fixed-points-on-premium convention as SPIKE / SPIKE_NIFTY
      (kept at 10 points on premium — only the trigger body threshold
@@ -142,6 +153,7 @@ CFG = {
     "bucket_10s"             : 10,
     "bucket_5s"              : 5,
     "min_body_pts"           : 20.0,   # body must be strictly greater than this
+    "fast_entry_pts"         : 30.0,   # intra-candle tick move that triggers immediate entry (fast path, skips confirm)
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
     "sl_points"              : 20.0,
@@ -259,6 +271,12 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
         # ── Pattern state machine ─────────────────────────────────────────────
         if self._state == "SCAN":
+            # Fast path: 30pt intra-candle tick move → enter immediately,
+            # no confirm/breakout watch. Runs ahead of the normal flow.
+            if self._pending_entry is None:
+                self._check_fast_tick_trigger(price, ts)
+                if self._trade is not None or self._pending_entry is not None:
+                    return
             if closed10 is not None:
                 self._check_trigger_candle(closed10)
 
@@ -326,6 +344,56 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             self._do_exit(price, "TP_HIT", ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
+
+    def _check_fast_tick_trigger(self, price: float, ts: datetime):
+        """
+        Rule 4a (fast path): watch every tick of the currently-forming 10s
+        candle against its own open. If price has moved >= fast_entry_pts
+        from that open, enter IMMEDIATELY — no confirm 5s candle, no
+        breakout watch, no waiting for the candle to close. Only called
+        while state == SCAN. If this doesn't fire, the candle proceeds to
+        close normally and is evaluated by _check_trigger_candle() as before.
+        """
+        cur = self._c10.get_current()
+        if cur is None:
+            return
+
+        move = price - cur["open"]
+        if abs(move) < CFG["fast_entry_pts"]:
+            return
+
+        color  = "GREEN" if move > 0 else "RED"
+        signal = "CE" if color == "GREEN" else "PE"
+
+        log.info(
+            f"[{self.name}] FAST TICK TRIGGER {color} | candle_open={cur['open']:.1f} "
+            f"price={price:.1f} move={move:+.1f} (>= {CFG['fast_entry_pts']}pts) "
+            f"@ {ts.strftime('%H:%M:%S')} — entering immediately, skipping confirm"
+        )
+
+        self._log_signal_csv({
+            "timestamp"     : ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "event"         : "FAST_TICK_ENTER",
+            "color"         : color,
+            "c1_open"       : cur["open"], "c1_high": cur["high"],
+            "c1_low"        : cur["low"],  "c1_close": price,
+            "c1_body"       : round(abs(move), 2),
+            "confirm_open"  : "", "confirm_high": "", "confirm_low": "", "confirm_close": "",
+            "breakout_price": round(price, 2),
+        })
+
+        self._signal_meta = {
+            "index_price"   : price,
+            "weekday"       : ts.strftime("%A"),
+            "c1_body"       : round(abs(move), 2),
+            "c1_open"       : cur["open"], "c1_high": cur["high"],
+            "c1_low"        : cur["low"],  "c1_close": price,
+            "confirm_open"  : "", "confirm_high": "",
+            "confirm_low"   : "", "confirm_close": "",
+            "breakout_price": round(price, 2),
+        }
+        self._reset_pattern_state()
+        self._fire_entry(signal, price, ts, reason="tick_30pt_fast_entry")
 
     def _check_trigger_candle(self, c: dict):
         """
@@ -474,7 +542,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
-    def _fire_entry(self, signal: str, index_price: float, ts: datetime):
+    def _fire_entry(self, signal: str, index_price: float, ts: datetime,
+                     reason: str = "10s_marubozu_5s_confirm_breakout"):
         strike = get_atm_strike(index_price, step=BANKNIFTY_STRIKE_STEP)
         token, sym = self._instruments.get_option_token(strike, signal, self._expiry_date)
 
@@ -486,7 +555,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             return
 
         self.subscribe_option(token)
-        self._build_entry(sym, token, signal, ts, reason="10s_marubozu_5s_confirm_breakout")
+        self._build_entry(sym, token, signal, ts, reason=reason)
 
     def _build_entry(self, sym: str, token: int, signal: str, ts: datetime, reason: str):
         opt_price = self.get_price(token)
@@ -789,4 +858,5 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             )
         log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
 
