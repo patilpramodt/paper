@@ -108,7 +108,7 @@ CFG = {
     "rsi_period"        : 14,
     "ema_fast"          : 9,
     "ema_slow"          : 21,
-    "vol_multiplier"    : 1.5,
+    "vol_multiplier"    : 0.85,
     "vol_avg_period"    : 10,
     "st_period"         : 7,
     "st_mult"           : 3.0,
