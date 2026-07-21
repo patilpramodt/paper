@@ -104,6 +104,8 @@ from strategies.nifty_directional_strategy          import NiftyDirectionalStrat
 from strategies.nifty_fut_directional_strategy      import NiftyFutDirectionalStrategy
 from strategies.nifty_candle_breakout_strategy       import NiftyCandleBreakoutStrategy
 from strategies.banknifty_candle_breakout_strategy    import BankNiftyCandleBreakoutStrategy
+from strategies.nifty_candle_breakout_v2_strategy      import NiftyCandleBreakoutV2Strategy
+from strategies.banknifty_candle_breakout_v2_strategy  import BankNiftyCandleBreakoutV2Strategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -124,6 +126,8 @@ ACTIVE_STRATEGIES = [
     NiftyFutDirectionalStrategy,      # Nifty Fut Directional:     9:30-14:30  Nifty FUTURES LONG on directional days, Mode A+B
     NiftyCandleBreakoutStrategy,      # Nifty Candle Breakout:     9:15-15:15  10s marubozu + 5s confirm + tick breakout
     BankNiftyCandleBreakoutStrategy,  # BankNifty Candle Breakout: 9:15-15:15  20pt marubozu + 5s confirm + tick breakout
+    NiftyCandleBreakoutV2Strategy,      # Nifty Candle Breakout V2:     9:15-15:15  C1 6pt tick trigger + C2 3pt point entry (test variant, runs alongside V1)
+    BankNiftyCandleBreakoutV2Strategy,  # BankNifty Candle Breakout V2: 9:15-15:15  C1 20pt tick trigger + C2 10pt point entry (test variant, runs alongside V1)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -199,6 +203,8 @@ def setup_logging():
         "strategy.nifty_fut_directional":        "nifty_fut_directional.log",
         "strategy.nifty_candle_breakout":        "nifty_candle_breakout.log",
         "strategy.banknifty_candle_breakout":     "banknifty_candle_breakout.log",
+        "strategy.nifty_candle_breakout_v2":       "nifty_candle_breakout_v2.log",
+        "strategy.banknifty_candle_breakout_v2":   "banknifty_candle_breakout_v2.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
