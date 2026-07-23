@@ -103,6 +103,7 @@ from typing import Optional
 from core.base_strategy import BaseStrategy
 from core.candle import SecondCandleBuilder
 from core.instruments import get_atm_strike
+from core.fast_indicators import compute_fast_indicators, CANDLE_WINDOW, INDICATOR_FIELDS
 
 log = logging.getLogger("strategy.banknifty_candle_breakout")
 
@@ -204,6 +205,11 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
         self._signal_meta    = None   # metrics collected from C1/confirm/breakout for the next entry
 
+        # Live PreMarketData reference (set in pre_market()) — read
+        # self._pm.pcr at signal time so it reflects the live-refreshed
+        # value, not a 9:08 AM snapshot. Log-only, mirrors orb_v2.py pattern.
+        self._pm = None
+
         self._trade         = None
         self._pending_entry  = None
         self._trades_today   = 0
@@ -231,12 +237,32 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         """
         self._instruments = instruments
         self._expiry_date = pm.expiry_date
+        # Kept as a LIVE reference (not just pm.pcr snapshotted here) so
+        # _indicator_snapshot() always reads the current PCR — the
+        # background refresh thread in premarket.py keeps updating pm.pcr
+        # every pcr_interval seconds all session long.
+        self._pm = pm
 
         log.info(
             f"[{self.name}] Pre-market | expiry={pm.expiry_date} "
             f"mode={'LIVE' if LIVE_MODE else 'PAPER'}"
         )
         return True
+
+    # ── Fast/leading indicator snapshot (LOG-ONLY — see core/fast_indicators.py) ──
+
+    def _indicator_snapshot(self, spot: float) -> dict:
+        """
+        Computes VWAP / PCR / EMA slope / RSI slope / MACD histogram / ATR% /
+        Supertrend from the strategy's own rolling 10s candle buffer plus the
+        live hub VWAP and live PCR. Called once per signal event and merged
+        into both the signals CSV and (via _signal_meta) the trades CSV.
+        Entry/exit decisions never read this — log-only.
+        """
+        candles = self._c10.last_n_closed(CANDLE_WINDOW)
+        vwap    = self._hub.session_vwap.value
+        pcr     = self._pm.pcr if self._pm is not None else None
+        return compute_fast_indicators(candles, spot=spot, vwap=vwap, pcr=pcr)
 
     # ── Tick handlers ─────────────────────────────────────────────────────────
 
@@ -294,6 +320,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                     f"({self._breakout_window_ts.strftime('%H:%M:%S')}) — resetting scan"
                 )
                 if self._c1 is not None and self._confirm5 is not None:
+                    ind = self._indicator_snapshot(self._confirm5["close"])
                     self._log_signal_csv({
                         "timestamp": self._breakout_window_ts.strftime("%Y-%m-%d %H:%M:%S"),
                         "event"    : "NO_BREAKOUT",
@@ -304,6 +331,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                         "confirm_open": self._confirm5["open"], "confirm_high": self._confirm5["high"],
                         "confirm_low" : self._confirm5["low"],  "confirm_close": self._confirm5["close"],
                         "breakout_price": "",
+                        **ind,
                     })
                 self._reset_pattern_state()
 
@@ -371,6 +399,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"@ {ts.strftime('%H:%M:%S')} — entering immediately, skipping confirm"
         )
 
+        ind = self._indicator_snapshot(price)
+
         self._log_signal_csv({
             "timestamp"     : ts.strftime("%Y-%m-%d %H:%M:%S"),
             "event"         : "FAST_TICK_ENTER",
@@ -380,6 +410,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "c1_body"       : round(abs(move), 2),
             "confirm_open"  : "", "confirm_high": "", "confirm_low": "", "confirm_close": "",
             "breakout_price": round(price, 2),
+            **ind,
         })
 
         self._signal_meta = {
@@ -391,6 +422,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "confirm_open"  : "", "confirm_high": "",
             "confirm_low"   : "", "confirm_close": "",
             "breakout_price": round(price, 2),
+            **ind,
         }
         self._reset_pattern_state()
         self._fire_entry(signal, price, ts, reason="tick_30pt_fast_entry")
@@ -417,6 +449,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"body={abs(body):.1f} @ {c['ts'].strftime('%H:%M:%S')} — waiting for confirm 5s"
         )
 
+        ind = self._indicator_snapshot(c["close"])
+
         self._log_signal_csv({
             "timestamp"  : c["ts"].strftime("%Y-%m-%d %H:%M:%S"),
             "event"      : "TRIGGER",
@@ -426,6 +460,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "c1_body"    : round(abs(body), 2),
             "confirm_open": "", "confirm_high": "", "confirm_low": "", "confirm_close": "",
             "breakout_price": "",
+            **ind,
         })
 
     def _check_confirm_candle(self, c5: dict, ts: datetime):
@@ -444,6 +479,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                 f"[{self.name}] Confirm 5s candle mismatch "
                 f"(C1={self._trigger_color} confirm={color5}) — resetting scan"
             )
+            ind = self._indicator_snapshot(c5["close"])
             self._log_signal_csv({
                 "timestamp": c5["ts"].strftime("%Y-%m-%d %H:%M:%S"),
                 "event"    : "CONFIRM_MISMATCH",
@@ -454,6 +490,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                 "confirm_open": c5["open"], "confirm_high": c5["high"],
                 "confirm_low" : c5["low"],  "confirm_close": c5["close"],
                 "breakout_price": "",
+                **ind,
             })
             self._reset_pattern_state()
             return
@@ -467,6 +504,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"o={c5['open']:.1f} h={c5['high']:.1f} l={c5['low']:.1f} c={c5['close']:.1f} "
             f"@ {c5['ts'].strftime('%H:%M:%S')} — watching breakout in next 10s window"
         )
+        ind = self._indicator_snapshot(c5["close"])
         self._log_signal_csv({
             "timestamp": c5["ts"].strftime("%Y-%m-%d %H:%M:%S"),
             "event"    : "CONFIRM_MATCH",
@@ -477,6 +515,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "confirm_open": c5["open"], "confirm_high": c5["high"],
             "confirm_low" : c5["low"],  "confirm_close": c5["close"],
             "breakout_price": "",
+            **ind,
         })
 
     def _check_breakout_tick(self, price: float, ts: datetime):
@@ -489,6 +528,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         c1 = self._c1
         if self._trigger_color == "GREEN":
             if price > c5["high"] and price > c5["close"]:
+                ind = self._indicator_snapshot(price)
                 self._log_signal_csv({
                     "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
                     "event"    : "BREAKOUT_ENTER",
@@ -499,12 +539,14 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                     "confirm_open": c5["open"], "confirm_high": c5["high"],
                     "confirm_low" : c5["low"],  "confirm_close": c5["close"],
                     "breakout_price": round(price, 2),
+                    **ind,
                 })
-                self._signal_meta = self._build_signal_meta(price, ts)
+                self._signal_meta = self._build_signal_meta(price, ts, ind)
                 self._reset_pattern_state()
                 self._fire_entry("CE", price, ts)
         else:
             if price < c5["low"] and price < c5["close"]:
+                ind = self._indicator_snapshot(price)
                 self._log_signal_csv({
                     "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
                     "event"    : "BREAKOUT_ENTER",
@@ -515,12 +557,13 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                     "confirm_open": c5["open"], "confirm_high": c5["high"],
                     "confirm_low" : c5["low"],  "confirm_close": c5["close"],
                     "breakout_price": round(price, 2),
+                    **ind,
                 })
-                self._signal_meta = self._build_signal_meta(price, ts)
+                self._signal_meta = self._build_signal_meta(price, ts, ind)
                 self._reset_pattern_state()
                 self._fire_entry("PE", price, ts)
 
-    def _build_signal_meta(self, breakout_price: float, ts: datetime) -> dict:
+    def _build_signal_meta(self, breakout_price: float, ts: datetime, ind: dict = None) -> dict:
         c1, c5 = self._c1, self._confirm5
         return {
             "index_price"   : breakout_price,
@@ -531,6 +574,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "confirm_open"  : c5["open"], "confirm_high": c5["high"],
             "confirm_low"   : c5["low"],  "confirm_close": c5["close"],
             "breakout_price": round(breakout_price, 2),
+            **(ind or {}),
         }
 
     def _reset_pattern_state(self):
@@ -638,6 +682,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "breakout_price" : meta.get("breakout_price", ""),
             "time_in_trade_s": "",
             "sl_tp_slippage" : "",
+            **{k: meta.get(k, "") for k in INDICATOR_FIELDS},
         })
 
     # ── Exit ──────────────────────────────────────────────────────────────────
@@ -800,6 +845,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "breakout_price" : meta.get("breakout_price", ""),
             "time_in_trade_s": time_in_trade_s,
             "sl_tp_slippage" : sl_tp_slippage,
+            **{k: meta.get(k, "") for k in INDICATOR_FIELDS},
         })
         self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
 
@@ -819,7 +865,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "c1_body", "c1_open", "c1_high", "c1_low", "c1_close",
             "confirm_open", "confirm_high", "confirm_low", "confirm_close",
             "breakout_price", "time_in_trade_s", "sl_tp_slippage",
-        ]
+        ] + INDICATOR_FIELDS
         with open(fname, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             if not exists:
@@ -831,6 +877,11 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         Logs EVERY trigger candle regardless of outcome (mismatched, timed out,
         or entered) so the C1/confirm thresholds can be tuned from the full
         population of setups, not just the ones that became trades.
+
+        Also carries the log-only fast/leading indicator snapshot (VWAP, PCR,
+        EMA slope, RSI slope, MACD histogram, ATR%, Supertrend — see
+        core/fast_indicators.py) so those can be studied against outcomes
+        after the fact. None of it feeds back into the state machine above.
         """
         fname  = CFG["csv_file"].replace("_trades.csv", "_signals.csv")
         exists = os.path.isfile(fname)
@@ -839,7 +890,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "c1_open", "c1_high", "c1_low", "c1_close", "c1_body",
             "confirm_open", "confirm_high", "confirm_low", "confirm_close",
             "breakout_price",
-        ]
+        ] + INDICATOR_FIELDS
         with open(fname, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             if not exists:
