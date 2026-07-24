@@ -16,7 +16,11 @@ ENTRY LOGIC:
 
 LIVE / PAPER MODE
 ─────────────────
-Set LIVE_MODE = True below to enable real orders for this strategy.
+Live every day except the weekdays listed in PAPER_WEEKDAYS below, which
+trade in paper mode regardless. Currently: Monday = paper, all other days
+= live. self.LIVE_MODE is a property recomputed on every access from the
+current IST weekday, so the switch takes effect at the next check without
+needing a restart at a day boundary.
 All other strategies remain in paper mode until their own flag is changed.
 
 ORDER EXECUTION (live mode)
@@ -128,9 +132,17 @@ def _now_ist() -> datetime:
     return datetime.now(tz=_IST).replace(tzinfo=None)
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  LIVE MODE FLAG
+#  LIVE / PAPER SCHEDULE
 # ─────────────────────────────────────────────────────────────────────────────
-LIVE_MODE = True
+# Weekdays that force paper mode regardless of the day-based schedule below.
+# datetime.weekday(): Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4,
+# Saturday=5, Sunday=6.
+PAPER_WEEKDAYS = {0}  # Monday
+
+
+def _is_live_today() -> bool:
+    """Live on every weekday except those listed in PAPER_WEEKDAYS (IST)."""
+    return _now_ist().weekday() not in PAPER_WEEKDAYS
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  CONFIG
@@ -160,7 +172,10 @@ CFG = {
 
 class SpikeStrategy(BaseStrategy):
 
-    LIVE_MODE = LIVE_MODE
+    @property
+    def LIVE_MODE(self) -> bool:
+        """Recomputed on every access — True unless today (IST) is a paper day."""
+        return _is_live_today()
 
     @property
     def name(self) -> str:
@@ -197,8 +212,8 @@ class SpikeStrategy(BaseStrategy):
 
         self._lock              = threading.Lock()
 
-        mode_tag = "[LIVE]" if LIVE_MODE else "[PAPER]"
-        log.info(f"[SPIKE] Initialized in {mode_tag} mode")
+        mode_tag = "[LIVE]" if self.LIVE_MODE else "[PAPER]"
+        log.info(f"[SPIKE] Initialized in {mode_tag} mode (today; re-checked daily)")
 
     # ── Pre-market ────────────────────────────────────────────────────────────
 
@@ -221,7 +236,7 @@ class SpikeStrategy(BaseStrategy):
 
         log.info(f"[SPIKE] Pre-market | "
                  f"body=[{self._prev_body_low} – {self._prev_body_high}] "
-                 f"prev_close={pm.prev_close} | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
+                 f"prev_close={pm.prev_close} | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
 
         ref_price = pm.prev_close or pm.prev_last5m_close
 
@@ -563,7 +578,7 @@ class SpikeStrategy(BaseStrategy):
             log.info(f"[SPIKE] Unsubscribed unused CE leg: "
                      f"{self._pre_ce_sym} ({self._pre_ce_token})")
 
-        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
             f"[SPIKE] [{mode_tag}] ENTRY {sym} @ {fill_price:.0f} | "
             f"SL={sl:.0f} | Trail kicks at {fill_price + CFG['trail_trigger_pts']:.0f} "
@@ -630,7 +645,7 @@ class SpikeStrategy(BaseStrategy):
             return
 
         # ── ALL 3 RETRIES FAILED ───────────────────────────────────────────────
-        if LIVE_MODE:
+        if self.LIVE_MODE:
             still_open = self._hub.order_router._is_position_open(t["symbol"])
 
             if not still_open:
@@ -715,7 +730,7 @@ class SpikeStrategy(BaseStrategy):
                 # Refresh LTP and try SELL
                 ltp = self.get_price(t["token"]) or ref_price
                 result = self._hub.order_router.place_sell(
-                    self.name, t["symbol"], t["token"], t["qty"], ltp, LIVE_MODE
+                    self.name, t["symbol"], t["token"], t["qty"], ltp, self.LIVE_MODE
                 )
 
                 if result:
@@ -775,7 +790,7 @@ class SpikeStrategy(BaseStrategy):
         self._today_pnl += pnl
         self._trade_done = True
 
-        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
             f"[SPIKE] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.0f} "
             f"| PnL {pnl:.0f} | Today {self._today_pnl:.0f} | order_id={order_id}"
@@ -841,7 +856,7 @@ class SpikeStrategy(BaseStrategy):
 
     def eod_summary(self):
         log.info(f"\n[SPIKE] {'='*50}")
-        log.info(f"[SPIKE] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
+        log.info(f"[SPIKE] END OF DAY | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
         log.info(f"[SPIKE] Gap direction  : {self._gap_direction}")
         log.info(f"[SPIKE] Trade executed : {'Yes' if self._trade_done else 'No'}")
         for t in self._completed:
