@@ -149,8 +149,8 @@ CFG = {
     "c2_move_pts"            : 3.0,   # price move from C2's open that closes C2 early
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
-    "sl_points"              : 10.0,
-    "tp_points"              : 10.0,
+    "sl_points"              : 15.0,
+    "tp_points"              : 5.0,
     "sl_grace_seconds"       : 5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
