@@ -146,7 +146,7 @@ BANKNIFTY_STRIKE_STEP = 100
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = {
-    "quantity"               : 15,
+    "quantity"               : 30,
 
     # ── Session windows ───────────────────────────────────────────────────────
     "start_time"             : dtime(9, 15),
@@ -161,8 +161,8 @@ CFG = {
     "c2_move_pts"            : 10.0,  # price move from C2's open that closes C2 early
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
-    "sl_points"              : 20.0,
-    "tp_points"              : 30.0,
+    "sl_points"              : 30.0,
+    "tp_points"              : 10.0,
     "sl_grace_seconds"       : 5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
