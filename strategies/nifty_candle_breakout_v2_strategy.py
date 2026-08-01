@@ -96,6 +96,7 @@ from typing import Optional
 from core.base_strategy import BaseStrategy
 from core.candle import SecondCandleBuilder
 from core.instruments import get_atm_strike
+from core.fast_indicators import compute_fast_indicators, CANDLE_WINDOW, INDICATOR_FIELDS
 
 log = logging.getLogger("strategy.nifty_candle_breakout_v2")
 
@@ -148,9 +149,10 @@ CFG = {
     "c2_window_sec"          : 5,     # C2 times out (closes as-is) after this many seconds
     "c2_move_pts"            : 3.0,   # price move from C2's open that closes C2 early
 
-    # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
-    "sl_points"              : 15.0,
-    "tp_points"              : 5.0,
+    # ── SL / trailing lock (on OPTION PREMIUM) — min 10pt gain, unlimited upside ──
+    "sl_points"              : 15.0,   # initial risk stop before trailing lock activates
+    "trail_activate_pts"     : 5.0,   # once profit (option premium) >= this, lock a minimum 5pt gain
+    "trail_distance_pts"     : 5.0,   # thereafter SL trails this far behind the peak — no fixed TP, unlimited upside
     "sl_grace_seconds"       : 5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
@@ -192,6 +194,11 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         self._signal_meta    = None   # metrics collected from C1/C2 for the next entry
 
+        # Live PreMarketData reference (set in pre_market()) — read
+        # self._pm.pcr at signal time so it reflects the live-refreshed
+        # value, not a snapshot taken at market open. Log-only.
+        self._pm = None
+
         self._trade         = None
         self._pending_entry  = None
         self._trades_today   = 0
@@ -204,7 +211,8 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         log.info(
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
             f"c1_move={CFG['c1_move_pts']}pts c2_move={CFG['c2_move_pts']}pts "
-            f"SL=-{CFG['sl_points']} TP=+{CFG['tp_points']}"
+            f"SL=-{CFG['sl_points']} | trail: lock +{CFG['trail_activate_pts']}, "
+            f"trail {CFG['trail_distance_pts']} behind peak (unlimited upside)"
         )
 
     # ── Pre-market ────────────────────────────────────────────────────────────
@@ -218,12 +226,28 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         """
         self._instruments = instruments
         self._expiry_date = pm.expiry_date
+        self._pm = pm
 
         log.info(
             f"[{self.name}] Pre-market | expiry={pm.expiry_date} "
             f"mode={'LIVE' if LIVE_MODE else 'PAPER'}"
         )
         return True
+
+    # ── Fast/leading indicator snapshot (LOG-ONLY — see core/fast_indicators.py) ──
+
+    def _indicator_snapshot(self, spot: float) -> dict:
+        """
+        Computes VWAP / PCR / EMA slope / RSI slope / MACD histogram / ATR% /
+        Supertrend from the strategy's own rolling 10s candle buffer plus the
+        live hub VWAP and live PCR. Called once per signal event and merged
+        into both the signals CSV and (via _signal_meta) the trades CSV.
+        Entry/exit decisions never read this — log-only, mirrors v1.
+        """
+        candles = self._c10.last_n_closed(CANDLE_WINDOW)
+        vwap    = self._hub.session_vwap.value
+        pcr     = self._pm.pcr if self._pm is not None else None
+        return compute_fast_indicators(candles, spot=spot, vwap=vwap, pcr=pcr)
 
     # ── Tick handlers ─────────────────────────────────────────────────────────
 
@@ -272,7 +296,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
     def on_option_tick(self, token: int, price: float, ts: datetime, tick_ts: datetime = None):
         """
         Resolves a pending entry (if the option had no valid live price at
-        signal time) and manages fixed SL/TP for the open trade.
+        signal time) and manages the trailing stop for the open trade.
         """
         # ── Resolve pending entry ─────────────────────────────────────────────
         if (self._pending_entry and token == self._pending_entry["token"]
@@ -292,15 +316,31 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         if self._trade["state"] != "OPEN" or self._trade.get("_exit_in_progress"):
             return
 
-        # ── SL / TP grace period ──────────────────────────────────────────────
+        # ── SL grace period ────────────────────────────────────────────────────
         sl_active_from = self._trade.get("sl_active_from")
         if sl_active_from is not None and ts < sl_active_from:
             return
 
-        if price <= self._trade["sl"]:
-            self._do_exit(price, "SL_HIT", ts)
-        elif price >= self._trade["tp"]:
-            self._do_exit(price, "TP_HIT", ts)
+        # ── Trailing stop — NO fixed TP, profit is unlimited ──────────────────
+        # Once the trade is up by trail_activate_pts, SL locks to at least
+        # entry+trail_activate_pts (guarantees the minimum 5pt gain) and then
+        # trails trail_distance_pts behind the running peak. SL only ever
+        # ratchets UP, never down. The only exits are this trailing SL (or the
+        # original risk SL before activation) and EOD force-close.
+        t = self._trade
+        t["peak"] = max(t["peak"], price)
+        gain = t["peak"] - t["entry"]
+        if gain >= CFG["trail_activate_pts"]:
+            locked_sl = max(
+                t["entry"] + CFG["trail_activate_pts"],
+                t["peak"] - CFG["trail_distance_pts"],
+            )
+            if locked_sl > t["sl"]:
+                t["sl"] = locked_sl
+
+        if price <= t["sl"]:
+            reason = "TRAIL_SL_HIT" if gain >= CFG["trail_activate_pts"] else "SL_HIT"
+            self._do_exit(price, reason, ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
 
@@ -331,6 +371,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
                 f"o={c1['open']:.1f} h={c1['high']:.1f} l={c1['low']:.1f} c={c1['close']:.1f} "
                 f"@ {ts.strftime('%H:%M:%S')} — starting C2"
             )
+            ind = self._indicator_snapshot(c1["close"])
             self._log_signal_csv({
                 "timestamp"  : ts.strftime("%Y-%m-%d %H:%M:%S"),
                 "event"      : "C1_TRIGGER",
@@ -340,6 +381,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
                 "c1_body"    : round(abs(move), 2),
                 "confirm_open": "", "confirm_high": "", "confirm_low": "", "confirm_close": "",
                 "breakout_price": "",
+                **ind,
             })
 
             self._start_c2(price, ts)
@@ -391,6 +433,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             log.info(
                 f"[{self.name}] C2 mismatch (C1={self._trigger_color} C2={color2}) — resetting scan"
             )
+            ind = self._indicator_snapshot(c2["close"])
             self._log_signal_csv({
                 "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
                 "event"    : "C2_MISMATCH",
@@ -401,6 +444,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
                 "confirm_open": c2["open"], "confirm_high": c2["high"],
                 "confirm_low" : c2["low"],  "confirm_close": c2["close"],
                 "breakout_price": "",
+                **ind,
             })
             self._reset_pattern_state()
             return
@@ -413,6 +457,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             f"o={c2['open']:.1f} h={c2['high']:.1f} l={c2['low']:.1f} c={c2['close']:.1f} "
             f"@ {ts.strftime('%H:%M:%S')} — entering {signal} @ {entry_price:.1f}"
         )
+        ind = self._indicator_snapshot(entry_price)
         self._log_signal_csv({
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "event"    : "C2_ENTER",
@@ -423,13 +468,14 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "confirm_open": c2["open"], "confirm_high": c2["high"],
             "confirm_low" : c2["low"],  "confirm_close": c2["close"],
             "breakout_price": round(entry_price, 2),
+            **ind,
         })
 
-        self._signal_meta = self._build_signal_meta(entry_price, ts)
+        self._signal_meta = self._build_signal_meta(entry_price, ts, ind)
         self._reset_pattern_state()
         self._fire_entry(signal, entry_price, ts)
 
-    def _build_signal_meta(self, entry_price: float, ts: datetime) -> dict:
+    def _build_signal_meta(self, entry_price: float, ts: datetime, ind: dict = None) -> dict:
         c1, c2 = self._c1, self._c2
         return {
             "index_price"   : entry_price,
@@ -440,6 +486,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "confirm_open"  : c2["open"], "confirm_high": c2["high"],
             "confirm_low"   : c2["low"],  "confirm_close": c2["close"],
             "breakout_price": round(entry_price, 2),
+            **(ind or {}),
         }
 
     def _reset_pattern_state(self):
@@ -491,7 +538,6 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         order_id, fill_price = result
 
         sl = fill_price - CFG["sl_points"]
-        tp = fill_price + CFG["tp_points"]
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
 
         meta = self._signal_meta or {}
@@ -503,7 +549,8 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "signal"           : signal,
             "entry"            : fill_price,
             "sl"               : sl,
-            "tp"               : tp,
+            "tp"               : None,   # no fixed TP — trailing stop only, profit unlimited
+            "peak"             : fill_price,
             "entry_time"       : ts,
             "sl_active_from"   : sl_active_from,
             "order_id"         : order_id,
@@ -516,7 +563,8 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         log.info(
             f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} @ {fill_price:.2f} | "
-            f"SL={sl:.2f} (-{CFG['sl_points']}) TP={tp:.2f} (+{CFG['tp_points']}) | "
+            f"SL={sl:.2f} (-{CFG['sl_points']}) | trail: lock +{CFG['trail_activate_pts']} then "
+            f"trail {CFG['trail_distance_pts']} behind peak (unlimited upside) | "
             f"reason={reason} | order_id={order_id}"
         )
 
@@ -527,7 +575,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "action"         : "ENTRY",
             "price"          : fill_price,
             "sl"             : round(sl, 2),
-            "tp"             : round(tp, 2),
+            "tp"             : "",
             "status"         : "OPEN",
             "pnl"            : 0,
             "reason"         : reason,
@@ -547,6 +595,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "breakout_price" : meta.get("breakout_price", ""),
             "time_in_trade_s": "",
             "sl_tp_slippage" : "",
+            **{k: meta.get(k, "") for k in INDICATOR_FIELDS},
         })
 
     # ── Exit ──────────────────────────────────────────────────────────────────
@@ -665,12 +714,12 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         self._today_pnl += pnl
 
         time_in_trade_s = round((ts - t["entry_time"]).total_seconds(), 1)
-        # Positive slippage = filled worse than the intended SL/TP level (gap-through);
-        # negative/zero = filled at or better than the level.
+        # Positive slippage = filled worse than the intended SL level (gap-through);
+        # negative/zero = filled at or better than the level. No TP_HIT anymore —
+        # profit is unlimited via the trailing stop, so only SL_HIT/TRAIL_SL_HIT
+        # (both contain "SL_HIT") carry a slippage figure.
         if "SL_HIT" in reason:
             sl_tp_slippage = round(t["sl"] - sell_price, 2)
-        elif "TP_HIT" in reason:
-            sl_tp_slippage = round(sell_price - t["tp"], 2)
         else:
             sl_tp_slippage = ""
 
@@ -689,7 +738,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "action"         : "EXIT",
             "price"          : sell_price,
             "sl"             : round(t["sl"], 2),
-            "tp"             : round(t["tp"], 2),
+            "tp"             : "",
             "status"         : "CLOSED",
             "pnl"            : round(pnl, 2),
             "reason"         : reason,
@@ -709,6 +758,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "breakout_price" : meta.get("breakout_price", ""),
             "time_in_trade_s": time_in_trade_s,
             "sl_tp_slippage" : sl_tp_slippage,
+            **{k: meta.get(k, "") for k in INDICATOR_FIELDS},
         })
         self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
 
@@ -728,7 +778,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "c1_body", "c1_open", "c1_high", "c1_low", "c1_close",
             "confirm_open", "confirm_high", "confirm_low", "confirm_close",
             "breakout_price", "time_in_trade_s", "sl_tp_slippage",
-        ]
+        ] + INDICATOR_FIELDS
         with open(fname, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             if not exists:
@@ -740,6 +790,11 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         Logs EVERY trigger candle regardless of outcome (mismatched, timed out,
         or entered) so the C1/confirm thresholds can be tuned from the full
         population of setups, not just the ones that became trades.
+
+        Also carries the log-only fast/leading indicator snapshot (VWAP, PCR,
+        EMA slope, RSI slope, MACD histogram, ATR%, Supertrend — see
+        core/fast_indicators.py) so those can be studied against outcomes
+        after the fact. None of it feeds back into the state machine above.
         """
         fname  = CFG["csv_file"].replace("_trades.csv", "_signals.csv")
         exists = os.path.isfile(fname)
@@ -748,7 +803,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "c1_open", "c1_high", "c1_low", "c1_close", "c1_body",
             "confirm_open", "confirm_high", "confirm_low", "confirm_close",
             "breakout_price",
-        ]
+        ] + INDICATOR_FIELDS
         with open(fname, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             if not exists:
