@@ -137,9 +137,10 @@ CFG = {
     "bucket_5s"              : 5,
     "min_body_pts"           : 6.0,   # body must be strictly greater than this
 
-    # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
-    "sl_points"              : 15.0,
-    "tp_points"              : 5.0,
+    # ── SL / trailing lock (on OPTION PREMIUM) — min 10pt gain, unlimited upside ──
+    "sl_points"              : 15.0,   # initial risk stop before trailing lock activates
+    "trail_activate_pts"     : 5.0,   # once profit (option premium) >= this, lock a minimum 5pt gain
+    "trail_distance_pts"     : 5.0,   # thereafter SL trails this far behind the peak — no fixed TP, unlimited upside
     "sl_grace_seconds"       : 5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
@@ -200,7 +201,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
             f"min_body={CFG['min_body_pts']}pts "
-            f"SL=-{CFG['sl_points']} TP=+{CFG['tp_points']}"
+            f"SL=-{CFG['sl_points']} | trail: lock +{CFG['trail_activate_pts']}, "
+            f"trail {CFG['trail_distance_pts']} behind peak (unlimited upside)"
         )
 
     # ── Pre-market ────────────────────────────────────────────────────────────
@@ -312,7 +314,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
     def on_option_tick(self, token: int, price: float, ts: datetime, tick_ts: datetime = None):
         """
         Resolves a pending entry (if the option had no valid live price at
-        signal time) and manages fixed SL/TP for the open trade.
+        signal time) and manages the trailing stop for the open trade.
         """
         # ── Resolve pending entry ─────────────────────────────────────────────
         if (self._pending_entry and token == self._pending_entry["token"]
@@ -332,15 +334,31 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         if self._trade["state"] != "OPEN" or self._trade.get("_exit_in_progress"):
             return
 
-        # ── SL / TP grace period ──────────────────────────────────────────────
+        # ── SL grace period ────────────────────────────────────────────────────
         sl_active_from = self._trade.get("sl_active_from")
         if sl_active_from is not None and ts < sl_active_from:
             return
 
-        if price <= self._trade["sl"]:
-            self._do_exit(price, "SL_HIT", ts)
-        elif price >= self._trade["tp"]:
-            self._do_exit(price, "TP_HIT", ts)
+        # ── Trailing stop — NO fixed TP, profit is unlimited ──────────────────
+        # Once the trade is up by trail_activate_pts, SL locks to at least
+        # entry+trail_activate_pts (guarantees the minimum 5pt gain) and then
+        # trails trail_distance_pts behind the running peak. SL only ever
+        # ratchets UP, never down. The only exits are this trailing SL (or the
+        # original risk SL before activation) and EOD force-close.
+        t = self._trade
+        t["peak"] = max(t["peak"], price)
+        gain = t["peak"] - t["entry"]
+        if gain >= CFG["trail_activate_pts"]:
+            locked_sl = max(
+                t["entry"] + CFG["trail_activate_pts"],
+                t["peak"] - CFG["trail_distance_pts"],
+            )
+            if locked_sl > t["sl"]:
+                t["sl"] = locked_sl
+
+        if price <= t["sl"]:
+            reason = "TRAIL_SL_HIT" if gain >= CFG["trail_activate_pts"] else "SL_HIT"
+            self._do_exit(price, reason, ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
 
@@ -542,7 +560,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         order_id, fill_price = result
 
         sl = fill_price - CFG["sl_points"]
-        tp = fill_price + CFG["tp_points"]
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
 
         meta = self._signal_meta or {}
@@ -554,7 +571,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             "signal"           : signal,
             "entry"            : fill_price,
             "sl"               : sl,
-            "tp"               : tp,
+            "tp"               : None,   # no fixed TP — trailing stop only, profit unlimited
+            "peak"             : fill_price,
             "entry_time"       : ts,
             "sl_active_from"   : sl_active_from,
             "order_id"         : order_id,
@@ -567,7 +585,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         log.info(
             f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} @ {fill_price:.2f} | "
-            f"SL={sl:.2f} (-{CFG['sl_points']}) TP={tp:.2f} (+{CFG['tp_points']}) | "
+            f"SL={sl:.2f} (-{CFG['sl_points']}) | trail: lock +{CFG['trail_activate_pts']} then "
+            f"trail {CFG['trail_distance_pts']} behind peak (unlimited upside) | "
             f"reason={reason} | order_id={order_id}"
         )
 
@@ -578,7 +597,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             "action"         : "ENTRY",
             "price"          : fill_price,
             "sl"             : round(sl, 2),
-            "tp"             : round(tp, 2),
+            "tp"             : "",
             "status"         : "OPEN",
             "pnl"            : 0,
             "reason"         : reason,
@@ -717,12 +736,12 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         self._today_pnl += pnl
 
         time_in_trade_s = round((ts - t["entry_time"]).total_seconds(), 1)
-        # Positive slippage = filled worse than the intended SL/TP level (gap-through);
-        # negative/zero = filled at or better than the level.
+        # Positive slippage = filled worse than the intended SL level (gap-through);
+        # negative/zero = filled at or better than the level. No TP_HIT anymore —
+        # profit is unlimited via the trailing stop, so only SL_HIT/TRAIL_SL_HIT
+        # (both contain "SL_HIT") carry a slippage figure.
         if "SL_HIT" in reason:
             sl_tp_slippage = round(t["sl"] - sell_price, 2)
-        elif "TP_HIT" in reason:
-            sl_tp_slippage = round(sell_price - t["tp"], 2)
         else:
             sl_tp_slippage = ""
 
@@ -741,7 +760,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             "action"         : "EXIT",
             "price"          : sell_price,
             "sl"             : round(t["sl"], 2),
-            "tp"             : round(t["tp"], 2),
+            "tp"             : "",
             "status"         : "CLOSED",
             "pnl"            : round(pnl, 2),
             "reason"         : reason,
