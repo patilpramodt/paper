@@ -137,7 +137,7 @@ def _now_ist() -> datetime:
 # Weekdays that force paper mode regardless of the day-based schedule below.
 # datetime.weekday(): Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4,
 # Saturday=5, Sunday=6.
-PAPER_WEEKDAYS = {0}  # Monday
+PAPER_WEEKDAYS = {}  # Monday
 
 
 def _is_live_today() -> bool:
