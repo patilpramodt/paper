@@ -165,7 +165,7 @@ CFG = {
     # priced in core/costs.py, or no entry signal can rescue the strategy.
     "sl_points"              : 30.0,
     "trail_activate_pts"     : 34.0,   # open profit before trail arms
-    "lock_pts"               : 16.0,   # profit locked the moment it arms
+    "lock_pts"               : 10.0,   # profit locked the moment it arms
     "trail_distance_pts"     : 22.0,   # thereafter trail this far behind peak
     "sl_grace_seconds"       : 5,
 
@@ -174,14 +174,22 @@ CFG = {
     "time_stop_min_profit"   : 12.0,
 
     # ── FIX C: risk caps (all NEW — there were none) ──────────────────────────
+    # TEST-PHASE SWITCH (2026-08): both master switches below are OFF while you
+    # collect a clean, unfiltered month of paper data. All the tracking, halt
+    # bookkeeping, and CSV logging still runs underneath so you can see exactly
+    # what each gate WOULD have blocked — nothing is deleted, it just isn't
+    # enforced yet. Flip both to True once you've reviewed a month of data and
+    # decided on thresholds; no code changes needed, just these two flags.
+    "enforce_risk_caps"      : False,
+    "enforce_direction_gate" : False,
     "max_trades_day"         : 6,
     "max_daily_loss_rs"      : 6000.0,
     "max_consec_losses"      : 3,
     "post_loss_cooldown_sec" : 180,
 
     # ── FIX E: directional gates (were computed but unused) ───────────────────
-    "require_vwap_side"      : True,
-    "require_supertrend"     : True,
+    "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
+    "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -671,7 +679,11 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
         Both gates FAIL OPEN when the indicator is blank/not ready, so
         warm-up behaviour is unchanged. Set the CFG flags False to revert.
+        TEST PHASE: also fails open entirely while enforce_direction_gate=False —
+        see the CFG comment above.
         """
+        if not CFG["enforce_direction_gate"]:
+            return True, ""
         if CFG["require_vwap_side"]:
             side = ind.get("spot_vs_vwap", "")
             if side == "BELOW" and signal == "CE":
@@ -691,7 +703,16 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
     # ── FIX C: risk caps ────────────────────────────────────────────────────
 
     def _risk_block_reason(self) -> "Optional[str]":
-        """Returns a reason string if new entries are blocked, else None."""
+        """
+        Returns a reason string if new entries WOULD BE blocked, else None.
+        TEST PHASE: when enforce_risk_caps=False (default now) this never
+        actually blocks an entry — the caller only logs the reason. The
+        underlying counters (_halted, _consec_losses, _today_pnl) keep
+        updating exactly as before so the month-end CSV shows what each
+        cap would have done.
+        """
+        if not CFG["enforce_risk_caps"]:
+            return None
         if self._halted:
             return self._halt_reason or "halted"
         if self._trades_today >= CFG["max_trades_day"]:

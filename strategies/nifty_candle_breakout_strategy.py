@@ -155,7 +155,7 @@ CFG = {
     # Reward must be a MULTIPLE of risk, not a fraction. See module docstring.
     "sl_points"              : 12.0,  # initial risk stop
     "trail_activate_pts"     : 14.0,  # ~1.2R of open profit before trail arms
-    "lock_pts"               : 6.0,   # profit locked in the moment trail arms
+    "lock_pts"               : 5.0,   # profit locked the moment it arms
     "trail_distance_pts"     : 9.0,   # thereafter SL trails this far behind peak
     "sl_grace_seconds"       : 5,
 
@@ -166,6 +166,14 @@ CFG = {
     "time_stop_min_profit"   : 4.0,
 
     # ── FIX C: risk caps (all NEW — there were none) ──────────────────────────
+    # TEST-PHASE SWITCH (2026-08): both master switches below are OFF while you
+    # collect a clean, unfiltered month of paper data. All the tracking, halt
+    # bookkeeping, and CSV logging still runs underneath so you can see exactly
+    # what each gate WOULD have blocked — nothing is deleted, it just isn't
+    # enforced yet. Flip both to True once you've reviewed a month of data and
+    # decided on thresholds; no code changes needed, just these two flags.
+    "enforce_risk_caps"      : False,
+    "enforce_direction_gate" : False,
     "max_trades_day"         : 6,
     "max_daily_loss_rs"      : 4000.0,
     "max_consec_losses"      : 3,
@@ -174,8 +182,8 @@ CFG = {
     # ── FIX E: directional gates (were computed but unused) ───────────────────
     # Both fail OPEN when the indicator is not ready, so early-session
     # behaviour is identical to before. Set False to restore old behaviour.
-    "require_vwap_side"      : True,
-    "require_supertrend"     : True,
+    "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
+    "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -288,7 +296,11 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
 
         Both gates FAIL OPEN when the underlying indicator is blank/not ready,
         so nothing changes during warm-up or if fast_indicators errors out.
+        TEST PHASE: also fails open entirely while enforce_direction_gate=False —
+        see the CFG comment above.
         """
+        if not CFG["enforce_direction_gate"]:
+            return True, ""
         if CFG["require_vwap_side"]:
             side = ind.get("spot_vs_vwap", "")
             if side == "BELOW" and signal == "CE":
@@ -308,7 +320,16 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
     # ── FIX C: risk gate ──────────────────────────────────────────────────────
 
     def _risk_block_reason(self, ts: datetime) -> Optional[str]:
-        """Returns a reason string if new entries are blocked, else None."""
+        """
+        Returns a reason string if new entries WOULD BE blocked, else None.
+        TEST PHASE: when enforce_risk_caps=False (default now) this never
+        actually blocks an entry — the caller only logs the reason. The
+        underlying counters (_halted, _consec_losses, _today_pnl) keep
+        updating exactly as before so the month-end CSV shows what each
+        cap would have done.
+        """
+        if not CFG["enforce_risk_caps"]:
+            return None
         if self._halted:
             return self._halt_reason or "halted"
         if self._trades_today >= CFG["max_trades_day"]:
