@@ -123,6 +123,100 @@ FIXES APPLIED:
              Bug 9 breakeven guarantee still holds exactly) and scaled to
              what was actually traded, not a single constant borrowed from
              Nifty's economics and silently reused for BankNifty.
+
+  Bug 19 -- BB_MIN_BW_BREAKOUT UNIT MISMATCH (percent vs fraction).
+             `bb_min_bw_breakout` was set to 0.36 with the intent "0.36%",
+             but compute_bb() returns `bw_pct` as a FRACTION
+             ((upper-lower)/mid), e.g. 0.0053 for a 0.53% band width.
+             So the gate was really demanding a 36% band width -- a level
+             BankNifty never reaches. Every `breakout` entry was silently
+             rejected with blocked_by="bw_squeeze" from the moment this
+             gate was introduced.
+             Evidence (48 sessions, 2026-05-14 .. 2026-08-10):
+                 2026-05 : 11 breakout entries   (gate not yet live)
+                 2026-06 :  0 breakout entries
+                 2026-07 :  0 breakout entries
+                 2026-08 :  0 breakout entries
+             P&L by entry mode over the same window:
+                 breakout : n=11  +8,908 Rs   64% win
+                 bounce   : n= 5  +8,041 Rs   80% win
+                 middle   : n=35  -5,262 Rs   29% win
+             i.e. the gate disabled the two profitable modes' main
+             contributor and left the strategy running almost exclusively
+             on its only losing mode.
+             Fix: threshold expressed as a fraction (0.0036) to match the
+             units compute_bb() actually returns, plus an assertion-style
+             sanity clamp in _validate_cfg() so a future edit that types a
+             percent here fails loudly at startup instead of silently
+             disabling a whole entry mode.
+
+  Bug 20 -- STOP SIZED INSIDE THE NOISE BAND.
+             Bug 15's premium_atr_scale correction was arithmetically
+             right (index points != premium points) but the multiplier
+             was not re-based afterwards, so the effective stop halved:
+                 median SL_pts  May 48.5 -> Jul 23.3
+                 win rate       May 52%  -> Jul 22%
+                 net            May +11,678 Rs -> Jul -2,098 Rs
+             With index ATR ~65 and an ATM delta of ~0.45, one 5-min bar
+             moves the premium ~29 pts. A 23-pt stop therefore sits INSIDE
+             a single bar's normal range and gets taken out by noise
+             independently of whether the signal was right.
+             Grouping all 51 trades by realised stop width instead of by
+             date makes the relationship monotonic:
+                 SL > 40 pts : n=24  50% win  +13.9 pts/trade
+                 SL 25-40    : n=16  38% win   +2.4 pts/trade
+                 SL <= 25    : n=11  27% win   +1.6 pts/trade
+             Fix: atr_sl_mult 0.8 -> 1.7 and sl_max 35 -> 55, restoring a
+             stop of ~1.5-1.8x premium ATR (May's real width) WITHOUT
+             reintroducing the unit bug. atr_tp_mult re-based to 2.7 so
+             R:R lands near 1:1.6 -- a 1:2.5 target is ~120 premium points,
+             which was reachable at VIX 18 (May) but is not at VIX 12
+             (Aug). Sizing now targets a reachable target at a survivable
+             stop rather than an unreachable target at a stop that cannot
+             survive one bar. See _validate_cfg() for the noise-band check
+             that logs a WARNING when sl_pts < premium ATR.
+
+  Bug 21 -- MIDDLE-BAND CROSS IS A NET LOSING MODE.
+             A middle-band cross is a mean-reversion event, not a
+             volatility-expansion event, so it shares neither premise with
+             the other two modes. Over 48 sessions it produced n=35,
+             -5,262 Rs, 29% win -- and because of Bug 19 it became the
+             ONLY mode still firing. It is now behind a master switch
+             (`enable_middle_mode`, default False) rather than deleted, so
+             a month of data can be gathered with it off and it can be
+             re-enabled without a code change if the picture changes.
+
+  Bug 22 -- FIXED BW THRESHOLD BECOMES A KILL SWITCH IN LOW VOL.
+             India VIX ran ~18.2 median in May, ~15.8 in June, ~12.6 in
+             July, ~12.0 in August; BankNifty BB width followed
+             (0.53% -> 0.34% median). Any FIXED band-width floor silently
+             turns into a full stop as vol compresses -- the bb_squeeze
+             block rate went 0% (May) -> 26% (Aug).
+             Fix: `bb_bw_adaptive` compares the current bar's band width
+             against a rolling percentile of its own recent history
+             (bb_bw_lookback / bb_bw_pctile) and takes whichever of that
+             and the absolute floor is HIGHER. The strategy keeps
+             demanding an above-average expansion relative to current
+             conditions instead of relative to May's conditions.
+
+  Bug 23 -- TRAIL ARMED AT A FIXED DISTANCE WHILE SL IS ADAPTIVE.
+             `trail_arm` was a flat 25 pts regardless of the stop the
+             trade was actually sized with, so on a wide-stop day the
+             trail armed well before 1R and on a narrow-stop day well
+             after it. It is now the greater of the absolute floor and
+             `trail_arm_sl_frac` x this trade's own sl_pts, i.e. always a
+             fixed FRACTION of risk. Same treatment for trail_step via
+             trail_step_sl_frac.
+
+NOTE ON SAMPLE SIZE
+-------------------
+The mode and stop-width splits above rest on 51 trades across 48
+sessions -- suggestive, not conclusive. May also genuinely had higher
+vol, which independently helps a long-premium strategy, so part of the
+May/July gap is regime rather than configuration. The stop-width finding
+is the more solid of the two because it holds when the trades are sliced
+by width rather than by month. Re-measure after 20-30 trades on this
+sizing before treating any of it as settled.
 """
 
 import csv
@@ -197,7 +291,28 @@ CFG = {
     "bb_std"             : 2.0,
     "bb_squeeze_pct"     : 0.002,   # band-width/close < this → squeeze, skip all entries
     "bb_mid_squeeze_pct" : 0.003,   # stricter threshold for middle-band cross only
-    "bb_min_bw_breakout" : 0.36,    # breakout entries only when BW/close >= this
+
+    # Bug 19 fix — UNITS. compute_bb() returns bw_pct as a FRACTION
+    # ((upper-lower)/mid), so 0.53% band width arrives here as 0.0053.
+    # This value was 0.36, which reads as "0.36%" but actually demanded a
+    # 36% band width — unreachable on BankNifty, so it rejected 100% of
+    # breakout entries for three straight months. 0.0036 == 0.36%, which
+    # is what was intended. _validate_cfg() now hard-fails if this is set
+    # above 0.05 (5%), so the same typo can't silently return.
+    "bb_min_bw_breakout" : 0.0036,  # breakout entries only when BW/mid >= this
+
+    # Bug 22 fix — adaptive band-width floor.
+    # A fixed floor becomes a kill switch when vol compresses (VIX 18 →
+    # 12 between May and Aug took median BW from 0.53% to 0.34%). When
+    # enabled, the effective breakout threshold is
+    #     max(bb_min_bw_breakout, percentile(recent BW, bb_bw_pctile))
+    # so the strategy always demands an expansion that is large RELATIVE
+    # TO CURRENT CONDITIONS, while bb_min_bw_breakout stays as the
+    # absolute never-go-below floor.
+    "bb_bw_adaptive"     : True,
+    "bb_bw_lookback"     : 40,      # bars of BW history for the percentile
+    "bb_bw_pctile"       : 60,      # demand BW above this percentile of recent BW
+    "bb_bw_min_history"  : 15,      # below this many bars, fall back to the fixed floor
 
     # Volume filter
     "vol_avg_period"     : 10,
@@ -213,8 +328,22 @@ CFG = {
 
     # Trade management
     "atr_period"         : 14,
-    "atr_sl_mult"        : 0.8,
-    "atr_tp_mult"        : 2.0,
+
+    # Bug 20 fix — RE-BASED AFTER THE Bug 15 UNIT CORRECTION.
+    # Bug 15 correctly scaled index-point ATR into premium points, but
+    # left atr_sl_mult at 0.8, which had been tuned against the UNSCALED
+    # (roughly 2.2x larger) number. Net effect: the stop silently halved
+    # from ~48 pts to ~23 pts, and the win rate went 52% → 22%.
+    # With index ATR ~65 and ATM delta ~0.45, a 5-min bar moves the
+    # premium ~29 pts — so a 23-pt stop was inside one bar's noise.
+    # 1.7 restores a stop of ~1.5-1.8x premium ATR (May's real width)
+    # while keeping the units correct.
+    "atr_sl_mult"        : 1.7,
+    # Re-based to keep R:R near 1:1.6. At the previous 1:2.5 the target
+    # sat ~120 premium points away, which was reachable at VIX 18 but not
+    # at VIX 12. A 1:1.6 target at ~50% win rate has positive expectancy;
+    # a 1:2.5 target at 27% does not.
+    "atr_tp_mult"        : 2.7,
     # BUG FIX (ATR unit mismatch): `atr` computed by _compute_atr(df, ...) is
     # measured on the 5-min BankNifty INDEX candle buffer, i.e. raw index
     # points (typically 60-150+ on BankNifty) -- NOT option premium points.
@@ -229,12 +358,25 @@ CFG = {
     # in bb_stoch_nifty_strategy.py. sl_min/sl_max/tp_min/tp_max recalibrated
     # to match the new (correctly-scaled) premium ATR range.
     "premium_atr_scale"  : 0.45,
-    "sl_min"             : 8.0,
-    "sl_max"             : 35.0,
-    "tp_min"             : 15.0,
-    "tp_max"             : 90.0,
-    "trail_arm"          : 25.0,    # move SL to BE when profit >= this
-    "trail_step"         : 12.0,    # then trail every N pts
+
+    # Bug 20 fix — clamps re-based to the new multipliers. The old
+    # sl_max=35 would have truncated the wider stop straight back down to
+    # the losing width on every normal-ATR day, undoing the fix above.
+    "sl_min"             : 12.0,
+    "sl_max"             : 55.0,
+    "tp_min"             : 20.0,
+    "tp_max"             : 110.0,
+
+    # Bug 23 fix — trail thresholds expressed as a FRACTION OF THIS
+    # TRADE'S OWN RISK, not as a flat point count. With an adaptive SL, a
+    # flat 25-pt arm meant the trail armed at 0.45R on a wide-stop day and
+    # at 1.1R on a narrow-stop day. The absolute values below are now
+    # floors; the effective threshold is
+    #     max(trail_arm, trail_arm_sl_frac * trade.sl_pts)
+    "trail_arm"          : 18.0,    # absolute floor for the breakeven arm
+    "trail_arm_sl_frac"  : 0.60,    # arm breakeven at 0.60R
+    "trail_step"         : 12.0,    # absolute floor for each trail increment
+    "trail_step_sl_frac" : 0.35,    # then ratchet every 0.35R
 
     # Bug 17/18 fix: spread/slippage now modeled from the option's own
     # premium instead of a single flat constant borrowed from Nifty's
@@ -253,6 +395,19 @@ CFG = {
     "post_sl_cooldown"   : 120,
     "max_daily_loss"     : 6000,
     "quantity"           : 30,
+
+    # ── Entry-mode master switches (Bug 21) ──────────────────────────────
+    # Measured over 48 sessions (2026-05-14 .. 2026-08-10):
+    #     breakout : n=11  +8,908 Rs   64% win   avg +810
+    #     bounce   : n= 5  +8,041 Rs   80% win   avg +1,608
+    #     middle   : n=35  -5,262 Rs   29% win   avg   -150
+    # A middle-band cross is a mean-reversion event and shares no premise
+    # with the volatility-expansion modes. It is switched OFF rather than
+    # deleted so it can be re-enabled from config alone once there is
+    # enough data on the other two modes under the new sizing.
+    "enable_breakout_mode" : True,
+    "enable_bounce_mode"   : True,
+    "enable_middle_mode"   : False,
 
     # Signal persistence
     "persistence"        : 1,
@@ -282,6 +437,72 @@ CFG = {
     "exit_csv"           : "logs/bb_stoch_exit.csv",
     "signal_csv"         : "logs/bb_stoch_signals.csv",
 }
+
+
+# ============================================================
+# CONFIG VALIDATION  (Bug 19/20 guard)
+# ============================================================
+
+def _validate_cfg() -> None:
+    """
+    Fail loudly at import time on the two config mistakes that have
+    silently disabled this strategy before.
+
+    Neither of these is catchable at runtime: a percent-vs-fraction typo
+    in a band-width threshold, or a stop clamped below the instrument's
+    own noise band, both produce a strategy that runs cleanly all day and
+    simply never makes money. Both cost roughly a quarter's P&L before
+    anyone noticed, because there is no error to grep for -- the logs just
+    say "bw_squeeze" or "SL".
+    """
+    # Bug 19: bw thresholds are FRACTIONS. compute_bb() returns
+    # (upper-lower)/mid, so 0.36% arrives as 0.0036, not 0.36. BankNifty
+    # band width has never exceeded ~3%, so anything above 0.05 here is a
+    # percent typed where a fraction belongs and would reject 100% of the
+    # gated entry mode.
+    for key in ("bb_squeeze_pct", "bb_mid_squeeze_pct", "bb_min_bw_breakout"):
+        val = CFG[key]
+        if val > 0.05:
+            raise ValueError(
+                f"[BB_STOCH] CFG['{key}']={val} looks like a PERCENT but this "
+                f"value is compared against compute_bb()['bw_pct'], which is a "
+                f"FRACTION ((upper-lower)/mid). A 0.36% threshold must be "
+                f"written 0.0036, not 0.36. As written this gate rejects every "
+                f"entry it guards. See Bug 19 in the module docstring."
+            )
+
+    # Bug 20: a stop clamped tighter than one bar's premium range is a
+    # coin flip dressed up as risk management. This is a warning rather
+    # than a hard failure because the right value is instrument- and
+    # regime-dependent, but it should never pass unnoticed.
+    typical_index_atr = 65.0        # BankNifty 5-min ATR, 2026 observed median
+    typical_prem_atr  = typical_index_atr * CFG["premium_atr_scale"]
+    if CFG["sl_max"] < typical_prem_atr:
+        log.warning(
+            "[BB_STOCH] CFG['sl_max']=%.1f is below the typical premium ATR "
+            "(%.1f pts). The stop will be clamped inside a single 5-min bar's "
+            "range on normal days and will be hit by noise regardless of "
+            "signal quality. See Bug 20 in the module docstring.",
+            CFG["sl_max"], typical_prem_atr,
+        )
+
+    if CFG["atr_tp_mult"] <= CFG["atr_sl_mult"]:
+        log.warning(
+            "[BB_STOCH] atr_tp_mult (%.2f) <= atr_sl_mult (%.2f): target is "
+            "closer than the stop, so R:R is below 1:1.",
+            CFG["atr_tp_mult"], CFG["atr_sl_mult"],
+        )
+
+    if not (CFG["enable_breakout_mode"] or CFG["enable_bounce_mode"]
+            or CFG["enable_middle_mode"]):
+        raise ValueError(
+            "[BB_STOCH] All three entry modes are disabled — the strategy "
+            "can never enter a trade. Enable at least one of "
+            "enable_breakout_mode / enable_bounce_mode / enable_middle_mode."
+        )
+
+
+_validate_cfg()
 
 
 # ============================================================
@@ -369,6 +590,55 @@ def compute_bb(df: pd.DataFrame, period: int, nstd: float) -> dict:
         "prev_lower" : round(float(lower.iloc[-2]), 2),
         "prev_close" : round(float(close.iloc[-2]), 2),
     }
+
+
+def compute_bw_threshold(df: pd.DataFrame, period: int, nstd: float) -> Tuple[float, str]:
+    """
+    Bug 22 fix — the band-width floor a breakout must clear, adapted to
+    current volatility.
+
+    Returns (threshold, source) where `source` is "fixed" or "adaptive",
+    purely so the HOLD logs make it obvious which one bound.
+
+    Rationale: a FIXED floor silently becomes a full stop when volatility
+    compresses. Between May and August 2026 India VIX went ~18.2 → ~12.0
+    and BankNifty's median 5-min band width went 0.53% → 0.34%, taking the
+    bb_squeeze block rate from 0% to 26% of all bars. A threshold that made
+    sense in May was rejecting most of August by construction.
+
+    The adaptive threshold asks the question that actually matters -- "is
+    this bar's expansion large relative to what this market has been doing
+    lately?" -- while `bb_min_bw_breakout` stays as an absolute floor, so a
+    dead-flat tape still can't produce a "breakout". Whichever is higher
+    wins.
+    """
+    fixed = float(CFG["bb_min_bw_breakout"])
+
+    if not CFG.get("bb_bw_adaptive", False):
+        return fixed, "fixed"
+
+    lookback = int(CFG["bb_bw_lookback"])
+    min_hist = int(CFG["bb_bw_min_history"])
+    if df is None or len(df) < min_hist:
+        return fixed, "fixed"
+
+    close = df["close"].astype(float)
+    min_p = max(2, period // 3)
+    mid   = close.rolling(period, min_periods=min_p).mean()
+    std   = close.rolling(period, min_periods=min_p).std().fillna(0)
+    bw    = ((2.0 * nstd * std) / mid.replace(0, np.nan)).dropna()
+
+    # Exclude the current bar: the threshold must be a property of the
+    # RECENT PAST, not of the bar being judged. Including it would let a
+    # single wide bar raise its own bar to clear.
+    hist = bw.iloc[-(lookback + 1):-1]
+    if len(hist) < min_hist:
+        return fixed, "fixed"
+
+    adaptive = float(np.percentile(hist.values, float(CFG["bb_bw_pctile"])))
+    if adaptive > fixed:
+        return round(adaptive, 5), "adaptive"
+    return fixed, "fixed"
 
 
 def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
@@ -505,9 +775,14 @@ def evaluate_signal(df: pd.DataFrame,
     k_cross_up = stoch["k"] > stoch["d"] and stoch["prev_k"] <= stoch["prev_d"]
     k_cross_dn = stoch["k"] < stoch["d"] and stoch["prev_k"] >= stoch["prev_d"]
 
+    # Bug 22 fix: breakout threshold adapts to the recent volatility
+    # regime instead of being frozen at a level tuned in a higher-vol month.
+    bw_thresh, bw_src = compute_bw_threshold(df, CFG["bb_period"], CFG["bb_std"])
+
     base = {
         "bb": bb, "vol_ratio": vol_ratio, "atr": atr,
         "close": close, "stoch_k": stoch["k"], "stoch_d": stoch["d"],
+        "bw_thresh": bw_thresh, "bw_thresh_src": bw_src,
     }
 
     # Gate 0: Stochastic not yet ready (insufficient bars)
@@ -542,9 +817,16 @@ def evaluate_signal(df: pd.DataFrame,
     #   Bounce   : close crosses back ABOVE lower band
     #   Middle   : close crosses ABOVE middle band
     # ================================================================
-    bb_breakout_up  = close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"]
-    bb_bounce_up    = close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
-    bb_mid_cross_up = close > bb["mid"]   and bb["prev_close"] <= bb["prev_mid"]
+    # Bug 21 fix: each mode is behind its own master switch. A disabled
+    # mode is not merely skipped at the end — it must not even count as a
+    # trigger, or a disabled middle-cross would still consume the bar and
+    # emit a misleading stoch/vwap block reason.
+    bb_breakout_up  = (CFG["enable_breakout_mode"]
+                       and close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"])
+    bb_bounce_up    = (CFG["enable_bounce_mode"]
+                       and close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"])
+    bb_mid_cross_up = (CFG["enable_middle_mode"]
+                       and close > bb["mid"]   and bb["prev_close"] <= bb["prev_mid"])
 
     ce_bb_trigger = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
 
@@ -556,8 +838,9 @@ def evaluate_signal(df: pd.DataFrame,
             reason = "stoch_ob" if stoch["k"] >= CFG["stoch_ob"] else "stoch_no_cross_ce"
             return {"action": "HOLD", "blocked_by": reason, **base}
         if bb_breakout_up:
-            if bb["bw_pct"] < CFG["bb_min_bw_breakout"]:
-                return {"action": "HOLD", "blocked_by": "bw_squeeze", **base}
+            # Bug 19/22 fix: bw_pct and bw_thresh are both FRACTIONS.
+            if bb["bw_pct"] < bw_thresh:
+                return {"action": "HOLD", "blocked_by": f"bw_squeeze_{bw_src}", **base}
             mode = "breakout"
         elif bb_bounce_up:
             mode = "bounce"
@@ -573,9 +856,12 @@ def evaluate_signal(df: pd.DataFrame,
     #   Bounce   : close crosses back BELOW upper band
     #   Middle   : close crosses BELOW middle band
     # ================================================================
-    bb_breakout_dn  = close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"]
-    bb_bounce_dn    = close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
-    bb_mid_cross_dn = close < bb["mid"]   and bb["prev_close"] >= bb["prev_mid"]
+    bb_breakout_dn  = (CFG["enable_breakout_mode"]
+                       and close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"])
+    bb_bounce_dn    = (CFG["enable_bounce_mode"]
+                       and close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"])
+    bb_mid_cross_dn = (CFG["enable_middle_mode"]
+                       and close < bb["mid"]   and bb["prev_close"] >= bb["prev_mid"])
 
     pe_bb_trigger = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
 
@@ -587,8 +873,9 @@ def evaluate_signal(df: pd.DataFrame,
             reason = "stoch_os" if stoch["k"] <= CFG["stoch_os"] else "stoch_no_cross_pe"
             return {"action": "HOLD", "blocked_by": reason, **base}
         if bb_breakout_dn:
-            if bb["bw_pct"] < CFG["bb_min_bw_breakout"]:
-                return {"action": "HOLD", "blocked_by": "bw_squeeze", **base}
+            # Bug 19/22 fix: bw_pct and bw_thresh are both FRACTIONS.
+            if bb["bw_pct"] < bw_thresh:
+                return {"action": "HOLD", "blocked_by": f"bw_squeeze_{bw_src}", **base}
             mode = "breakout"
         elif bb_bounce_dn:
             mode = "bounce"
@@ -1132,7 +1419,14 @@ class BBStochStrategy(BaseStrategy):
             f"[BB_STOCH] {action:8s} | "
             f"Close={sig.get('close', 0):.2f} | "
             f"BB=[{bb.get('lower', 0):.1f}~{bb.get('upper', 0):.1f}] "
-            f"BW={bb.get('bw_pct', 0)*100:.2f}% | "
+            # Bug 19/22: log the threshold alongside the value. Previously
+            # only BW was logged, so a bw_squeeze block gave no way to tell
+            # whether the bar was genuinely flat or the threshold was
+            # misconfigured — which is exactly how the 0.36-vs-0.0036 unit
+            # bug survived three months of daily log review.
+            f"BW={bb.get('bw_pct', 0)*100:.2f}%"
+            f"/{sig.get('bw_thresh', CFG['bb_min_bw_breakout'])*100:.2f}%"
+            f"({sig.get('bw_thresh_src', 'fixed')}) | "
             f"Vol={vol_str} | VWAP={vwap_str} | "
             f"Stoch={stoch_str} | "
             f"Block={sig.get('blocked_by') or 'none'} | Persist={confirmed} | "
@@ -1353,6 +1647,11 @@ class BBStochStrategy(BaseStrategy):
             "bb_mid"           : bb.get("mid", ""),
             "bb_lower"         : bb.get("lower", ""),
             "bb_bw_pct"        : bb.get("bw_pct", ""),
+            # Bug 19/22: persist the threshold that was actually applied so
+            # post-market analysis can separate "market was flat" from
+            # "gate was misconfigured" without re-deriving it.
+            "bb_bw_thresh"     : sig.get("bw_thresh", ""),
+            "bb_bw_thresh_src" : sig.get("bw_thresh_src", ""),
             "stoch_k"          : sig.get("stoch_k", ""),
             "stoch_d"          : sig.get("stoch_d", ""),
             "vol_ratio"        : sig.get("vol_ratio", ""),
@@ -1429,12 +1728,37 @@ class BBStochStrategy(BaseStrategy):
         elif ltp <= trade.sl:
             self._close_trade(ltp, "SL")
 
+    @staticmethod
+    def _trail_levels(trade: BBTrade) -> Tuple[float, float]:
+        """
+        Bug 23 fix — trail thresholds as a fraction of THIS trade's risk.
+
+        Returns (arm_pts, step_pts). With an ATR-adaptive stop, a flat
+        25-pt arm meant the breakeven trail engaged at 0.45R on a
+        wide-stop day and at 1.1R on a narrow-stop day — i.e. the trail
+        was doing a different job every trade. Expressing both as a
+        fraction of sl_pts makes the behaviour identical in R terms
+        regardless of the day's volatility, with the absolute CFG values
+        surviving as floors so a very tight stop can't produce a trail
+        that fires inside the spread.
+        """
+        arm  = max(float(CFG["trail_arm"]),
+                   float(CFG["trail_arm_sl_frac"]) * trade.sl_pts)
+        step = max(float(CFG["trail_step"]),
+                   float(CFG["trail_step_sl_frac"]) * trade.sl_pts)
+        return round(arm, 2), round(step, 2)
+
     def _update_trail(self, trade: BBTrade, ltp: float, pnl_pts: float):
         """
         Bug 9 fix: trail SL to entry + slippage so exit at trail SL
         yields net P&L = 0 (true breakeven), not -slippage.
+
+        Bug 23 fix: arm/step distances now scale with the trade's own
+        sl_pts — see _trail_levels().
         """
-        if pnl_pts >= CFG["trail_arm"] and trade.trail_stage == 0:
+        arm_pts, step_pts = self._trail_levels(trade)
+
+        if pnl_pts >= arm_pts and trade.trail_stage == 0:
             # Bug 18 fix: use this trade's own stored slip (matches what
             # was charged on entry / will be charged on exit) instead of
             # the flat CFG["slippage"] constant, so breakeven is exact.
@@ -1442,14 +1766,20 @@ class BBStochStrategy(BaseStrategy):
             if new_sl > trade.sl:
                 trade.sl          = new_sl
                 trade.trail_stage = 1
-                log.info(f"[BB_STOCH] Trail -> BE | SL={trade.sl:.2f}")
-        elif pnl_pts > CFG["trail_arm"] and trade.trail_stage >= 1:
-            new_stage = int((pnl_pts - CFG["trail_arm"]) / CFG["trail_step"]) + 1
+                log.info(
+                    f"[BB_STOCH] Trail -> BE | SL={trade.sl:.2f} "
+                    f"| armed at {arm_pts:.1f}pts ({arm_pts / trade.sl_pts:.2f}R)"
+                )
+        elif pnl_pts > arm_pts and trade.trail_stage >= 1:
+            new_stage = int((pnl_pts - arm_pts) / step_pts) + 1
             if new_stage > trade.trail_stage:
-                inc               = (new_stage - trade.trail_stage) * CFG["trail_step"]
+                inc               = (new_stage - trade.trail_stage) * step_pts
                 trade.sl          = round(trade.sl + inc, 2)
                 trade.trail_stage = new_stage
-                log.info(f"[BB_STOCH] Trail stage {new_stage} | SL={trade.sl:.2f}")
+                log.info(
+                    f"[BB_STOCH] Trail stage {new_stage} | SL={trade.sl:.2f} "
+                    f"| step={step_pts:.1f}pts"
+                )
 
     def _close_trade(self, ltp: float, reason: str):
         """Bug 3 fix: atomically claim self._trade at the top."""
@@ -1566,15 +1896,32 @@ class BBStochStrategy(BaseStrategy):
         premium_atr = atr * CFG["premium_atr_scale"] if atr > 0 else 0.0
         sl_pts = float(premium_atr * CFG["atr_sl_mult"]) if premium_atr > 0 else CFG["sl_min"]
         tp_pts = float(premium_atr * CFG["atr_tp_mult"]) if premium_atr > 0 else CFG["tp_min"]
+        raw_sl = sl_pts
         sl_pts = max(CFG["sl_min"], min(sl_pts, CFG["sl_max"]))
         tp_pts = max(CFG["tp_min"], min(tp_pts, CFG["tp_max"]))
         if self._dte == 0:
             tp_pts = max(CFG["tp_min"], tp_pts * 0.75)
         rr = round(tp_pts / sl_pts, 2) if sl_pts else 0
+
+        # Bug 20 diagnostic: sl_in_atr is the number that actually predicts
+        # whether this trade can survive normal noise. Below ~1.0 the stop
+        # sits inside a single 5-min bar's premium range and will be hit at
+        # random; the 48-session sample showed 27% win below 25 pts vs 50%
+        # above 40. Logged on every trade so a regression is visible from
+        # the log alone rather than only from a P&L post-mortem.
+        sl_in_atr = round(sl_pts / premium_atr, 2) if premium_atr > 0 else 0.0
+        clamped   = "CLAMPED " if abs(raw_sl - sl_pts) > 0.01 else ""
         log.info(
             f"[BB_STOCH] SL/TP | ATR={atr:.1f} PremiumATR={premium_atr:.1f} "
-            f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} RR=1:{rr}"
+            f"SL_pts={sl_pts:.1f} TP_pts={tp_pts:.1f} RR=1:{rr} "
+            f"| {clamped}SL={sl_in_atr}x premiumATR"
         )
+        if 0 < sl_in_atr < 1.0:
+            log.warning(
+                "[BB_STOCH] Stop is %.2fx premium ATR — inside one 5-min bar's "
+                "range. Expect noise stop-outs independent of signal quality. "
+                "See Bug 20.", sl_in_atr,
+            )
         return sl_pts, tp_pts
 
     @staticmethod
@@ -1599,6 +1946,7 @@ class BBStochStrategy(BaseStrategy):
             "bb_mid"       : bb.get("mid", ""),
             "bb_lower"     : bb.get("lower", ""),
             "bb_bw_pct"    : bb.get("bw_pct", ""),
+            "bb_bw_thresh" : sig.get("bw_thresh", ""),
             "bb_squeeze"   : bb.get("squeeze", ""),
             "stoch_k"      : sig.get("stoch_k", ""),
             "stoch_d"      : sig.get("stoch_d", ""),
