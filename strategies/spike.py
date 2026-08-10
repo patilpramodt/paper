@@ -122,6 +122,9 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 
 from core.base_strategy import BaseStrategy
+# Shared execution-cost model — OrderRouter._paper_fill() returns the raw LTP
+# for BOTH legs, so paper P&L here had zero bid-ask and zero brokerage.
+from core.costs import entry_fill, exit_fill, net_pnl_rs, round_trip_cost_pts
 from core.candle import SecondCandleBuilder
 
 log = logging.getLogger("strategy.spike")
@@ -535,7 +538,16 @@ class SpikeStrategy(BaseStrategy):
             log.error(f"[SPIKE] BUY order FAILED for {sym} — entry aborted")
             return
 
-        order_id, fill_price = result
+        order_id, raw_fill = result
+
+        # FIX B: pay the bid-ask on entry in paper mode. Live mode already
+        # returns a real exchange average_price, so it is left untouched.
+        fill_price = raw_fill if self.LIVE_MODE else entry_fill(raw_fill)
+        _rt_cost   = round_trip_cost_pts(fill_price, CFG["quantity"])
+        log.info(
+            f"[SPIKE] Cost model | ltp={raw_fill:.2f} -> fill={fill_price:.2f} "
+            f"| est round-trip cost={_rt_cost:.2f}pts"
+        )
 
         log.info(
             f"[SPIKE] BUY confirmed | pre_ltp={opt_price:.2f} "
@@ -786,14 +798,21 @@ class SpikeStrategy(BaseStrategy):
         Record PnL, log, write CSV. Called after position is confirmed closed
         by either the normal exit path or the emergency exit thread.
         """
-        pnl = (sell_price - t["entry"]) * t["qty"]
+        # FIX B: pay the bid-ask on exit, then subtract brokerage/STT/
+        # exchange/GST. Gross is kept alongside net so the drag is visible.
+        raw_sell   = sell_price
+        sell_price = raw_sell if self.LIVE_MODE else exit_fill(raw_sell)
+        gross_pnl  = round((sell_price - t["entry"]) * t["qty"], 2)
+        pnl        = net_pnl_rs(t["entry"], sell_price, t["qty"])
         self._today_pnl += pnl
         self._trade_done = True
 
         mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
-            f"[SPIKE] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.0f} "
-            f"| PnL {pnl:.0f} | Today {self._today_pnl:.0f} | order_id={order_id}"
+            f"[SPIKE] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
+            f"(ltp={raw_sell:.2f}) | gross={gross_pnl:.0f} net={pnl:.0f} "
+            f"| cost_drag={gross_pnl - pnl:.0f} | Today {self._today_pnl:.0f} "
+            f"| order_id={order_id}"
         )
 
         self._log_csv({

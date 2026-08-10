@@ -86,6 +86,9 @@ import pandas as pd
 from core.base_strategy import BaseStrategy
 from core.candle import CandleBuilder
 from core.instruments import get_atm_strike
+# Shared execution-cost model — OrderRouter._paper_fill() returns the raw LTP
+# for BOTH legs, so paper P&L here had zero bid-ask and zero brokerage.
+from core.costs import entry_fill, exit_fill, net_pnl_rs, round_trip_cost_pts
 from core.vwap import SessionVWAP
 
 log = logging.getLogger("strategy.nifty_directional")
@@ -876,7 +879,16 @@ class NiftyDirectionalStrategy(BaseStrategy):
             log.error(f"[{self.name}] BUY FAILED for {sym}")
             return
 
-        order_id, fill_price = result
+        order_id, raw_fill = result
+
+        # FIX B: pay the bid-ask on entry in paper mode. Live mode already
+        # returns a real exchange average_price, so it is left untouched.
+        fill_price = raw_fill if self.LIVE_MODE else entry_fill(raw_fill)
+        _rt_cost   = round_trip_cost_pts(fill_price, CFG["quantity"])
+        log.info(
+            f"[NIFTY_DIRECTIONAL] Cost model | ltp={raw_fill:.2f} -> fill={fill_price:.2f} "
+            f"| est round-trip cost={_rt_cost:.2f}pts"
+        )
 
         sl = fill_price * (1 - CFG["sl_pct"])
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
@@ -952,15 +964,21 @@ class NiftyDirectionalStrategy(BaseStrategy):
 
         self._release_slot()
 
-        pnl = (sell_price - t["entry"]) * t["qty"]
+        # FIX B: pay the bid-ask on exit, then subtract brokerage/STT/
+        # exchange/GST. Gross is kept alongside net so the drag is visible.
+        raw_sell   = sell_price
+        sell_price = raw_sell if self.LIVE_MODE else exit_fill(raw_sell)
+        gross_pnl  = round((sell_price - t["entry"]) * t["qty"], 2)
+        pnl        = net_pnl_rs(t["entry"], sell_price, t["qty"])
         self._today_pnl += pnl
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         log.info(
             f"[{self.name}] [{mode_tag}] EXIT #{self._trades_taken} | "
-            f"[{reason}] {t['symbol']} @ {sell_price:.2f} | "
-            f"entry={t['entry']:.2f} PnL={pnl:.0f} "
-            f"({pnl / t['qty']:.1f}/unit) | Today={self._today_pnl:.0f}"
+            f"[{reason}] {t['symbol']} @ {sell_price:.2f} (ltp={raw_sell:.2f}) | "
+            f"entry={t['entry']:.2f} gross={gross_pnl:.0f} net={pnl:.0f} "
+            f"({pnl / t['qty']:.1f}/unit) | cost_drag={gross_pnl - pnl:.0f} "
+            f"| Today={self._today_pnl:.0f}"
         )
 
         self._log_csv({
@@ -1086,4 +1104,3 @@ class NiftyDirectionalStrategy(BaseStrategy):
             )
         log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*55}\n")
-

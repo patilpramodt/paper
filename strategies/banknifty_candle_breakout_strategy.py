@@ -104,6 +104,7 @@ from core.base_strategy import BaseStrategy
 from core.candle import SecondCandleBuilder
 from core.instruments import get_atm_strike
 from core.fast_indicators import compute_fast_indicators, CANDLE_WINDOW, INDICATOR_FIELDS
+from core.costs import entry_fill, exit_fill, net_pnl_rs, round_trip_cost_pts
 
 log = logging.getLogger("strategy.banknifty_candle_breakout")
 
@@ -157,10 +158,30 @@ CFG = {
     "fast_entry_pts"         : 30.0,   # intra-candle tick move that triggers immediate entry (fast path, skips confirm)
 
     # ── SL / trailing lock (on OPTION PREMIUM) — min 10pt gain, unlimited upside ──
-    "sl_points"              : 30.0,   # initial risk stop before trailing lock activates
-    "trail_activate_pts"     : 10.0,  # once profit (option premium) >= this, lock a minimum 10pt gain
-    "trail_distance_pts"     : 10.0,  # thereafter SL trails this far behind the peak — no fixed TP, unlimited upside
+    # ── FIX A: risk / reward on OPTION PREMIUM points ─────────────────────────
+    # The old geometry locked profit at exactly the same distance it armed at,
+    # with an equally tight trail — a fraction of the risk rather than a
+    # multiple of it. Reward must exceed risk AND exceed the round-trip cost
+    # priced in core/costs.py, or no entry signal can rescue the strategy.
+    "sl_points"              : 30.0,
+    "trail_activate_pts"     : 34.0,   # open profit before trail arms
+    "lock_pts"               : 16.0,   # profit locked the moment it arms
+    "trail_distance_pts"     : 22.0,   # thereafter trail this far behind peak
     "sl_grace_seconds"       : 5,
+
+    # ── FIX F: time stop ──────────────────────────────────────────────────────
+    "max_hold_seconds"       : 180,
+    "time_stop_min_profit"   : 12.0,
+
+    # ── FIX C: risk caps (all NEW — there were none) ──────────────────────────
+    "max_trades_day"         : 6,
+    "max_daily_loss_rs"      : 6000.0,
+    "max_consec_losses"      : 3,
+    "post_loss_cooldown_sec" : 180,
+
+    # ── FIX E: directional gates (were computed but unused) ───────────────────
+    "require_vwap_side"      : True,
+    "require_supertrend"     : True,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -217,6 +238,13 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         self._today_pnl      = 0.0
         self._completed      = []
 
+        # FIX C: risk state — this strategy previously had NO daily loss
+        # limit, NO cap on trades per day and NO cooldown after a loss.
+        self._consec_losses = 0
+        self._halted        = False
+        self._halt_reason   = ""
+        self._last_loss_ts  = 0.0
+
         self._lock = threading.Lock()
 
         mode_tag = "[LIVE]" if LIVE_MODE else "[PAPER]"
@@ -244,6 +272,15 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         # background refresh thread in premarket.py keeps updating pm.pcr
         # every pcr_interval seconds all session long.
         self._pm = pm
+
+        # Reset daily risk state (matters when the process is long-lived).
+        self._trades_today  = 0
+        self._today_pnl     = 0.0
+        self._consec_losses = 0
+        self._halted        = False
+        self._halt_reason   = ""
+        self._last_loss_ts  = 0.0
+        self._completed     = []
 
         log.info(
             f"[{self.name}] Pre-market | expiry={pm.expiry_date} "
@@ -374,20 +411,37 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         # trails trail_distance_pts behind the running peak. SL only ever
         # ratchets UP, never down. The only exits are this trailing SL (or the
         # original risk SL before activation) and EOD force-close.
+        # ── FIX A: trail arms late, locks a real profit, trails wide ────────
+        # Old: armed at +trail_activate and locked EXACTLY that same level with
+        # an equally tight trail, so every winner was stopped out on ordinary
+        # premium noise at the lock level while every loser paid the full SL.
+        # See the module docstring for the breakeven-win-rate arithmetic.
         t = self._trade
         t["peak"] = max(t["peak"], price)
         gain = t["peak"] - t["entry"]
         if gain >= CFG["trail_activate_pts"]:
             locked_sl = max(
-                t["entry"] + CFG["trail_activate_pts"],
-                t["peak"] - CFG["trail_distance_pts"],
+                t["entry"] + CFG["lock_pts"],
+                t["peak"]  - CFG["trail_distance_pts"],
             )
             if locked_sl > t["sl"]:
                 t["sl"] = locked_sl
+                t["trail_armed"] = True
 
         if price <= t["sl"]:
-            reason = "TRAIL_SL_HIT" if gain >= CFG["trail_activate_pts"] else "SL_HIT"
+            reason = "TRAIL_SL_HIT" if t.get("trail_armed") else "SL_HIT"
             self._do_exit(price, reason, ts)
+            return
+
+        # ── FIX F: time stop for trades going nowhere ───────────────────────
+        held = (ts - t["entry_time"]).total_seconds()
+        if held >= CFG["max_hold_seconds"]:
+            if (price - t["entry"]) < CFG["time_stop_min_profit"]:
+                log.info(
+                    f"[{self.name}] Time stop | held={held:.0f}s "
+                    f"pnl={(price - t['entry']):+.2f}pts — exiting"
+                )
+                self._do_exit(price, "TIME_STOP", ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
 
@@ -604,8 +658,76 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
+    # ── FIX E: directional gates (indicators were computed then discarded) ──
+
+    def _direction_allowed(self, signal: str, ind: dict) -> tuple:
+        """
+        Returns (allowed: bool, reason: str).
+
+        compute_fast_indicators() already ran on every signal event and was
+        written to CSV without ever influencing a decision. Taking a 10-second
+        breakout against the session trend is the most common way this pattern
+        loses, so VWAP side and fast Supertrend now gate direction.
+
+        Both gates FAIL OPEN when the indicator is blank/not ready, so
+        warm-up behaviour is unchanged. Set the CFG flags False to revert.
+        """
+        if CFG["require_vwap_side"]:
+            side = ind.get("spot_vs_vwap", "")
+            if side == "BELOW" and signal == "CE":
+                return False, "vwap_side_below_for_CE"
+            if side == "ABOVE" and signal == "PE":
+                return False, "vwap_side_above_for_PE"
+
+        if CFG["require_supertrend"] and ind.get("indicators_ready"):
+            st = ind.get("supertrend_dir", "")
+            if st == "DOWN" and signal == "CE":
+                return False, "supertrend_down_for_CE"
+            if st == "UP" and signal == "PE":
+                return False, "supertrend_up_for_PE"
+
+        return True, ""
+
+    # ── FIX C: risk caps ────────────────────────────────────────────────────
+
+    def _risk_block_reason(self) -> "Optional[str]":
+        """Returns a reason string if new entries are blocked, else None."""
+        if self._halted:
+            return self._halt_reason or "halted"
+        if self._trades_today >= CFG["max_trades_day"]:
+            return f"max_trades_day({CFG['max_trades_day']})"
+        if self._today_pnl <= -abs(CFG["max_daily_loss_rs"]):
+            return f"max_daily_loss(Rs{self._today_pnl:.0f})"
+        if self._consec_losses >= CFG["max_consec_losses"]:
+            return f"max_consec_losses({self._consec_losses})"
+        if self._last_loss_ts > 0:
+            elapsed = _time_mod.time() - self._last_loss_ts
+            if elapsed < CFG["post_loss_cooldown_sec"]:
+                return f"post_loss_cooldown({CFG['post_loss_cooldown_sec'] - elapsed:.0f}s)"
+        return None
+
     def _fire_entry(self, signal: str, index_price: float, ts: datetime,
                      reason: str = "10s_marubozu_5s_confirm_breakout"):
+        # ── FIX C + FIX E: risk caps and directional gates ──────────────────
+        # Placed here rather than at each pattern call-site so every entry
+        # path (breakout, fast-tick, C2 points entry) is covered.
+        block = self._risk_block_reason()
+        if block:
+            log.info(f"[{self.name}] Entry blocked by risk gate: {block} — skipping")
+            self._signal_meta = None
+            return
+
+        _ind = self._indicator_snapshot(index_price)
+        _ok, _why = self._direction_allowed(signal, _ind)
+        if not _ok:
+            log.info(
+                f"[{self.name}] Entry blocked by direction gate: {_why} "
+                f"(signal={signal} vwap_side={_ind.get('spot_vs_vwap', '?')} "
+                f"st={_ind.get('supertrend_dir', '?')}) — skipping"
+            )
+            self._signal_meta = None
+            return
+
         strike = get_atm_strike(index_price, step=BANKNIFTY_STRIKE_STEP)
         token, sym = self._instruments.get_option_token(strike, signal, self._expiry_date)
 
@@ -633,15 +755,23 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
         if not self._acquire_slot():
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
+            self.unsubscribe_option(token)   # FIX D: don't leak the refcount
             return
 
         result = self._place_buy(sym, token, CFG["quantity"], opt_price)
         if result is None:
             self._release_slot()
+            self.unsubscribe_option(token)   # FIX D
             log.error(f"[{self.name}] BUY order FAILED for {sym} — entry aborted")
             return
 
-        order_id, fill_price = result
+        order_id, raw_fill = result
+
+        # ── FIX B: pay the bid-ask on entry in paper mode ────────────────────
+        # OrderRouter._paper_fill() returns the raw LTP for both legs, so paper
+        # P&L had zero spread and zero brokerage. Live mode already returns a
+        # real exchange average_price, so only paper fills are adjusted.
+        fill_price = raw_fill if LIVE_MODE else entry_fill(raw_fill)
 
         sl = fill_price - CFG["sl_points"]
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
@@ -667,11 +797,17 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         self._trades_today += 1
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        # Round-trip cost is logged on every entry so the drag is never
+        # invisible again. If this number approaches CFG["lock_pts"], the
+        # locked profit is being eaten entirely by spread + charges.
+        rt_cost = round_trip_cost_pts(fill_price, CFG["quantity"])
+        self._trade["rt_cost_pts"] = rt_cost
         log.info(
-            f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} @ {fill_price:.2f} | "
-            f"SL={sl:.2f} (-{CFG['sl_points']}) | trail: lock +{CFG['trail_activate_pts']} then "
-            f"trail {CFG['trail_distance_pts']} behind peak (unlimited upside) | "
-            f"reason={reason} | order_id={order_id}"
+            f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} "
+            f"@ {fill_price:.2f} (ltp={raw_fill:.2f}) | SL={sl:.2f} (-{CFG['sl_points']}) | "
+            f"trail arms +{CFG['trail_activate_pts']} locks +{CFG['lock_pts']} then "
+            f"trails {CFG['trail_distance_pts']} behind peak | "
+            f"est round-trip cost={rt_cost:.2f}pts | reason={reason} | order_id={order_id}"
         )
 
         meta = self._trade.get("meta", {})
@@ -816,8 +952,28 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(f"[{self.name}] Emergency exit thread started for {t['symbol']}")
 
     def _finalize_exit(self, t: dict, sell_price: float, order_id: Optional[str], reason: str, ts: datetime):
-        pnl = (sell_price - t["entry"]) * t["qty"]
+        # ── FIX B: pay the bid-ask on exit, then subtract brokerage/STT/GST ──
+        raw_sell   = sell_price
+        sell_price = raw_sell if LIVE_MODE else exit_fill(raw_sell)
+        gross_pnl  = round((sell_price - t["entry"]) * t["qty"], 2)
+        pnl        = net_pnl_rs(t["entry"], sell_price, t["qty"])
         self._today_pnl += pnl
+
+        # ── FIX C: consecutive-loss / cooldown / halt bookkeeping ───────────
+        if pnl < 0:
+            self._consec_losses += 1
+            self._last_loss_ts   = _time_mod.time()
+        else:
+            self._consec_losses = 0
+
+        if self._today_pnl <= -abs(CFG["max_daily_loss_rs"]):
+            self._halted      = True
+            self._halt_reason = f"max_daily_loss(Rs{self._today_pnl:.0f})"
+            log.warning(f"[{self.name}] HALTED for the day — {self._halt_reason}")
+        elif self._consec_losses >= CFG["max_consec_losses"]:
+            self._halted      = True
+            self._halt_reason = f"max_consec_losses({self._consec_losses})"
+            log.warning(f"[{self.name}] HALTED for the day — {self._halt_reason}")
 
         time_in_trade_s = round((ts - t["entry_time"]).total_seconds(), 1)
         # Positive slippage = filled worse than the intended SL level (gap-through);
@@ -833,8 +989,10 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         slip_tag = f" | slip={sl_tp_slippage}" if sl_tp_slippage != "" else ""
         log.info(
             f"[{self.name}] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
-            f"| PnL={pnl:.0f} ({pnl / t['qty']:.1f}/unit) | Today={self._today_pnl:.0f} | "
-            f"held={time_in_trade_s:.0f}s{slip_tag} | order_id={order_id}"
+            f"(ltp={raw_sell:.2f}) | gross={gross_pnl:.0f} net={pnl:.0f} "
+            f"({pnl / t['qty']:.1f}/unit) | cost_drag={gross_pnl - pnl:.0f} | "
+            f"Today={self._today_pnl:.0f} | held={time_in_trade_s:.0f}s{slip_tag} | "
+            f"consec_L={self._consec_losses} | order_id={order_id}"
         )
 
         meta = t.get("meta", {})
@@ -866,7 +1024,19 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "sl_tp_slippage" : sl_tp_slippage,
             **{k: meta.get(k, "") for k in INDICATOR_FIELDS},
         })
-        self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
+        self._completed.append({
+            **t, "exit_price": sell_price, "exit_reason": reason,
+            "pnl": pnl, "gross_pnl": gross_pnl,
+        })
+
+        # FIX D: release the WebSocket subscription this trade acquired.
+        # _fire_entry() called subscribe_option() on every entry and nothing
+        # ever released it, so MarketHub's refcount for every strike traded
+        # stayed permanently above zero for the whole session.
+        try:
+            self.unsubscribe_option(t["token"])
+        except Exception as e:
+            log.warning(f"[{self.name}] unsubscribe error for {t['token']}: {e}")
 
         # Trade fully resolved — free up scanning for the next setup.
         self._trade = None
@@ -920,14 +1090,27 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(f"\n[{self.name}] {'='*50}")
         log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
         log.info(f"[{self.name}] Trades taken   : {self._trades_today}")
+        wins   = [x for x in self._completed if x["pnl"] > 0]
+        losses = [x for x in self._completed if x["pnl"] <= 0]
+        gross  = sum(x.get("gross_pnl", 0) for x in self._completed)
+
         for t in self._completed:
             log.info(
                 f"[{self.name}]   {t['symbol']} [{t['exit_reason']}] "
                 f"entry={t['entry']:.2f} exit={t['exit_price']:.2f} "
-                f"PnL={t['pnl']:.0f} ({t['pnl'] / t['qty']:.1f}/unit)"
+                f"gross={t.get('gross_pnl', 0):.0f} net={t['pnl']:.0f} "
+                f"({t['pnl'] / t['qty']:.1f}/unit)"
             )
-        log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
+
+        if self._completed:
+            wr = len(wins) / len(self._completed) * 100
+            log.info(
+                f"[{self.name}] W/L            : {len(wins)}/{len(losses)}  "
+                f"(win rate {wr:.1f}%)"
+            )
+        log.info(f"[{self.name}] Gross PnL      : {gross:.0f}")
+        log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
+        log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
+        if self._halted:
+            log.info(f"[{self.name}] Halted         : {self._halt_reason}")
         log.info(f"[{self.name}] {'='*50}\n")
-
-
-

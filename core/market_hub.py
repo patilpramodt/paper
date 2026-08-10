@@ -101,7 +101,7 @@ import os
 import sys
 import threading
 import time
-from datetime import datetime, time as dtime, timezone, timedelta
+from datetime import datetime, date as _dt_date, time as dtime, timezone, timedelta
 from typing import TYPE_CHECKING
 
 from core.candle import CandleBuilder
@@ -121,7 +121,30 @@ def _now_ist() -> datetime:
 
 # ── Market hours (all times are IST) ─────────────────────────────────────────
 MARKET_OPEN  = dtime(9, 14)
-MARKET_CLOSE = dtime(15, 31)
+
+# ── SEBI Closing Auction Session (CAS) ───────────────────────────────────────
+# From 2026-08-03 the derivatives segment trades until 15:40 instead of 15:30.
+# A hard-coded 15:31 cut-off silently discards the last 9 minutes of live
+# ticks AND fires eod_summary() early, so every strategy force-closes at
+# 15:31 even though the market is still open. Make the boundary date-aware.
+CAS_START_DATE     = _dt_date(2026, 8, 3)
+MARKET_CLOSE_PRE   = dtime(15, 31)   # before CAS  (session ends 15:30)
+MARKET_CLOSE_CAS   = dtime(15, 41)   # from CAS on (session ends 15:40)
+
+
+def market_close_for(d) -> dtime:
+    """Return the tick/EOD cut-off time for a given trading date."""
+    try:
+        if d >= CAS_START_DATE:
+            return MARKET_CLOSE_CAS
+    except TypeError:
+        pass
+    return MARKET_CLOSE_PRE
+
+
+# Backwards-compatible module constant for any code that still imports it.
+# Prefer market_close_for(<date>) — this is only the value for *today*.
+MARKET_CLOSE = market_close_for(_now_ist().date())
 
 # ── Main BankNifty index token (fixed Zerodha instrument token) ───────────────
 _BANKNIFTY_TOKEN = 260105
@@ -338,7 +361,7 @@ class MarketHub:
         t   = now.time()
 
         # Ignore outside market hours
-        if t < MARKET_OPEN or t > MARKET_CLOSE:
+        if t < MARKET_OPEN or t > market_close_for(now.date()):
             return
 
         # Start VWAP tracking at 9:15
@@ -696,8 +719,11 @@ class MarketHub:
                 # run until GitHub's timeout killed it (~15:00 IST).
                 # With _now_ist(), the bot self-exits cleanly at 15:31 IST.
                 now = _now_ist()
-                if now.time() > MARKET_CLOSE:
-                    log.info(" Market closed (3:30 PM) — running EOD summaries")
+                if now.time() > market_close_for(now.date()):
+                    log.info(
+                        f" Market closed (cut-off {market_close_for(now.date())}) "
+                        f"— running EOD summaries"
+                    )
                     for strat in self._strategies:
                         try:
                             strat.eod_summary()

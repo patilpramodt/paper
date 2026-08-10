@@ -383,8 +383,26 @@ def compute_vol_ratio(df: pd.DataFrame, avg_period: int) -> float:
         return -1.0
     if len(df) < avg_period + 1:
         return -1.0
-    avg     = float(vol.iloc[-(avg_period + 1):-1].mean())
+
     current = float(vol.iloc[-1])
+    window  = vol.iloc[-(avg_period + 1):-1]
+
+    # BUG FIX 20 — the rolling average was poisoned by zero-volume bars.
+    # Two sources of zero-volume bars land in _buf_5m:
+    #   1. _seed_historical_buffer(): kite.historical_data() on an INDEX token
+    #      returns volume=0 for every bar (an index has no traded quantity).
+    #   2. hub.backfill(): same, int(bar["volume"]) == 0 for index candles.
+    # Live bars, by contrast, carry MarketHub's proxy volume (tick count,
+    # typically hundreds per 5-min bar). Mixing them means the denominator is
+    # dragged toward zero, vol_ratio explodes, and the volume gate passes
+    # unconditionally for the first ~50 minutes of every session — exactly the
+    # window where the filter matters most.
+    # Fix: compute the average over non-zero bars only, and bypass the filter
+    # honestly (-1.0) when there is not enough live data to judge.
+    nonzero = window[window > 0]
+    if len(nonzero) < max(3, avg_period // 3):
+        return -1.0
+    avg = float(nonzero.mean())
     if avg <= 0:
         return -1.0
     return round(current / avg, 3)
@@ -409,7 +427,7 @@ def compute_stochastic(df: pd.DataFrame,
       ready : False when insufficient data
     """
     min_bars = k_period + k_smooth + d_smooth - 2
-    insufficient = {"k": 50.0, "d": 50.0, "ready": False}
+    insufficient = {"k": 50.0, "d": 50.0, "prev_k": 50.0, "prev_d": 50.0, "ready": False}
     if len(df) < min_bars:
         return insufficient
 
@@ -431,10 +449,21 @@ def compute_stochastic(df: pd.DataFrame,
     k = float(round(k_series.iloc[-1], 2))
     d = float(round(d_series.iloc[-1], 2))
 
+    # BUG FIX 19 — the caller previously derived "K crossed above D" from
+    # `k > d`, which is a LEVEL check, not a CROSS. K sits above D for roughly
+    # half of all bars, so the "momentum turning up at the band touch" filter
+    # documented at the top of this file was never actually applied: any bar
+    # where K happened to already be above D passed. Return the previous bar's
+    # K and D as well so evaluate_signal() can test a genuine transition.
+    prev_k = float(round(k_series.iloc[-2], 2)) if len(k_series) >= 2 and not pd.isna(k_series.iloc[-2]) else k
+    prev_d = float(round(d_series.iloc[-2], 2)) if len(d_series) >= 2 and not pd.isna(d_series.iloc[-2]) else d
+
     return {
-        "k"     : k,
-        "d"     : d,
-        "ready" : True,
+        "k"      : k,
+        "d"      : d,
+        "prev_k" : prev_k,
+        "prev_d" : prev_d,
+        "ready"  : True,
     }
 
 
@@ -466,9 +495,15 @@ def evaluate_signal(df: pd.DataFrame,
     # Stochastic momentum filter
     stoch      = compute_stochastic(df, CFG["stoch_k_period"],
                                     CFG["stoch_k_smooth"], CFG["stoch_d_smooth"])
-    # Crossover: K crosses above D (bullish momentum) or below D (bearish)
-    k_cross_up = stoch["k"] > stoch["d"]
-    k_cross_dn = stoch["k"] < stoch["d"]
+    # BUG FIX 19 — genuine crossover, not a level check.
+    #   before:  k_cross_up = stoch["k"] > stoch["d"]
+    # That is true on ~half of all bars, so the stochastic gate documented in
+    # the module header ("K crosses above D") was never enforced — entries
+    # fired on any bar where K happened to already be above D, including bars
+    # where momentum had been fading for several candles.
+    # A cross requires the relationship to have FLIPPED on this bar.
+    k_cross_up = stoch["k"] > stoch["d"] and stoch["prev_k"] <= stoch["prev_d"]
+    k_cross_dn = stoch["k"] < stoch["d"] and stoch["prev_k"] >= stoch["prev_d"]
 
     base = {
         "bb": bb, "vol_ratio": vol_ratio, "atr": atr,
