@@ -154,9 +154,9 @@ CFG = {
     # ── FIX A: risk / reward on OPTION PREMIUM points ─────────────────────────
     # Reward must be a MULTIPLE of risk, not a fraction. See module docstring.
     "sl_points"              : 12.0,  # initial risk stop
-    "trail_activate_pts"     : 14.0,  # ~1.2R of open profit before trail arms
+    "trail_activate_pts"     : 6.0,  # ~1.2R of open profit before trail arms
     "lock_pts"               : 5.0,   # profit locked the moment it arms
-    "trail_distance_pts"     : 9.0,   # thereafter SL trails this far behind peak
+    "trail_distance_pts"     : 5.0,   # thereafter SL trails this far behind peak
     "sl_grace_seconds"       : 5,
 
     # ── FIX F: time stop ──────────────────────────────────────────────────────
