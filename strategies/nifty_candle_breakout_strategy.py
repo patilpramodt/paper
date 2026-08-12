@@ -38,14 +38,14 @@ FIX B — PAPER P&L IGNORED ALL EXECUTION COSTS.
   P&L uses core.costs.net_pnl_rs(). Gross and net are both logged so the
   size of the cost drag stays visible.
 
-FIX C — NO RISK CAPS AT ALL.
-  The strategy scanned 09:15-15:00 with no daily loss limit, no cap on
-  trades per day, and no cooldown after a loss. On a chop day it can fire
-  dozens of times and there was nothing to stop the bleed. Added:
-    - max_trades_day
-    - max_daily_loss_rs      (hard halt)
-    - max_consec_losses      (hard halt)
-    - post_loss_cooldown_sec (no re-entry straight into the same chop)
+FIX C — RISK CAPS ADDED, THEN REMOVED AGAIN FOR PAPER DATA COLLECTION (2026-08-12).
+  Daily-loss halt, max-trades/day, consecutive-loss halt, and post-loss
+  cooldown were added and then explicitly stripped back out at the user's
+  request: this is a paper-trading phase and the goal is a clean,
+  completely unfiltered record of every setup the pattern fires — not a
+  record filtered by risk gates. The strategy scans 09:15-15:00 with
+  nothing capping trade count or daily P&L; the trailing stop below is
+  the only exit-side control left.
 
 FIX D — SUBSCRIPTION REFCOUNT LEAK.
   _fire_entry() called subscribe_option() on every entry; nothing ever
@@ -165,19 +165,12 @@ CFG = {
     # Only time-stop out if the trade is not meaningfully in profit.
     "time_stop_min_profit"   : 4.0,
 
-    # ── FIX C: risk caps (all NEW — there were none) ──────────────────────────
-    # TEST-PHASE SWITCH (2026-08): both master switches below are OFF while you
-    # collect a clean, unfiltered month of paper data. All the tracking, halt
-    # bookkeeping, and CSV logging still runs underneath so you can see exactly
-    # what each gate WOULD have blocked — nothing is deleted, it just isn't
-    # enforced yet. Flip both to True once you've reviewed a month of data and
-    # decided on thresholds; no code changes needed, just these two flags.
-    "enforce_risk_caps"      : False,
+    # ── Risk caps removed (2026-08-12) ─────────────────────────────────────────
+    # Pure paper-data collection phase: no max daily loss, no max trades/day,
+    # no consecutive-loss halt, no post-loss cooldown. Every setup that fires
+    # takes a trade so the CSV reflects the strategy's raw, unfiltered
+    # behaviour.
     "enforce_direction_gate" : False,
-    "max_trades_day"         : 60,
-    "max_daily_loss_rs"      : 40000.0,
-    "max_consec_losses"      : 30,
-    "post_loss_cooldown_sec" : 30,
 
     # ── FIX E: directional gates (were computed but unused) ───────────────────
     # Both fail OPEN when the indicator is not ready, so early-session
@@ -231,12 +224,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         self._today_pnl     = 0.0
         self._completed     = []
 
-        # FIX C: risk state
-        self._consec_losses  = 0
-        self._halted         = False
-        self._halt_reason    = ""
-        self._last_loss_ts   = 0.0
-
         self._lock = threading.Lock()
 
         mode_tag = "[LIVE]" if LIVE_MODE else "[PAPER]"
@@ -244,9 +231,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
             f"min_body={CFG['min_body_pts']}pts | SL=-{CFG['sl_points']} "
             f"trail arms at +{CFG['trail_activate_pts']} locking +{CFG['lock_pts']}, "
-            f"then {CFG['trail_distance_pts']} behind peak | "
-            f"caps: {CFG['max_trades_day']} trades / -Rs{CFG['max_daily_loss_rs']:.0f} / "
-            f"{CFG['max_consec_losses']} consec losses | "
+            f"then {CFG['trail_distance_pts']} behind peak | no risk caps (paper data phase) | "
             f"gates: vwap={CFG['require_vwap_side']} st={CFG['require_supertrend']}"
         )
 
@@ -257,13 +242,9 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         self._expiry_date = pm.expiry_date
         self._pm          = pm
 
-        # Reset daily risk state (matters when the process is long-lived).
+        # Reset daily counters (matters when the process is long-lived).
         self._trades_today  = 0
         self._today_pnl     = 0.0
-        self._consec_losses = 0
-        self._halted        = False
-        self._halt_reason   = ""
-        self._last_loss_ts  = 0.0
         self._completed     = []
 
         log.info(
@@ -316,33 +297,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
                 return False, "supertrend_up_for_PE"
 
         return True, ""
-
-    # ── FIX C: risk gate ──────────────────────────────────────────────────────
-
-    def _risk_block_reason(self, ts: datetime) -> Optional[str]:
-        """
-        Returns a reason string if new entries WOULD BE blocked, else None.
-        TEST PHASE: when enforce_risk_caps=False (default now) this never
-        actually blocks an entry — the caller only logs the reason. The
-        underlying counters (_halted, _consec_losses, _today_pnl) keep
-        updating exactly as before so the month-end CSV shows what each
-        cap would have done.
-        """
-        if not CFG["enforce_risk_caps"]:
-            return None
-        if self._halted:
-            return self._halt_reason or "halted"
-        if self._trades_today >= CFG["max_trades_day"]:
-            return f"max_trades_day({CFG['max_trades_day']})"
-        if self._today_pnl <= -abs(CFG["max_daily_loss_rs"]):
-            return f"max_daily_loss(Rs{self._today_pnl:.0f})"
-        if self._consec_losses >= CFG["max_consec_losses"]:
-            return f"max_consec_losses({self._consec_losses})"
-        if self._last_loss_ts > 0:
-            elapsed = _time_mod.time() - self._last_loss_ts
-            if elapsed < CFG["post_loss_cooldown_sec"]:
-                return f"post_loss_cooldown({CFG['post_loss_cooldown_sec'] - elapsed:.0f}s)"
-        return None
 
     # ── Tick handlers ─────────────────────────────────────────────────────────
 
@@ -532,16 +486,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             return
 
         ind = self._indicator_snapshot(price)
-
-        # ── FIX C: risk caps checked at the moment of entry ──────────────────
-        block = self._risk_block_reason(ts)
-        if block:
-            log.info(f"[{self.name}] Setup blocked by risk gate: {block} — skipping")
-            row = self._signal_row(ts, "RISK_BLOCK", ind, breakout_price=price)
-            row["block_reason"] = block
-            self._log_signal_csv(row)
-            self._reset_pattern_state()
-            return
 
         # ── FIX E: directional gates ─────────────────────────────────────────
         allowed, reason = self._direction_allowed(signal, ind)
@@ -811,22 +755,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         pnl        = net_pnl_rs(t["entry"], sell_price, t["qty"])
         self._today_pnl += pnl
 
-        # ── FIX C: consecutive-loss / cooldown bookkeeping ───────────────────
-        if pnl < 0:
-            self._consec_losses += 1
-            self._last_loss_ts   = _time_mod.time()
-        else:
-            self._consec_losses = 0
-
-        if self._today_pnl <= -abs(CFG["max_daily_loss_rs"]):
-            self._halted     = True
-            self._halt_reason = f"max_daily_loss(Rs{self._today_pnl:.0f})"
-            log.warning(f"[{self.name}] HALTED for the day — {self._halt_reason}")
-        elif self._consec_losses >= CFG["max_consec_losses"]:
-            self._halted     = True
-            self._halt_reason = f"max_consec_losses({self._consec_losses})"
-            log.warning(f"[{self.name}] HALTED for the day — {self._halt_reason}")
-
         time_in_trade_s = round((ts - t["entry_time"]).total_seconds(), 1)
         if "SL_HIT" in reason:
             sl_tp_slippage = round(t["sl"] - sell_price, 2)
@@ -840,7 +768,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             f"(ltp={raw_sell:.2f}) | gross={gross_pnl:.0f} net={pnl:.0f} "
             f"({pnl / t['qty']:.1f}/unit) | cost_drag={gross_pnl - pnl:.0f} | "
             f"Today={self._today_pnl:.0f} | held={time_in_trade_s:.0f}s"
-            f"{slip_tag} | consec_L={self._consec_losses} | order_id={order_id}"
+            f"{slip_tag} | order_id={order_id}"
         )
 
         self._log_csv(self._trade_row(
@@ -963,6 +891,4 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(f"[{self.name}] Gross PnL      : {gross:.0f}")
         log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
         log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
-        if self._halted:
-            log.info(f"[{self.name}] Halted         : {self._halt_reason}")
         log.info(f"[{self.name}] {'='*50}\n")
