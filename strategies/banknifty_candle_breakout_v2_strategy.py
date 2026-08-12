@@ -169,13 +169,13 @@ CFG = {
     # multiple of it. Reward must exceed risk AND exceed the round-trip cost
     # priced in core/costs.py, or no entry signal can rescue the strategy.
     "sl_points"              : 30.0,
-    "trail_activate_pts"     : 34.0,   # open profit before trail arms
+    "trail_activate_pts"     : 20.0,   # open profit before trail arms
     "lock_pts"               : 10.0,   # profit locked the moment it arms
-    "trail_distance_pts"     : 22.0,   # thereafter trail this far behind peak
+    "trail_distance_pts"     : 10.0,   # thereafter trail this far behind peak
     "sl_grace_seconds"       : 5,
 
     # ── FIX F: time stop ──────────────────────────────────────────────────────
-    "max_hold_seconds"       : 180,
+    "max_hold_seconds"       : 300,
     "time_stop_min_profit"   : 12.0,
 
     # ── FIX C: risk caps (all NEW — there were none) ──────────────────────────
