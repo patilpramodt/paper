@@ -161,7 +161,7 @@ CFG = {
 
     # ── FIX F: time stop ──────────────────────────────────────────────────────
     # A 10-second breakout that hasn't worked in this long is not going to.
-    "max_hold_seconds"       : 180,
+    "max_hold_seconds"       : 300,
     # Only time-stop out if the trade is not meaningfully in profit.
     "time_stop_min_profit"   : 4.0,
 
@@ -174,10 +174,10 @@ CFG = {
     # decided on thresholds; no code changes needed, just these two flags.
     "enforce_risk_caps"      : False,
     "enforce_direction_gate" : False,
-    "max_trades_day"         : 6,
-    "max_daily_loss_rs"      : 4000.0,
-    "max_consec_losses"      : 3,
-    "post_loss_cooldown_sec" : 180,
+    "max_trades_day"         : 60,
+    "max_daily_loss_rs"      : 40000.0,
+    "max_consec_losses"      : 30,
+    "post_loss_cooldown_sec" : 30,
 
     # ── FIX E: directional gates (were computed but unused) ───────────────────
     # Both fail OPEN when the indicator is not ready, so early-session
