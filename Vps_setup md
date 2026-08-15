@@ -238,11 +238,23 @@ sed -i 's|bash -c "python3 ml_predictor/live_tracker.py|bash -c "/root/paper/ven
 grep -n "python3" ml_predictor/run_daily_trackers.sh   # confirm the change
 ```
 
+**Also set the execute bit.** A fresh `git clone` does not preserve/set the execute
+permission reliably across VPS moves, and the crontab entry (Step 12 below) calls
+this script directly as `./ml_predictor/run_daily_trackers.sh` rather than via
+`bash ml_predictor/run_daily_trackers.sh` — without `+x` it fails silently every day
+with `Permission denied` in `cron.log`, and the ML predictor never actually runs even
+though `data_fetcher.py` keeps appending candle data normally, masking the failure.
+
+```bash
+chmod +x ml_predictor/run_daily_trackers.sh
+ls -l ml_predictor/run_daily_trackers.sh   # confirm -rwxr-xr-x
+```
+
 **Commit and push this fix** so future migrations don't need to rediscover it:
 ```bash
 git status                                    # confirm ONLY this file is staged-worthy
 git add ml_predictor/run_daily_trackers.sh
-git commit -m "Fix live_tracker.py call to use venv python instead of system python3"
+git commit -m "Fix live_tracker.py call to use venv python instead of system python3; set +x"
 git push
 ```
 (Push needs a GitHub Personal Access Token as password if not already
@@ -324,6 +336,7 @@ manual test in Step 8. After one clean day, trust it fully.
 - [ ] `nproc` → matches old VPS (stagger logic assumption in `run_daily_trackers.sh`)
 - [ ] `config_secrets.env` present, `chmod 600`, login verified via `token.json`
 - [ ] `ml_predictor/models/` has all 12 files after `train.py`
+- [ ] `ml_predictor/run_daily_trackers.sh` is executable (`ls -l` shows `x` bits) — a fresh clone can lose this, and cron fails silently on `Permission denied` if missed
 - [ ] `systemctl status algo` → clean manual start/stop, log shows full session
 - [ ] `crontab -l` → matches, all Python lines use `venv/bin/python3`
 - [ ] `run_daily_trackers.sh` internal `python3` call also uses venv path
