@@ -178,6 +178,28 @@ CFG = {
     "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
     "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
 
+    # ── Indicator filter (added 2026-08-18, retuned 2026-08-18 for August-only) ─
+    # Best-performing filter found for THIS strategy on AUGUST-2026 trades
+    # ONLY (08-03 to 08-18, ~45 indicator-ready trades): RSI strongly in the
+    # trade's direction (>rsi_strong for CE, <100-rsi_strong for PE) AND RSI
+    # inside a TIGHT band [rsi_tight_min, rsi_tight_max] — narrower than the
+    # first cut, which used a loose [20,80] band.
+    # August sample: 45 trades / 53.3% WR / -Rs 4,294 baseline -> 8 trades /
+    # 87.5% WR / +Rs 1,362 (net flipped positive; the looser band only
+    # reached 21 trades / 66.7% WR / -Rs 168 — still negative).
+    #
+    # CAVEAT (also logged at runtime — see _indicator_filter_allowed): this
+    # is the weakest-sample strategy of the four (fewest trades), and the
+    # tight band above shrinks the trade count further (8 trades in the
+    # August sample) — a small-sample result, tuned specifically to August
+    # at the user's request, NOT re-checked against the pre-August
+    # (Jul24-Aug10) sample. Defaults to OFF (fails open), same convention as
+    # enforce_direction_gate above — flip True only after re-validating.
+    "enforce_indicator_filter": False,
+    "rsi_strong"               : 60.0,  # RSI must exceed this for CE (below 100-this for PE)
+    "rsi_tight_min"            : 30.0,
+    "rsi_tight_max"            : 70.0,
+
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
     "emergency_max_attempts" : 30,
@@ -295,6 +317,38 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
                 return False, "supertrend_down_for_CE"
             if st == "UP" and signal == "PE":
                 return False, "supertrend_up_for_PE"
+
+        return True, ""
+
+    # ── Indicator filter (added 2026-08-18) ────────────────────────────────────
+
+    def _indicator_filter_allowed(self, signal: str, ind: dict) -> tuple:
+        """
+        Returns (allowed: bool, reason: str).
+
+        Best combo found for NIFTY_CANDLE_BREAKOUT on AUGUST-2026 data
+        specifically: RSI strongly aligned with trade direction AND RSI
+        inside a tight band. See CFG comment for the before/after numbers
+        and the generalization caveat.
+
+        Fails open when indicators aren't ready yet or CFG flag is off —
+        same convention as _direction_allowed above.
+        """
+        if not CFG["enforce_indicator_filter"]:
+            return True, ""
+        if not ind.get("indicators_ready"):
+            return True, ""
+
+        rsi = ind.get("rsi")
+        if rsi is None or rsi == "":
+            return True, ""
+
+        if signal == "CE" and rsi <= CFG["rsi_strong"]:
+            return False, "rsi_not_strong_bullish"
+        if signal == "PE" and rsi >= (100.0 - CFG["rsi_strong"]):
+            return False, "rsi_not_strong_bearish"
+        if not (CFG["rsi_tight_min"] <= rsi <= CFG["rsi_tight_max"]):
+            return False, "rsi_outside_tight_band"
 
         return True, ""
 
@@ -497,6 +551,19 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             )
             row = self._signal_row(ts, "GATE_BLOCK", ind, breakout_price=price)
             row["block_reason"] = reason
+            self._log_signal_csv(row)
+            self._reset_pattern_state()
+            return
+
+        # ── Indicator filter (RSI strength + RSI band) ────────────────────────
+        i_allowed, i_reason = self._indicator_filter_allowed(signal, ind)
+        if not i_allowed:
+            log.info(
+                f"[{self.name}] Setup blocked by indicator filter: {i_reason} "
+                f"(signal={signal} rsi={ind.get('rsi', '?')}) — skipping"
+            )
+            row = self._signal_row(ts, "GATE_BLOCK", ind, breakout_price=price)
+            row["block_reason"] = i_reason
             self._log_signal_csv(row)
             self._reset_pattern_state()
             return
