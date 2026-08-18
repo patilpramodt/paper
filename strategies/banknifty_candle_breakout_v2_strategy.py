@@ -189,6 +189,31 @@ CFG = {
     "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
     "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
 
+    # ── Indicator filter (added 2026-08-18, retuned 2026-08-18 for August-only) ─
+    # Best-performing filter found for THIS strategy on AUGUST-2026 trades
+    # ONLY (08-03 to 08-18, ~86 indicator-ready trades): RSI not extreme
+    # (inside [rsi_min, rsi_max]) AND PCR tight (inside [pcr_min, pcr_max])
+    # AND ATR% above its August sample median.
+    # August sample: 86 trades / 57.0% WR / -Rs 9,002 baseline -> 20 trades
+    # / 70.0% WR / +Rs 1,226 (net flipped positive; the earlier 2-filter
+    # version without the PCR-tight leg only reached 31 trades / 64.5% WR /
+    # -Rs 1,707 — still net negative — so PCR-tight was added).
+    #
+    # CAVEAT (also logged at runtime — see _indicator_filter_allowed): tuned
+    # specifically on August data at the user's request — NOT re-checked
+    # against the pre-August (Jul24-Aug10) sample, where an earlier, looser
+    # version of this filter family cut mostly WINNING trades. Treat as
+    # August-specific, not a portable edge. Defaults to OFF (fails open),
+    # same convention as enforce_direction_gate above — flip True only
+    # after re-validating.
+    "enforce_indicator_filter": False,
+    "min_atr_pct"             : 0.0214,  # ATR% must exceed this (August sample median)
+    "rsi_min"                 : 20.0,
+    "rsi_max"                 : 80.0,
+    "require_pcr_tight"       : True,    # pcr must be inside [pcr_min, pcr_max]
+    "pcr_min"                  : 0.85,
+    "pcr_max"                  : 1.15,
+
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
     "emergency_max_attempts" : 30,
@@ -593,6 +618,40 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         return True, ""
 
+    # ── Indicator filter (added 2026-08-18) ────────────────────────────────────
+
+    def _indicator_filter_allowed(self, signal: str, ind: dict) -> tuple:
+        """
+        Returns (allowed: bool, reason: str).
+
+        Best combo found for BANKNIFTY_CANDLE_BREAKOUT_V2 on AUGUST-2026
+        data specifically: RSI not extreme AND PCR tight AND ATR% above its
+        August sample median. See CFG comment for the before/after numbers
+        and the generalization caveat.
+
+        Fails open when indicators aren't ready yet or CFG flag is off —
+        same convention as _direction_allowed above.
+        """
+        if not CFG["enforce_indicator_filter"]:
+            return True, ""
+        if not ind.get("indicators_ready"):
+            return True, ""
+
+        rsi = ind.get("rsi")
+        if rsi is not None and rsi != "" and not (CFG["rsi_min"] <= rsi <= CFG["rsi_max"]):
+            return False, "rsi_extreme"
+
+        if CFG["require_pcr_tight"]:
+            pcr = ind.get("pcr")
+            if pcr is not None and pcr != "" and not (CFG["pcr_min"] <= pcr <= CFG["pcr_max"]):
+                return False, "pcr_outside_tight_band"
+
+        atr_pct = ind.get("atr_pct")
+        if atr_pct is not None and atr_pct != "" and atr_pct < CFG["min_atr_pct"]:
+            return False, "atr_pct_below_min"
+
+        return True, ""
+
     def _fire_entry(self, signal: str, index_price: float, ts: datetime,
                      reason: str = "c1_c2_points_entry"):
         # ── FIX E: directional gate ───────────────────────────────────────────
@@ -605,6 +664,17 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
                 f"[{self.name}] Entry blocked by direction gate: {_why} "
                 f"(signal={signal} vwap_side={_ind.get('spot_vs_vwap', '?')} "
                 f"st={_ind.get('supertrend_dir', '?')}) — skipping"
+            )
+            self._signal_meta = None
+            return
+
+        # ── Indicator filter (RSI band + ATR%) ────────────────────────────────
+        _iok, _iwhy = self._indicator_filter_allowed(signal, _ind)
+        if not _iok:
+            log.info(
+                f"[{self.name}] Entry blocked by indicator filter: {_iwhy} "
+                f"(signal={signal} rsi={_ind.get('rsi', '?')} "
+                f"atr_pct={_ind.get('atr_pct', '?')}) — skipping"
             )
             self._signal_meta = None
             return
