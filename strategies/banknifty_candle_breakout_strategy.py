@@ -184,6 +184,28 @@ CFG = {
     "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
     "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
 
+    # ── Indicator filter (added 2026-08-18, retuned 2026-08-18 for August-only) ─
+    # Best-performing filter found for THIS strategy on AUGUST-2026 trades
+    # ONLY (08-03 to 08-18, ~66 indicator-ready trades): PCR neutral
+    # ([pcr_min, pcr_max]) AND ATR% above its August sample median AND MACD
+    # histogram slope pointing the same way as the trade direction.
+    # August sample: 66 trades / 60.6% WR / -Rs 3,127 baseline ->
+    # 22 trades / 59.1% WR / +Rs 1,534 (net flipped positive; this beat the
+    # earlier 2-filter version, which reached +Rs 1,312 on 26 trades).
+    #
+    # CAVEAT (also logged at runtime — see _indicator_filter_allowed): tuned
+    # specifically on August data at the user's request — NOT re-checked
+    # against the pre-August (Jul24-Aug10) sample, where an earlier, looser
+    # version of this filter cut mostly WINNING trades. Treat as August-
+    # specific, not a portable edge. Defaults to OFF (fails open), same as
+    # enforce_direction_gate above — flip True only after re-validating.
+    "enforce_indicator_filter": False,
+    "min_atr_pct"             : 0.0222,  # ATR% must exceed this (August sample median)
+    "require_macd_slope"      : True,    # macd_slope must agree with trade direction
+    "require_pcr_neutral"     : True,    # pcr must be inside [pcr_min, pcr_max]
+    "pcr_min"                  : 0.7,
+    "pcr_max"                  : 1.3,
+
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
     "emergency_max_attempts" : 30,
@@ -682,6 +704,44 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
         return True, ""
 
+    # ── Indicator filter (added 2026-08-18) ────────────────────────────────────
+
+    def _indicator_filter_allowed(self, signal: str, ind: dict) -> tuple:
+        """
+        Returns (allowed: bool, reason: str).
+
+        Best combo found for BANKNIFTY_CANDLE_BREAKOUT on AUGUST-2026 data
+        specifically: PCR neutral AND ATR% > August sample median AND MACD
+        histogram slope aligned with trade direction. See CFG comment for
+        the before/after numbers and the generalization caveat.
+
+        Fails open when indicators aren't ready yet or CFG flag is off —
+        same convention as _direction_allowed above.
+        """
+        if not CFG["enforce_indicator_filter"]:
+            return True, ""
+        if not ind.get("indicators_ready"):
+            return True, ""
+
+        if CFG["require_pcr_neutral"]:
+            pcr = ind.get("pcr")
+            if pcr is not None and pcr != "" and not (CFG["pcr_min"] <= pcr <= CFG["pcr_max"]):
+                return False, "pcr_outside_neutral_band"
+
+        atr_pct = ind.get("atr_pct")
+        if atr_pct is not None and atr_pct != "" and atr_pct < CFG["min_atr_pct"]:
+            return False, "atr_pct_below_min"
+
+        if CFG["require_macd_slope"]:
+            macd_slope = ind.get("macd_slope")
+            if macd_slope is not None and macd_slope != "":
+                if signal == "CE" and macd_slope <= 0:
+                    return False, "macd_slope_not_bullish_for_CE"
+                if signal == "PE" and macd_slope >= 0:
+                    return False, "macd_slope_not_bearish_for_PE"
+
+        return True, ""
+
     def _fire_entry(self, signal: str, index_price: float, ts: datetime,
                      reason: str = "10s_marubozu_5s_confirm_breakout"):
         # ── FIX E: directional gate ───────────────────────────────────────────
@@ -694,6 +754,17 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
                 f"[{self.name}] Entry blocked by direction gate: {_why} "
                 f"(signal={signal} vwap_side={_ind.get('spot_vs_vwap', '?')} "
                 f"st={_ind.get('supertrend_dir', '?')}) — skipping"
+            )
+            self._signal_meta = None
+            return
+
+        # ── Indicator filter (ATR% + MACD slope) ─────────────────────────────
+        _iok, _iwhy = self._indicator_filter_allowed(signal, _ind)
+        if not _iok:
+            log.info(
+                f"[{self.name}] Entry blocked by indicator filter: {_iwhy} "
+                f"(signal={signal} atr_pct={_ind.get('atr_pct', '?')} "
+                f"macd_slope={_ind.get('macd_slope', '?')}) — skipping"
             )
             self._signal_meta = None
             return
