@@ -177,6 +177,29 @@ CFG = {
     "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
     "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
 
+    # ── Indicator filter (added 2026-08-18, retuned 2026-08-18 for August-only) ─
+    # Best-performing filter found for THIS strategy on AUGUST-2026 trades
+    # ONLY (08-03 to 08-18, ~76 indicator-ready trades): RSI in a tight band
+    # [rsi_min, rsi_max] AND RSI slope pointing the same way as the trade
+    # direction AND MACD histogram sign agreeing with trade direction.
+    # August sample: 76 trades / 56.6% WR / -Rs 3,234 baseline -> 23 trades
+    # / 82.6% WR / +Rs 2,125 (best result of the four strategies for
+    # August; the 2-filter version without the MACD leg reached 26 trades /
+    # 73.1% WR / +Rs 1,283, so the MACD condition was added on top).
+    #
+    # CAVEAT (also logged at runtime — see _indicator_filter_allowed): tuned
+    # specifically on August data at the user's request — NOT re-checked
+    # against the pre-August (Jul24-Aug10) sample. "Best filter" shifted
+    # between indicator families across different sample windows during
+    # testing, so treat this as August-specific, not a locked-in edge.
+    # Defaults to OFF (fails open), same convention as
+    # enforce_direction_gate above — flip True only after re-validating.
+    "enforce_indicator_filter": False,
+    "rsi_min"                  : 30.0,
+    "rsi_max"                  : 70.0,
+    "require_rsi_slope"        : True,   # rsi_slope must agree with trade direction
+    "require_macd"             : True,   # macd_hist sign must agree with trade direction
+
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
     "emergency_max_attempts" : 30,
@@ -577,6 +600,48 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         return True, ""
 
+    # ── Indicator filter (added 2026-08-18) ────────────────────────────────────
+
+    def _indicator_filter_allowed(self, signal: str, ind: dict) -> tuple:
+        """
+        Returns (allowed: bool, reason: str).
+
+        Best combo found for NIFTY_CANDLE_BREAKOUT_V2 on AUGUST-2026 data
+        specifically: RSI inside a tight [rsi_min, rsi_max] band AND RSI
+        slope pointing the same way as the trade direction AND MACD
+        histogram sign agreeing with trade direction. See CFG comment for
+        the before/after numbers and the generalization caveat.
+
+        Fails open when indicators aren't ready yet or CFG flag is off —
+        same convention as _direction_allowed above.
+        """
+        if not CFG["enforce_indicator_filter"]:
+            return True, ""
+        if not ind.get("indicators_ready"):
+            return True, ""
+
+        rsi = ind.get("rsi")
+        if rsi is not None and rsi != "" and not (CFG["rsi_min"] <= rsi <= CFG["rsi_max"]):
+            return False, "rsi_outside_band"
+
+        if CFG["require_rsi_slope"]:
+            rsi_slope = ind.get("rsi_slope")
+            if rsi_slope is not None and rsi_slope != "":
+                if signal == "CE" and rsi_slope <= 0:
+                    return False, "rsi_slope_not_rising_for_CE"
+                if signal == "PE" and rsi_slope >= 0:
+                    return False, "rsi_slope_not_falling_for_PE"
+
+        if CFG["require_macd"]:
+            macd_hist = ind.get("macd_hist")
+            if macd_hist is not None and macd_hist != "":
+                if signal == "CE" and macd_hist <= 0:
+                    return False, "macd_hist_not_bullish_for_CE"
+                if signal == "PE" and macd_hist >= 0:
+                    return False, "macd_hist_not_bearish_for_PE"
+
+        return True, ""
+
     def _fire_entry(self, signal: str, index_price: float, ts: datetime):
         # ── FIX E: directional gate ───────────────────────────────────────────
         # Placed here rather than at each pattern call-site so every entry
@@ -588,6 +653,17 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
                 f"[{self.name}] Entry blocked by direction gate: {_why} "
                 f"(signal={signal} vwap_side={_ind.get('spot_vs_vwap', '?')} "
                 f"st={_ind.get('supertrend_dir', '?')}) — skipping"
+            )
+            self._signal_meta = None
+            return
+
+        # ── Indicator filter (RSI band + RSI slope) ───────────────────────────
+        _iok, _iwhy = self._indicator_filter_allowed(signal, _ind)
+        if not _iok:
+            log.info(
+                f"[{self.name}] Entry blocked by indicator filter: {_iwhy} "
+                f"(signal={signal} rsi={_ind.get('rsi', '?')} "
+                f"rsi_slope={_ind.get('rsi_slope', '?')}) — skipping"
             )
             self._signal_meta = None
             return
