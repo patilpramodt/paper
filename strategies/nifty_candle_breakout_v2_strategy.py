@@ -194,7 +194,7 @@ CFG = {
     # testing, so treat this as August-specific, not a locked-in edge.
     # Defaults to OFF (fails open), same convention as
     # enforce_direction_gate above — flip True only after re-validating.
-    "enforce_indicator_filter": False,
+    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
     "rsi_min"                  : 30.0,
     "rsi_max"                  : 70.0,
     "require_rsi_slope"        : True,   # rsi_slope must agree with trade direction
@@ -1036,3 +1036,4 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
         log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
