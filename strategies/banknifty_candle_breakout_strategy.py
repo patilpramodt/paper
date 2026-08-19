@@ -199,7 +199,7 @@ CFG = {
     # version of this filter cut mostly WINNING trades. Treat as August-
     # specific, not a portable edge. Defaults to OFF (fails open), same as
     # enforce_direction_gate above — flip True only after re-validating.
-    "enforce_indicator_filter": False,
+    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
     "min_atr_pct"             : 0.0222,  # ATR% must exceed this (August sample median)
     "require_macd_slope"      : True,    # macd_slope must agree with trade direction
     "require_pcr_neutral"     : True,    # pcr must be inside [pcr_min, pcr_max]
