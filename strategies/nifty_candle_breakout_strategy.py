@@ -195,7 +195,7 @@ CFG = {
     # at the user's request, NOT re-checked against the pre-August
     # (Jul24-Aug10) sample. Defaults to OFF (fails open), same convention as
     # enforce_direction_gate above — flip True only after re-validating.
-    "enforce_indicator_filter": False,
+    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
     "rsi_strong"               : 60.0,  # RSI must exceed this for CE (below 100-this for PE)
     "rsi_tight_min"            : 30.0,
     "rsi_tight_max"            : 70.0,
