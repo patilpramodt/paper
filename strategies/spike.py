@@ -21,6 +21,12 @@ trade in paper mode regardless. Currently: Monday = paper, all other days
 = live. self.LIVE_MODE is a property recomputed on every access from the
 current IST weekday, so the switch takes effect at the next check without
 needing a restart at a day boundary.
+
+FORCE_PAPER_TODAY is a manual kill-switch that overrides the weekday
+schedule entirely — set True to force paper mode regardless of weekday
+(e.g. after a bad live day), set False to return to the normal
+PAPER_WEEKDAYS schedule.
+
 All other strategies remain in paper mode until their own flag is changed.
 
 ORDER EXECUTION (live mode)
@@ -142,9 +148,16 @@ def _now_ist() -> datetime:
 # Saturday=5, Sunday=6.
 PAPER_WEEKDAYS = {}  # Monday
 
+# Manual kill-switch: True forces paper mode regardless of weekday.
+# Set False to return to the normal PAPER_WEEKDAYS schedule.
+FORCE_PAPER_TODAY = True
+
 
 def _is_live_today() -> bool:
-    """Live on every weekday except those listed in PAPER_WEEKDAYS (IST)."""
+    """Live on every weekday except those listed in PAPER_WEEKDAYS (IST),
+    unless FORCE_PAPER_TODAY overrides the schedule entirely."""
+    if FORCE_PAPER_TODAY:
+        return False
     return _now_ist().weekday() not in PAPER_WEEKDAYS
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -883,3 +896,4 @@ class SpikeStrategy(BaseStrategy):
                      f"entry={t['entry']:.0f} exit={t['exit_price']:.0f} PnL={t['pnl']:.0f}")
         log.info(f"[SPIKE] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[SPIKE] {'='*50}\n")
+
