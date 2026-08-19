@@ -206,7 +206,7 @@ CFG = {
     # August-specific, not a portable edge. Defaults to OFF (fails open),
     # same convention as enforce_direction_gate above — flip True only
     # after re-validating.
-    "enforce_indicator_filter": False,
+    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
     "min_atr_pct"             : 0.0214,  # ATR% must exceed this (August sample median)
     "rsi_min"                 : 20.0,
     "rsi_max"                 : 80.0,
