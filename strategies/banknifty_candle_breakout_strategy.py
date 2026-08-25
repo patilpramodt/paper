@@ -199,12 +199,42 @@ CFG = {
     # version of this filter cut mostly WINNING trades. Treat as August-
     # specific, not a portable edge. Defaults to OFF (fails open), same as
     # enforce_direction_gate above — flip True only after re-validating.
-    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
+    # REVERTED 2026-08-25: cross-strategy backtest (2026-07-14 to 2026-08-25,
+    # 269 trades) shows this filter flipped the strategy from +30/trade
+    # pre-activation to -325/trade post-activation (n=27). It was tuned on
+    # an August-only sample and the code's own original caveat said as much
+    # ("NOT re-checked against pre-August data, where an earlier looser
+    # version cut mostly WINNING trades"). Data confirmed the caveat was
+    # right. Leave OFF until re-tuned on a walk-forward sample, not a
+    # single fixed window. See /areas/paper-main.md.
+    "enforce_indicator_filter": False,
     "min_atr_pct"             : 0.0222,  # ATR% must exceed this (August sample median)
     "require_macd_slope"      : True,    # macd_slope must agree with trade direction
     "require_pcr_neutral"     : True,    # pcr must be inside [pcr_min, pcr_max]
     "pcr_min"                  : 0.7,
     "pcr_max"                  : 1.3,
+
+    # ── Weakest-hour guard (added 2026-08-25) ─────────────────────────────────
+    # Backtest across 27 sessions shows hour 10 (10:00-10:59) is the one
+    # consistently negative hour for ALL FOUR candle-breakout variants
+    # (avg -185 to -253/trade) while every other hour is flat-to-positive on
+    # average. Skips NEW setups only — an already-open trade is still
+    # managed normally through SL/trail/time-stop.
+    "avoid_hour"              : 10,
+
+    # ── Fast-tick entry path (DISABLED 2026-08-25) ────────────────────────────
+    # Full-log backtest (2026-07-14 to 2026-08-25, 131 fast-tick trades)
+    # shows this no-confirmation path is negative in BOTH months, while the
+    # confirm-based path on the same strategy is flat-to-positive:
+    #     fast-tick : Jul  69 trades  -561  (-8/trade)
+    #                 Aug  62 trades -3717 (-60/trade)
+    #     confirm   : Jul 100 trades  -246  (-2/trade)
+    #                 Aug  38 trades +3016 (+79/trade)
+    # Disabling it takes the strategy from -1508 to +2770 over the same
+    # history. This is a mechanism-level result (entering with zero
+    # confirmation chases spikes into reversals), consistent across both
+    # months — not a threshold tuned to one window. Set True to re-enable.
+    "enable_fast_tick_entry"  : False,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -346,11 +376,18 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         if t >= CFG["last_entry_time"]:
             return
 
+        # No new setups during the historically weakest hour — see CFG note.
+        if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
+            return
+
         # ── Pattern state machine ─────────────────────────────────────────────
         if self._state == "SCAN":
             # Fast path: 30pt intra-candle tick move → enter immediately,
-            # no confirm/breakout watch. Runs ahead of the normal flow.
-            if self._pending_entry is None:
+            # no confirm/breakout watch. DISABLED by default since 2026-08-25
+            # (see enable_fast_tick_entry in CFG) — negative in both months
+            # of the backtest. When off, every candle falls through to the
+            # normal >20pt body + confirm + breakout-watch flow below.
+            if CFG.get("enable_fast_tick_entry", True) and self._pending_entry is None:
                 self._check_fast_tick_trigger(price, ts)
                 if self._trade is not None or self._pending_entry is not None:
                     return
