@@ -206,13 +206,25 @@ CFG = {
     # August-specific, not a portable edge. Defaults to OFF (fails open),
     # same convention as enforce_direction_gate above — flip True only
     # after re-validating.
-    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
+    # REVERTED 2026-08-25: cross-strategy backtest (2026-07-14 to 2026-08-25,
+    # 206 trades) shows this filter dropped the strategy from -3/trade
+    # pre-activation to -217/trade post-activation (n=25). Same August-only
+    # tuning caveat as the other three candle-breakout files, and the data
+    # confirms it did not generalize. Leave OFF until re-tuned walk-forward.
+    # See /areas/paper-main.md.
+    "enforce_indicator_filter": False,
     "min_atr_pct"             : 0.0214,  # ATR% must exceed this (August sample median)
     "rsi_min"                 : 20.0,
     "rsi_max"                 : 80.0,
     "require_pcr_tight"       : True,    # pcr must be inside [pcr_min, pcr_max]
     "pcr_min"                  : 0.85,
     "pcr_max"                  : 1.15,
+
+    # ── Weakest-hour guard (added 2026-08-25) ─────────────────────────────────
+    # Hour 10 (10:00-10:59) is the one consistently negative hour across all
+    # four candle-breakout variants in the 27-session backtest. Skips NEW
+    # setups only; an already-open trade is still managed normally.
+    "avoid_hour"              : 10,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -349,6 +361,10 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         # No new setups too close to EOD.
         if t >= CFG["last_entry_time"]:
+            return
+
+        # No new setups during the historically weakest hour — see CFG note.
+        if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
             return
 
         # ── Pattern state machine ─────────────────────────────────────────────
@@ -1047,3 +1063,4 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
         log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
         log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
