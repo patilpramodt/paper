@@ -202,7 +202,16 @@ CFG = {
     "bb_std"             : 2.0,
     "bb_squeeze_pct"     : 0.002,   # band-width/close < this → squeeze, skip all entries
     "bb_mid_squeeze_pct" : 0.003,   # stricter threshold for middle-band cross only
-    "bb_min_bw_breakout" : 0.36,    # breakout entries only when BW/close >= this
+    # Bug 19 fix (ported from bb_stoch_strategy.py 2026-08-25 — this file
+    # was NEVER patched when the BankNifty file was). compute_bb() above
+    # returns bw_pct as a FRACTION ((upper-lower)/mid), so 0.36% arrives
+    # here as 0.0036. The old value of 0.36 reads as "0.36%" but actually
+    # demanded a 36% band width. Observed Nifty BW at entry over the full
+    # log history ranges 0.21%-0.96% (i.e. 0.0021-0.0096), so 0.36 was
+    # 37x above the highest value ever recorded and rejected 100% of
+    # breakout entries. Breakout mode last fired 2026-05-27 and has been
+    # dead ever since. _validate_cfg() below now hard-fails on a repeat.
+    "bb_min_bw_breakout" : 0.0036,  # breakout entries only when BW/mid >= this
 
     # Volume filter
     "vol_avg_period"     : 10,
@@ -218,8 +227,21 @@ CFG = {
 
     # Trade management
     "atr_period"         : 14,
-    "atr_sl_mult"        : 0.8,
-    "atr_tp_mult"        : 2.0,
+
+    # Bug 20 fix (ported from bb_stoch_strategy.py 2026-08-25 — never
+    # applied to this file). Full-log evidence that the stop was inside
+    # one bar's noise on Nifty exactly as it had been on BankNifty:
+    # over 39 logged entries the MEDIAN SL was 9.5 premium points on a
+    # median fill of 110.0 (8.6% of premium), and 12 of 39 trades were
+    # pinned flat at the sl_min=8.0 floor — the "ATR-adaptive" sizing was
+    # not adapting at all. Median index ATR 21.3 x premium_atr_scale 0.45
+    # = ~9.6 premium-point ATR, so atr_sl_mult 0.8 produced a stop of
+    # ~1.0x premium ATR. BankNifty's validated fix targets 1.5-1.8x.
+    # 1.7 here matches that, and atr_tp_mult 2.7 keeps R:R near 1:1.6
+    # (was 1:2.5 — a target that the data shows was only reached on 11 of
+    # 39 trades, 28%, which is not enough to carry a 1:2.5 payoff).
+    "atr_sl_mult"        : 1.7,
+    "atr_tp_mult"        : 2.7,
 
     # Bug 12 fix: `atr` from evaluate_signal() is computed on the NIFTY
     # *index* 5-min candles (15-25 pt range), not the option premium.
@@ -229,12 +251,16 @@ CFG = {
     # ATR data is available (see _seed/_compute_sl_tp TODO).
     "premium_atr_scale"  : 0.45,
 
-    # Recalibrated to the premium-point scale above (old values of
-    # 20/50/30/120 were sized for raw index points and pinned SL to the
-    # floor on almost every trade -- see Bug 12).
-    "sl_min"             : 8.0,
-    "sl_max"             : 35.0,
-    "tp_min"             : 15.0,
+    # Recalibrated 2026-08-25 for the re-based multipliers above. The old
+    # sl_min=8.0 was catching 12 of 39 trades (the floor WAS the stop on
+    # nearly a third of them); 12.0 sits just under the new median stop
+    # (~16 pts) so it clamps only genuinely low-ATR bars. sl_max raised to
+    # 40 so the widest observed bar (index ATR 46.7 -> ~35.7 pt stop) is
+    # sized rather than truncated, which is what re-introduced the old
+    # too-tight stop on high-vol days.
+    "sl_min"             : 12.0,
+    "sl_max"             : 40.0,
+    "tp_min"             : 20.0,
     "tp_max"             : 90.0,
 
     # Bug 13 fix: trail now locks a FRACTION of profit reached at each
@@ -279,6 +305,26 @@ CFG = {
     # 10 bars = 50 min from 9:15 → first signal ~10:05 AM.
     "min_bars"           : 10,
 
+    # ── Entry-mode master switches (ported from bb_stoch_strategy.py) ────
+    # This file had NO mode switches at all, so every mode ran
+    # unconditionally. Per-mode P&L over the full log history
+    # (2026-05-14 .. 2026-08-25, 39 logged NIFTY trades):
+    #     breakout : n= 8  -4,784 Rs   avg   -598
+    #     bounce   : n= 5     -78 Rs   avg    -16
+    #     middle   : n=26    -110 Rs   avg     -4
+    # Compare BankNifty over the same period, where breakout/bounce carry
+    # the strategy (+810 / +1,095 avg) and only middle loses (-150 avg).
+    # The signs do NOT agree across instruments, and every Nifty sample is
+    # small, so nothing here is switched on by evidence of an edge.
+    # middle is OFF because it is the one mode with a consistent negative
+    # read on BOTH instruments and the largest sample backing it.
+    # breakout is left ON because its 8-trade Nifty sample all predates
+    # 2026-05-27 and was taken under the un-rebased stop fixed above —
+    # those results say nothing about how it behaves now.
+    "enable_breakout_mode" : True,
+    "enable_bounce_mode"   : True,
+    "enable_middle_mode"   : False,
+
     # Stochastic momentum filter -- replaces SuperTrend
     "stoch_k_period"     : 5,
     "stoch_k_smooth"     : 3,
@@ -291,6 +337,51 @@ CFG = {
     "exit_csv"           : "logs/bb_stoch_nifty_exit.csv",
     "signal_csv"         : "logs/bb_stoch_nifty_signals.csv",
 }
+
+
+# ============================================================
+# CONFIG VALIDATION  (ported from bb_stoch_strategy.py 2026-08-25)
+# ============================================================
+
+def _validate_cfg() -> None:
+    """
+    Fail loudly at import time on the config mistakes that have silently
+    disabled this strategy before.
+
+    This guard existed in bb_stoch_strategy.py but was never added here,
+    which is precisely why bb_min_bw_breakout sat at 0.36 (a percent typed
+    where a fraction belongs) for three months without anyone noticing:
+    the strategy ran cleanly all day and simply logged "bw_squeeze"
+    instead of raising anything greppable.
+    """
+    # bw thresholds are FRACTIONS. compute_bb() returns (upper-lower)/mid,
+    # so 0.36% must be written 0.0036. Nifty band width has never been
+    # observed above ~1%, so anything above 0.05 here is a unit error that
+    # would reject 100% of the gated entry mode.
+    for key in ("bb_squeeze_pct", "bb_mid_squeeze_pct", "bb_min_bw_breakout"):
+        val = CFG[key]
+        if val > 0.05:
+            raise ValueError(
+                f"[BB_STOCH_NIFTY] CFG['{key}']={val} looks like a PERCENT but "
+                f"this value is compared against compute_bb()['bw_pct'], which "
+                f"is a FRACTION ((upper-lower)/mid). A 0.36% threshold must be "
+                f"written 0.0036, not 0.36. As written this gate rejects every "
+                f"entry in the mode it guards."
+            )
+
+    # A stop clamped below the instrument's own 5-min noise band produces a
+    # strategy that stops itself out on ordinary premium movement. Median
+    # premium ATR on Nifty is ~9.6 pts, so a floor at or below that is a
+    # stop sitting inside one bar.
+    if CFG["sl_min"] >= CFG["sl_max"]:
+        raise ValueError(
+            f"[BB_STOCH_NIFTY] sl_min={CFG['sl_min']} >= sl_max={CFG['sl_max']}"
+        )
+    if CFG["atr_sl_mult"] <= 0 or CFG["atr_tp_mult"] <= 0:
+        raise ValueError("[BB_STOCH_NIFTY] ATR multipliers must be positive")
+
+
+_validate_cfg()
 
 
 # ============================================================
@@ -519,9 +610,12 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
         above_vwap = True
         below_vwap = True
 
-    bb_breakout_up  = close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"]
-    bb_bounce_up    = close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"]
-    bb_mid_cross_up = close > bb["mid"]   and bb["prev_close"] <= bb["prev_mid"]
+    bb_breakout_up  = (CFG["enable_breakout_mode"]
+                       and close > bb["upper"] and bb["prev_close"] <= bb["prev_upper"])
+    bb_bounce_up    = (CFG["enable_bounce_mode"]
+                       and close > bb["lower"] and bb["prev_close"] <= bb["prev_lower"])
+    bb_mid_cross_up = (CFG["enable_middle_mode"]
+                       and close > bb["mid"] and bb["prev_close"] <= bb["prev_mid"])
     ce_bb_trigger   = bb_breakout_up or bb_bounce_up or bb_mid_cross_up
     stoch_ce_ok     = stoch["k"] < CFG["stoch_ob"] and k_cross_up
 
@@ -541,9 +635,12 @@ def evaluate_signal(df: pd.DataFrame, vwap: Optional[float]) -> dict:
             mode = "middle"
         return {"action": "BUY_CE", "blocked_by": "", **base, "mode": mode}
 
-    bb_breakout_dn  = close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"]
-    bb_bounce_dn    = close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"]
-    bb_mid_cross_dn = close < bb["mid"]   and bb["prev_close"] >= bb["prev_mid"]
+    bb_breakout_dn  = (CFG["enable_breakout_mode"]
+                       and close < bb["lower"] and bb["prev_close"] >= bb["prev_lower"])
+    bb_bounce_dn    = (CFG["enable_bounce_mode"]
+                       and close < bb["upper"] and bb["prev_close"] >= bb["prev_upper"])
+    bb_mid_cross_dn = (CFG["enable_middle_mode"]
+                       and close < bb["mid"] and bb["prev_close"] >= bb["prev_mid"])
     pe_bb_trigger   = bb_breakout_dn or bb_bounce_dn or bb_mid_cross_dn
     stoch_pe_ok     = stoch["k"] > CFG["stoch_os"] and k_cross_dn
 
