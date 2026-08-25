@@ -168,6 +168,34 @@ CFG = {
     "start_time"             : dtime(9, 15),
     "spike_exit_time"        : dtime(9, 30),
     "close_time"             : dtime(15, 15),
+
+    # ── Full-day / multi-trade mode (added 2026-08-25) ────────────────────
+    # Original behaviour: the strategy scanned only 09:15-09:30, took at
+    # most ONE trade, and force-exited any open position at 09:30
+    # (SPIKE_WINDOW_END). With full_day_mode ON:
+    #   * signal scanning runs from start_time until last_entry_time
+    #   * an open trade is NOT force-exited at spike_exit_time; it exits
+    #     only on its own SL / trailing SL, or at close_time
+    #   * the one-shot lockout after a completed trade is lifted, so the
+    #     strategy re-arms and can take another signal
+    # The entry signal, SL, trailing SL and doji logic are UNCHANGED —
+    # this only changes WHEN and HOW OFTEN they are allowed to run.
+    # Set full_day_mode False to restore the original 09:15-09:30 one-shot.
+    "full_day_mode"          : True,
+
+    # Latest time a NEW entry signal may fire. Open trades still run to
+    # close_time. Kept 15 min before close_time so a fresh entry is not
+    # opened straight into the square-off.
+    "last_entry_time"        : dtime(15, 0),
+
+    # None = unlimited trades per day. Set an int to cap it.
+    "max_trades_day"         : None,
+
+    # Seconds to wait after an exit before a new entry signal is accepted.
+    # 0 = no cooldown (the 2x10s candle pattern already imposes ~20s of
+    # natural spacing). Raise this if re-entry churn shows up in the logs.
+    "post_exit_cooldown_sec" : 0,
+
     "initial_sl_buffer"      : 70,
     "trail_trigger_pts"      : 40,
     "trail_distance"         : 25,
@@ -214,6 +242,8 @@ class SpikeStrategy(BaseStrategy):
 
         self._trade             = None
         self._trade_done        : bool           = False
+        self._trades_today      : int            = 0
+        self._last_exit_ts                       = None
         self._today_pnl         : float          = 0.0
         self._completed         : list           = []
         self._pending_entry     = None
@@ -237,8 +267,10 @@ class SpikeStrategy(BaseStrategy):
         from core.instruments import get_atm_strike
 
         now = _now_ist().time()
-        if now >= CFG["spike_exit_time"]:
-            log.warning(f"[SPIKE] Started after spike window — skipping today.")
+        _scan_deadline = (CFG["last_entry_time"] if CFG["full_day_mode"]
+                          else CFG["spike_exit_time"])
+        if now >= _scan_deadline:
+            log.warning(f"[SPIKE] Started after entry window ({_scan_deadline}) — skipping today.")
             self._trade_done = True
             return True
 
@@ -310,11 +342,15 @@ class SpikeStrategy(BaseStrategy):
             self._determine_gap_direction(price)
             self._gap_filter_done = True
 
-        # BUG FIX 6: Close spike window when time passes 9:30 with no trade.
-        # Without this guard, _check_2candle_signal is called all day until
-        # 15:15, and any signal at e.g. 11:00 AM would trigger a real entry.
-        if not self._trade_done and self._trade is None and t >= CFG["spike_exit_time"]:
-            log.info("[SPIKE] Spike window closed (9:30) with no trade — done for today.")
+        # BUG FIX 6: Close spike window when the entry deadline passes with no
+        # trade. Without this guard, _check_2candle_signal is called all day
+        # until 15:15. In full_day_mode the deadline is last_entry_time
+        # (15:00) rather than spike_exit_time (09:30), so scanning legitimately
+        # runs all session — but it still stops before the square-off.
+        _entry_deadline = (CFG["last_entry_time"] if CFG["full_day_mode"]
+                           else CFG["spike_exit_time"])
+        if not self._trade_done and self._trade is None and t >= _entry_deadline:
+            log.info(f"[SPIKE] Entry window closed ({_entry_deadline}) — no new entries today.")
             self._trade_done = True
 
         # BUG FIX 7: Guard _pending_entry so a second candle signal cannot
@@ -323,16 +359,27 @@ class SpikeStrategy(BaseStrategy):
         if (not self._trade_done and
                 self._trade is None and
                 self._pending_entry is None and   # BUG FIX 7
+                self._cooldown_ok(ts) and
                 closed_8s is not None):
             self._check_2candle_signal(closed_8s, price, ts)
+
+        # Force-exit an open trade at the end of its holding window.
+        # Original behaviour force-closed at spike_exit_time (09:30) even if
+        # the trade was still running fine. In full_day_mode the trade is
+        # instead allowed to run on its own SL / trailing SL and is only
+        # force-closed at close_time (15:15) square-off.
+        _hold_deadline = (CFG["close_time"] if CFG["full_day_mode"]
+                          else CFG["spike_exit_time"])
+        _exit_reason   = ("EOD_CLOSE" if CFG["full_day_mode"]
+                          else "SPIKE_WINDOW_END")
 
         # BUG FIX 2: only attempt time-exit if no exit already in progress
         if (self._trade and
                 self._trade["state"] == "OPEN" and
                 not self._trade.get("_exit_in_progress")):
-            if t >= CFG["spike_exit_time"]:
+            if t >= _hold_deadline:
                 opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
-                self._do_exit(opt_price, "SPIKE_WINDOW_END", ts)
+                self._do_exit(opt_price, _exit_reason, ts)
 
     def on_candle(self, candle: dict, ts: datetime):
         pass
@@ -818,7 +865,17 @@ class SpikeStrategy(BaseStrategy):
         gross_pnl  = round((sell_price - t["entry"]) * t["qty"], 2)
         pnl        = net_pnl_rs(t["entry"], sell_price, t["qty"])
         self._today_pnl += pnl
-        self._trade_done = True
+        self._trades_today += 1
+        self._last_exit_ts = ts
+
+        # Original behaviour: _trade_done = True unconditionally, which was
+        # the one-shot lockout — after any completed trade the strategy was
+        # finished for the day. In full_day_mode the lockout only applies
+        # once max_trades_day is reached (None = unlimited); otherwise the
+        # strategy re-arms below and scans for the next signal.
+        _cap = CFG["max_trades_day"]
+        if (not CFG["full_day_mode"]) or (_cap is not None and self._trades_today >= _cap):
+            self._trade_done = True
 
         mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
@@ -848,7 +905,38 @@ class SpikeStrategy(BaseStrategy):
             "pnl"         : pnl,
         })
 
+        # Re-arm for the next trade. self._trade is NOT cleared anywhere else
+        # (_release_slot only frees the router slot), and on_tick requires
+        # self._trade is None before it will scan for a new signal — so
+        # without this the strategy would sit idle for the rest of the day
+        # even with the lockout lifted. The per-trade option candle builder
+        # and any stale pending entry are reset with it.
+        if not self._trade_done:
+            self._trade         = None
+            self._pending_entry = None
+            self._opt_8s        = None
+            _cap_txt = f"/{CFG['max_trades_day']}" if CFG["max_trades_day"] else ""
+            log.info(
+                f"[SPIKE] Re-armed for next signal "
+                f"(trades today={self._trades_today}{_cap_txt}, "
+                f"Today {self._today_pnl:.0f})"
+            )
+
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _cooldown_ok(self, ts) -> bool:
+        """
+        True when enough time has passed since the last exit for a new entry
+        signal to be accepted. Always True when post_exit_cooldown_sec is 0
+        or when no trade has completed yet.
+        """
+        cd = CFG.get("post_exit_cooldown_sec", 0)
+        if not cd or self._last_exit_ts is None:
+            return True
+        try:
+            return (ts - self._last_exit_ts).total_seconds() >= cd
+        except Exception:
+            return True
 
     @staticmethod
     def _check_signal(c1: dict, c2: dict) -> Optional[str]:
@@ -890,7 +978,7 @@ class SpikeStrategy(BaseStrategy):
         log.info(f"\n[SPIKE] {'='*50}")
         log.info(f"[SPIKE] END OF DAY | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
         log.info(f"[SPIKE] Gap direction  : {self._gap_direction}")
-        log.info(f"[SPIKE] Trade executed : {'Yes' if self._trade_done else 'No'}")
+        log.info(f"[SPIKE] Trades taken   : {self._trades_today}")
         for t in self._completed:
             log.info(f"[SPIKE]   {t['symbol']} {t['exit_reason']} "
                      f"entry={t['entry']:.0f} exit={t['exit_price']:.0f} PnL={t['pnl']:.0f}")
