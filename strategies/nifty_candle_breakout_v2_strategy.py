@@ -194,11 +194,25 @@ CFG = {
     # testing, so treat this as August-specific, not a locked-in edge.
     # Defaults to OFF (fails open), same convention as
     # enforce_direction_gate above — flip True only after re-validating.
-    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
+    # REVERTED 2026-08-25: unlike the other three candle-breakout files,
+    # this one's post-activation sample is small and actually improved
+    # (-18/trade pre-08-19 -> +54/trade post-08-19, n=17) — but 17 trades
+    # isn't enough to trust over the other three showing the opposite, and
+    # the file's own caveat already flagged that "best filter" kept shifting
+    # between sample windows during tuning. Turning OFF for consistency with
+    # the other three until there's enough post-activation data (need ~40+
+    # trades) to actually re-tune rather than guess. See /areas/paper-main.md.
+    "enforce_indicator_filter": False,
     "rsi_min"                  : 30.0,
     "rsi_max"                  : 70.0,
     "require_rsi_slope"        : True,   # rsi_slope must agree with trade direction
     "require_macd"             : True,   # macd_hist sign must agree with trade direction
+
+    # ── Weakest-hour guard (added 2026-08-25) ─────────────────────────────────
+    # Hour 10 (10:00-10:59) is the one consistently negative hour across all
+    # four candle-breakout variants in the 27-session backtest. Skips NEW
+    # setups only; an already-open trade is still managed normally.
+    "avoid_hour"              : 10,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -331,6 +345,10 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         # No new setups too close to EOD.
         if t >= CFG["last_entry_time"]:
+            return
+
+        # No new setups during the historically weakest hour — see CFG note.
+        if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
             return
 
         # ── Pattern state machine ─────────────────────────────────────────────
