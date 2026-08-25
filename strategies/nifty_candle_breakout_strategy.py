@@ -195,10 +195,28 @@ CFG = {
     # at the user's request, NOT re-checked against the pre-August
     # (Jul24-Aug10) sample. Defaults to OFF (fails open), same convention as
     # enforce_direction_gate above — flip True only after re-validating.
-    "enforce_indicator_filter": True,   # ACTIVATED 2026-08-19 for paper testing (was False)
+    # REVERTED 2026-08-25: this is the strategy whose own caveat turned out
+    # to matter most. Full-history backtest (2026-07-14 to 2026-08-25) shows
+    # it was the ONLY net-profitable candle-breakout of the four overall
+    # (+8,007 / +58 per trade across 137 trades) — almost entirely from the
+    # pre-08-19 period (+70/trade, n=133). Since this tight-RSI filter
+    # activated 08-19 the strategy has taken 4 trades total and gone
+    # completely silent on 4 of the last 4 sessions (08-20, 08-21, 08-24,
+    # 08-25) — not because the market stopped moving, but because
+    # "Confirm 5s candle mismatch" is resetting almost every scan, and the
+    # few that do confirm mostly get killed by this RSI band on top. Leave
+    # OFF; this strategy did not need fixing, it needed to be left alone.
+    # See /areas/paper-main.md.
+    "enforce_indicator_filter": False,
     "rsi_strong"               : 60.0,  # RSI must exceed this for CE (below 100-this for PE)
     "rsi_tight_min"            : 30.0,
     "rsi_tight_max"            : 70.0,
+
+    # ── Weakest-hour guard (added 2026-08-25) ─────────────────────────────────
+    # Hour 10 (10:00-10:59) is the one consistently negative hour across all
+    # four candle-breakout variants in the 27-session backtest. Skips NEW
+    # setups only; an already-open trade is still managed normally.
+    "avoid_hour"              : 10,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -381,6 +399,10 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
 
         # No new setups too close to EOD, or during opening warm-up.
         if t >= CFG["last_entry_time"] or t < CFG["warmup_until"]:
+            return
+
+        # No new setups during the historically weakest hour — see CFG note.
+        if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
             return
 
         # ── Pattern state machine ─────────────────────────────────────────────
