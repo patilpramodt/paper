@@ -120,10 +120,21 @@ def _now_ist() -> datetime:
 
 
 def strike_from_symbol(sym: str) -> str:
-    """Best-effort strike extraction from an option tradingsymbol for CSV logging."""
-    digits = "".join(ch for ch in sym if ch.isdigit())
-    # tradingsymbols embed the expiry date digits too; strike is the trailing
-    # numeric run right before the CE/PE suffix, so pull it from the raw string.
+    """
+    Best-effort strike extraction from an option tradingsymbol for CSV logging.
+
+    FIX (2026-08-26): the old version walked backwards collecting digits until
+    it hit a non-digit. That works for BANKNIFTY26AUG57600PE (the "AUG" stops
+    the walk at 57600) but NOT for weekly NIFTY symbols like NIFTY2690124350CE,
+    which have no letter between the date code and the strike — the walk
+    swallowed the whole numeric block and logged strike=2690124350. Every Nifty
+    row in nifty_candle_breakout_trades.csv is affected.
+
+    New rule: strip the CE/PE suffix, then take the LAST 5 digits if the
+    remaining numeric tail is longer than 5 (index strikes are 4-5 digits and
+    always the trailing part of the symbol); otherwise take the whole tail.
+    Monthly symbols with an alpha month code are unaffected.
+    """
     for suffix in ("CE", "PE"):
         if sym.endswith(suffix):
             tail = sym[:-2]
@@ -133,8 +144,15 @@ def strike_from_symbol(sym: str) -> str:
                     num = ch + num
                 else:
                     break
+            if not num:
+                return ""
+            # Monthly symbols (…26SEP57600) stop at the alpha month code, so
+            # `num` is already just the strike. Weekly Nifty symbols
+            # (NIFTY26901 24350) give one long run — the strike is the tail.
+            if len(num) > 5:
+                num = num[-5:]
             return num
-    return digits
+    return "".join(ch for ch in sym if ch.isdigit())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,7 +242,40 @@ CFG = {
     # Hour 10 (10:00-10:59) is the one consistently negative hour across all
     # four candle-breakout variants in the 27-session backtest. Skips NEW
     # setups only; an already-open trade is still managed normally.
+    # ── Master enable switch (added 2026-08-26) ───────────────────────────────
+    # Same reasoning as the Nifty V2 sibling: the only entry mode here is
+    # c1_c2_points_entry, which is -7,997 over 381 trades across both
+    # instruments and negative in July AND August separately. This variant
+    # specifically is the worst of the four candle-breakouts at -6,009 over
+    # 206 trades, and added another -2,421 on 2026-08-26.
+    # Set True to re-enable; nothing else was removed.
+    "enabled"                 : False,
+
     "avoid_hour"              : 10,
+
+    # ── Entry-hour allow-list (added 2026-08-26) ──────────────────────────────
+    # Full-history entry-paired backtest (2026-07-14 -> 2026-08-26, 275
+    # marubozu + 381 c1_c2 trades) shows the ONLY hour that is independently
+    # positive in BOTH July and August is 09:00-09:59:
+    #     marubozu 09h : +10,958 over 108 trades (Jul +6,001/72, Aug +4,957/36)
+    #     marubozu 12h : +5,113  over  43 trades (Jul +5,233,   Aug   -120)
+    #     hours 10/11/13/14 : negative or month-dependent in every cut
+    # Set to None to disable the gate and scan every hour again.
+    "entry_hours"             : (9, 12),
+
+    # ── Minimum SL-to-cost ratio (added 2026-08-26) ───────────────────────────
+    # The point-based SL/trail below were calibrated on near-expiry options
+    # trading at ~130 premium, where round_trip_cost_pts() is ~3.5pts against a
+    # 30pt stop (8.6x). After the monthly expiry rolls, BankNifty ATM premium
+    # jumps to ~900 and the modelled round-trip cost jumps to ~11.6pts — the
+    # same 30pt stop is now only 2.6x cost and ~3% of premium, i.e. pure noise.
+    # On 2026-08-26 all four BankNifty entries were taken on 34-DTE SEP options
+    # at 588-928 premium; three of four died on TIME_STOP or SL for -1,340.
+    # This gate refuses any entry where the modelled stop is not at least
+    # min_sl_to_cost_ratio x the modelled round-trip cost. It is premium-aware
+    # and self-adjusting, so no DTE constant has to be maintained.
+    # Set to None to disable.
+    "min_sl_to_cost_ratio"    : 3.5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -299,6 +350,9 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
         ATM pair is done here — ATM drifts through the day and this strategy
         can fire at any time, so the strike is resolved fresh at signal time.
         """
+        if not CFG.get("enabled", True):
+            log.info(f"[{self.name}] DISABLED via CFG['enabled']=False — not arming today")
+            return False
         self._instruments = instruments
         self._expiry_date = pm.expiry_date
         self._pm = pm
@@ -332,9 +386,26 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
     # ── Tick handlers ─────────────────────────────────────────────────────────
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
+        if not CFG.get("enabled", True):
+            return
         t = ts.time()
 
-        if t < CFG["start_time"] or t > CFG["close_time"]:
+        if t < CFG["start_time"]:
+            return
+
+        # FIX (2026-08-26): the old guard was
+        #     if t < start_time or t > close_time: return
+        # which returns BEFORE the close_time force-exit below for every tick
+        # after 15:15:00. An open position could therefore survive the
+        # square-off entirely and only exit if its own SL happened to trigger
+        # later (observed live in spike_nifty on 2026-08-26: entry 12:17,
+        # exit 15:31:34 — sixteen minutes past close_time). Square off first,
+        # then return.
+        if t > CFG["close_time"]:
+            if (self._trade and self._trade["state"] == "OPEN"
+                    and not self._trade.get("_exit_in_progress")):
+                opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
+                self._do_exit(opt_price, "EOD_CLOSE", ts)
             return
 
         if not self._market_opened and t >= CFG["start_time"]:
@@ -365,6 +436,11 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         # No new setups during the historically weakest hour — see CFG note.
         if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
+            return
+
+        # Entry-hour allow-list — see CFG["entry_hours"].
+        _hours = CFG.get("entry_hours")
+        if _hours is not None and t.hour not in _hours:
             return
 
         # ── Pattern state machine ─────────────────────────────────────────────
@@ -719,6 +795,20 @@ class BankNiftyCandleBreakoutV2Strategy(BaseStrategy):
                 "sym": sym, "token": token, "signal": signal, "ts": ts, "reason": reason
             }
             return
+
+        # ── SL-to-cost sanity gate — see CFG["min_sl_to_cost_ratio"] ──────────
+        _ratio = CFG.get("min_sl_to_cost_ratio")
+        if _ratio is not None:
+            _est_cost = round_trip_cost_pts(entry_fill(opt_price), CFG["quantity"])
+            if _est_cost > 0 and CFG["sl_points"] < _ratio * _est_cost:
+                log.info(
+                    f"[{self.name}] Entry SKIPPED (sl_to_cost) | {sym} ltp={opt_price:.2f} "
+                    f"| sl={CFG['sl_points']:.1f}pts vs est round-trip cost={_est_cost:.2f}pts "
+                    f"(ratio={CFG['sl_points'] / _est_cost:.2f} < {_ratio}) — premium too high "
+                    f"for a point-based stop"
+                )
+                self.unsubscribe_option(token)
+                return
 
         if not self._acquire_slot():
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
