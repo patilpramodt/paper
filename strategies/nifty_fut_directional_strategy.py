@@ -136,7 +136,12 @@ LIVE_MODE = False
 # ─────────────────────────────────────────────────────────────────────────────
 CFG = {
     # ── Lot ──────────────────────────────────────────────────────────────────
-    "quantity"                : 25,      # Nifty futures lot size (1 lot = 25 units)
+    "quantity"                : 65,      # Nifty futures lot size — NSE revision effective
+                                         # Jan-2026 (was 25, which is not a valid lot and
+                                         # would be rejected by the exchange in LIVE mode;
+                                         # it also understated this strategy's logged P&L
+                                         # by 2.6x — real full-history loss is -15,842,
+                                         # not the -6,093 shown in the logs).
 
     # ── Session windows ───────────────────────────────────────────────────────
     "market_open"             : dtime(9, 15),
@@ -147,6 +152,27 @@ CFG = {
     "mode_b_start"            : dtime(9, 15),
     "mode_b_cutoff"           : dtime(11, 30),  # FIX 6: extended from 11:00
     "entry_cutoff"            : dtime(14, 30),
+
+    # ── Mode A master switch (added 2026-08-26) ───────────────────────────────
+    # Entry-paired backtest over the full logged history (2026-06 -> 2026-08-26)
+    # across NIFTY_DIRECTIONAL + NIFTY_FUT_DIRECTIONAL:
+    #     mode_a_pullback : 72 trades, -21,196 net, -294/trade, 28% win rate
+    #     mode_b_consol_* : 33 trades,  +2,866 net,  +87/trade
+    # Mode A is negative in every month it traded and is by a wide margin the
+    # worst single entry mode in the whole roster. By entry hour it is
+    # -18,473 over 25 trades in the 10:00 hour alone. On 2026-08-26 both
+    # strategies fired the same 13:25 mode_a_pullback and both stopped out
+    # (-1,885 options / -757 futures).
+    # Mode B stays ON. Nothing was deleted — flip this True to restore Mode A.
+    "enable_mode_a"           : False,
+
+    # ── Weakest-hour guard (added 2026-08-26) ─────────────────────────────────
+    # Hour 10 (10:00-10:59) is negative for every strategy in the roster except
+    # bb_stoch: -20,919 over 132 entries across the full history. The four
+    # candle-breakout strategies already carry this gate; these two did not,
+    # and they are where most of that loss actually sits.
+    # Set to None to disable.
+    "avoid_hour"              : 10,
     "hard_exit_time"          : dtime(15, 0),
 
     # ── Mode detection ────────────────────────────────────────────────────────
@@ -663,7 +689,13 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
         if not self._mode:
             return
 
+        # Weakest-hour guard — see CFG["avoid_hour"].
+        if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
+            return
+
         if self._mode == "A":
+            if not CFG.get("enable_mode_a", True):
+                return
             self._check_mode_a(candle, ts)
         elif self._mode == "B":
             self._check_mode_b(candle, ts)
@@ -1232,5 +1264,6 @@ class NiftyFutDirectionalStrategy(BaseStrategy):
 
         log.info(f"[{self.name}] Today PnL     : {self._today_pnl:+.0f}")
         log.info(f"[{self.name}] {'═'*55}\n")
+
 
 
