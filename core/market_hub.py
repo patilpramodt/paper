@@ -148,6 +148,7 @@ MARKET_CLOSE = market_close_for(_now_ist().date())
 
 # ── Main BankNifty index token (fixed Zerodha instrument token) ───────────────
 _BANKNIFTY_TOKEN = 260105
+NIFTY_INDEX_TOKEN = 256265   # Nifty 50 — fixed Zerodha token
 
 
 class MarketHub:
@@ -195,6 +196,13 @@ class MarketHub:
         # Shared infrastructure
         self.index_candles = CandleBuilder(minutes=5)
         self.session_vwap  = SessionVWAP()
+        # FIX (2026-08-26): session_vwap is fed ONLY by the BankNifty index
+        # tick in _handle_index_tick(). Every Nifty strategy that read
+        # hub.session_vwap was therefore comparing Nifty spot (~24,300) against
+        # a BankNifty VWAP (~57,500) — spot_vs_vwap came out 'BELOW' on 73 of
+        # 73 logged Nifty rows. nifty_vwap is the Nifty-50 equivalent, fed from
+        # _handle_extra_index_tick(). Nifty strategies MUST use this one.
+        self.nifty_vwap    = SessionVWAP()
 
         # Strategy registry
         self._strategies   : list["BaseStrategy"] = []
@@ -367,6 +375,7 @@ class MarketHub:
         # Start VWAP tracking at 9:15
         if not self._vwap_started and t >= dtime(9, 15):
             self.session_vwap.reset()
+            self.nifty_vwap.reset()
             self._vwap_started = True
 
         for tick in ticks:
@@ -469,6 +478,11 @@ class MarketHub:
         candles internally (e.g. BBStochNiftyStrategy uses an internal CandleBuilder
         in on_tick(); SpikeNiftyStrategy builds 8-second candles).
         """
+        # Keep a Nifty-50 session VWAP so Nifty strategies stop reading the
+        # BankNifty one (see nifty_vwap in __init__).
+        if token == NIFTY_INDEX_TOKEN:
+            self.nifty_vwap.update(price, price, price, volume=0, proxy_weight=1)
+
         for strat in self._strategies:
             strat_index = getattr(strat, "INDEX_TOKEN", None)
             if strat_index != token:
