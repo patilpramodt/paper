@@ -197,6 +197,17 @@ CFG = {
     "post_exit_cooldown_sec" : 0,
 
     "initial_sl_buffer"      : 70,
+
+    # ── Minimum SL-to-cost ratio (added 2026-08-26) ───────────────────────────
+    # initial_sl_buffer is an ABSOLUTE point value tuned when BankNifty ATM
+    # premium was ~350 near a weekly expiry. BankNifty has no weeklies — after
+    # each monthly expiry rolls, ATM premium jumps (on 2026-08-26, DTE=34 on
+    # the SEP series, entries at 503-1230 premium) and the modelled round-trip
+    # cost roughly triples while the 70pt stop stays fixed. This gate refuses
+    # any entry where the stop is not at least this multiple of the modelled
+    # round-trip cost, so the strategy stands aside on far-dated series instead
+    # of paying spread for a stop that is 3% of premium. Set None to disable.
+    "min_sl_to_cost_ratio"   : 3.5,
     "trail_trigger_pts"      : 40,
     "trail_distance"         : 25,
     "doji_threshold"         : 0.10,
@@ -325,7 +336,31 @@ class SpikeStrategy(BaseStrategy):
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
-        if t < CFG["start_time"] or t > CFG["close_time"]:
+        if t < CFG["start_time"]:
+            return
+
+        # ── FIX (2026-08-26): EOD square-off was unreachable ──────────────────
+        # The old guard was
+        #     if t < start_time or t > close_time: return
+        # which returns BEFORE the close_time force-exit further down, for
+        # every tick after 15:15:00. Since the full-day-mode conversion moved
+        # the hold deadline from spike_exit_time (09:30) to close_time (15:15),
+        # that made the square-off effectively dead code: an open position
+        # survived the whole afternoon and only ever exited if its own SL
+        # happened to trigger.
+        # Observed on 2026-08-26:
+        #   * SPIKE       entered BANKNIFTY26SEP57500PE @430 at 10:01:40 and
+        #                 was NEVER closed — no SELL in the router log all day.
+        #   * SPIKE_NIFTY entered NIFTY2690124350CE @114 at 12:17:30 and exited
+        #                 [SL_HIT] at 15:31:34, sixteen minutes past close_time.
+        # In LIVE mode this is an unhedged overnight carry on a weekly option.
+        # Square off first, then return.
+        if t > CFG["close_time"]:
+            if (self._trade and
+                    self._trade["state"] == "OPEN" and
+                    not self._trade.get("_exit_in_progress")):
+                opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
+                self._do_exit(opt_price, "EOD_CLOSE", ts)
             return
 
         if not self._market_opened and t >= CFG["start_time"]:
@@ -591,6 +626,19 @@ class SpikeStrategy(BaseStrategy):
         if not self._acquire_slot():
             log.warning("[SPIKE] Trade slot blocked — another live strategy has a position")
             return
+
+        # ── SL-to-cost sanity gate — see CFG["min_sl_to_cost_ratio"] ──────────
+        _ratio = CFG.get("min_sl_to_cost_ratio")
+        if _ratio is not None:
+            _est_cost = round_trip_cost_pts(entry_fill(opt_price), CFG["quantity"])
+            if _est_cost > 0 and CFG["initial_sl_buffer"] < _ratio * _est_cost:
+                log.info(
+                    f"[SPIKE] Entry SKIPPED (sl_to_cost) | {sym} ltp={opt_price:.2f} "
+                    f"| SL={CFG['initial_sl_buffer']}pts vs est round-trip cost="
+                    f"{_est_cost:.2f}pts (ratio={CFG['initial_sl_buffer'] / _est_cost:.2f}"
+                    f" < {_ratio}) — premium too high for a point-based stop"
+                )
+                return
 
         result = self._place_buy(sym, token, CFG["quantity"], opt_price)
         if result is None:
@@ -984,4 +1032,5 @@ class SpikeStrategy(BaseStrategy):
                      f"entry={t['entry']:.0f} exit={t['exit_price']:.0f} PnL={t['pnl']:.0f}")
         log.info(f"[SPIKE] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[SPIKE] {'='*50}\n")
+
 
