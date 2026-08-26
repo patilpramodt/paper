@@ -391,7 +391,31 @@ class SpikeNiftyStrategy(BaseStrategy):
         """
         t = ts.time()
 
-        if t < CFG["start_time"] or t > CFG["close_time"]:
+        if t < CFG["start_time"]:
+            return
+
+        # ── FIX (2026-08-26): EOD square-off was unreachable ──────────────────
+        # The old guard was
+        #     if t < start_time or t > close_time: return
+        # which returns BEFORE the close_time force-exit further down, for
+        # every tick after 15:15:00. Since the full-day-mode conversion moved
+        # the hold deadline from spike_exit_time (09:30) to close_time (15:15),
+        # that made the square-off effectively dead code: an open position
+        # survived the whole afternoon and only ever exited if its own SL
+        # happened to trigger.
+        # Observed on 2026-08-26:
+        #   * SPIKE       entered BANKNIFTY26SEP57500PE @430 at 10:01:40 and
+        #                 was NEVER closed — no SELL in the router log all day.
+        #   * SPIKE_NIFTY entered NIFTY2690124350CE @114 at 12:17:30 and exited
+        #                 [SL_HIT] at 15:31:34, sixteen minutes past close_time.
+        # In LIVE mode this is an unhedged overnight carry on a weekly option.
+        # Square off first, then return.
+        if t > CFG["close_time"]:
+            if (self._trade and
+                    self._trade["state"] == "OPEN" and
+                    not self._trade.get("_exit_in_progress")):
+                opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
+                self._do_exit(opt_price, "EOD_CLOSE", ts)
             return
 
         if not self._market_opened and t >= CFG["start_time"]:
