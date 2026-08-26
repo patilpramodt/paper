@@ -285,6 +285,18 @@ CFG = {
     "post_sl_cooldown"   : 120,
     "max_daily_loss"     : 6000,
 
+    # ── Master enable switch (added 2026-08-26) ───────────────────────────────
+    # Full-log review (2026-05-14 -> 2026-08-25, 39 trades) puts this strategy
+    # at -4,972 net / -128 per trade / 38% win rate, and NO entry mode is
+    # profitable on the Nifty side: breakout -598/trade (n=8), bounce
+    # -16/trade (n=5), middle -4/trade (n=26). The 2026-08-25 session fixed
+    # three real bugs here (the bb_min_bw_breakout 100x unit error, the ATR
+    # stop re-base, the missing _validate_cfg guard) but a bug fix is not an
+    # edge — there is still no evidence this configuration makes money.
+    # Kept OFF until forward paper data exists. The BankNifty sibling
+    # (bb_stoch_strategy.py, +11,311 over 53 trades) is unaffected and stays on.
+    "enabled"            : False,
+
     # ── Nifty-specific ────────────────────────────────────────────────────────
     # Lot size: Nifty 50. SEBI revises periodically — verify before live.
     "quantity"           : 65,
@@ -827,6 +839,9 @@ class BBStochNiftyStrategy(BaseStrategy):
           premarket_data : PreMarketData fetched with index_token=256265
           instruments    : InstrumentStore loaded with option_root="NIFTY"
         """
+        if not CFG.get("enabled", True):
+            log.info(f"[{self.name}] DISABLED via CFG['enabled']=False — not arming today")
+            return False
         self._instruments  = instruments
         self._expiry_date  = premarket_data.expiry_date
         self._dte          = premarket_data.dte_days
@@ -1754,3 +1769,4 @@ class BBStochNiftyStrategy(BaseStrategy):
         if self._blocked_log:
             top = sorted(self._blocked_log.items(), key=lambda x: -x[1])[:5]
             log.info(f"[BB_STOCH_NIFTY] Top blocks today: {top}")
+
