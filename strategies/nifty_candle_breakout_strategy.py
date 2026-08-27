@@ -65,7 +65,8 @@ FIX E — THE INDICATORS WERE COMPUTED AND THEN THROWN AWAY.
   behaviour is unchanged. Every rejection is logged with event=GATE_BLOCK
   in the signals CSV so you can measure exactly what they cost you.
 
-FIX F — TIME STOP.
+FIX F — TIME STOP. [REMOVED 2026-08-27 — trades now only exit via SL/trailing
+  SL or EOD force-close, no time-based exit.]
   A breakout that is right is right within a minute or two. Sitting in a
   dead trade only burns theta and ties up the live slot.
   Fix: max_hold_seconds exits any trade that is not in profit after N sec.
@@ -174,16 +175,11 @@ CFG = {
     # ── FIX A: risk / reward on OPTION PREMIUM points ─────────────────────────
     # Reward must be a MULTIPLE of risk, not a fraction. See module docstring.
     "sl_points"              : 12.0,  # initial risk stop
-    "trail_activate_pts"     : 6.0,  # ~1.2R of open profit before trail arms
+    "trail_activate_pts"     : 10.0,  # profit needed before trail arms
     "lock_pts"               : 5.0,   # profit locked the moment it arms
-    "trail_distance_pts"     : 5.0,   # thereafter SL trails this far behind peak
+    "trail_step_pts"         : 5.0,   # SL steps up by this much for every additional
+                                       # trail_step_pts of favorable move beyond activation
     "sl_grace_seconds"       : 5,
-
-    # ── FIX F: time stop ──────────────────────────────────────────────────────
-    # A 10-second breakout that hasn't worked in this long is not going to.
-    "max_hold_seconds"       : 300,
-    # Only time-stop out if the trade is not meaningfully in profit.
-    "time_stop_min_profit"   : 4.0,
 
     # ── Risk caps removed (2026-08-12) ─────────────────────────────────────────
     # Pure paper-data collection phase: no max daily loss, no max trades/day,
@@ -315,7 +311,7 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
             f"min_body={CFG['min_body_pts']}pts | SL=-{CFG['sl_points']} "
             f"trail arms at +{CFG['trail_activate_pts']} locking +{CFG['lock_pts']}, "
-            f"then {CFG['trail_distance_pts']} behind peak | no risk caps (paper data phase) | "
+            f"then steps +{CFG['trail_step_pts']} per extra +{CFG['trail_step_pts']} gained | no risk caps (paper data phase) | "
             f"gates: vwap={CFG['require_vwap_side']} st={CFG['require_supertrend']}"
         )
 
@@ -532,14 +528,14 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         t["peak"] = max(t["peak"], price)
         gain      = t["peak"] - t["entry"]
 
-        # ── FIX A: trail arms late, locks a real profit, trails wide ─────────
-        # Old: armed at +5 and locked exactly +5 with a 5pt trail — every
-        # winner died on premium noise at exactly the locked level.
+        # ── Stepped trail: once armed, SL locks in discrete steps ────────────
+        # At +trail_activate_pts, SL locks to entry+lock_pts. Thereafter, for
+        # every additional trail_step_pts of favorable move (measured off the
+        # peak), the SL steps up by trail_step_pts. This never trails smoothly
+        # behind the peak — it only ratchets up at each step boundary.
         if gain >= CFG["trail_activate_pts"]:
-            locked_sl = max(
-                t["entry"] + CFG["lock_pts"],
-                t["peak"]  - CFG["trail_distance_pts"],
-            )
+            steps = int((gain - CFG["trail_activate_pts"]) // CFG["trail_step_pts"])
+            locked_sl = t["entry"] + CFG["lock_pts"] + steps * CFG["trail_step_pts"]
             if locked_sl > t["sl"]:
                 t["sl"] = locked_sl
                 t["trail_armed"] = True
@@ -548,16 +544,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             reason = "TRAIL_SL_HIT" if t.get("trail_armed") else "SL_HIT"
             self._do_exit(price, reason, ts)
             return
-
-        # ── FIX F: time stop for trades going nowhere ────────────────────────
-        held = (ts - t["entry_time"]).total_seconds()
-        if held >= CFG["max_hold_seconds"]:
-            if (price - t["entry"]) < CFG["time_stop_min_profit"]:
-                log.info(
-                    f"[{self.name}] Time stop | held={held:.0f}s "
-                    f"pnl={(price - t['entry']):+.2f}pts — exiting"
-                )
-                self._do_exit(price, "TIME_STOP", ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
 
@@ -797,7 +783,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(
             f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} "
             f"@ {fill_price:.2f} (ltp={raw_fill:.2f}) | SL={sl:.2f} (-{CFG['sl_points']}) | "
-            f"trail arms +{CFG['trail_activate_pts']} locks +{CFG['lock_pts']} | "
+            f"trail arms +{CFG['trail_activate_pts']} locks +{CFG['lock_pts']} then "
+            f"steps +{CFG['trail_step_pts']} per extra +{CFG['trail_step_pts']} | "
             f"est round-trip cost={rt_cost:.2f}pts | reason={reason} | order_id={order_id}"
         )
 
@@ -1064,3 +1051,4 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
         log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
+
