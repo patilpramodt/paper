@@ -164,7 +164,7 @@ CFG = {
 
     # ── Candle pattern parameters ─────────────────────────────────────────────
     "c1_window_sec"          : 10,    # C1 times out (no trigger) after this many seconds
-    "c1_move_pts"            : 6.0,   # price move from C1 window's open that closes C1 early
+    "c1_move_pts"            : 8.0,   # price move from C1 window's open that closes C1 early
     "c2_window_sec"          : 5,     # C2 times out (closes as-is) after this many seconds
     "c2_move_pts"            : 3.0,   # price move from C2's open that closes C2 early
 
