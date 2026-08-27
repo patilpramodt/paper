@@ -181,15 +181,12 @@ CFG = {
     # with an equally tight trail — a fraction of the risk rather than a
     # multiple of it. Reward must exceed risk AND exceed the round-trip cost
     # priced in core/costs.py, or no entry signal can rescue the strategy.
-    "sl_points"              : 30.0,
+    "sl_points"              : 25.0,
     "trail_activate_pts"     : 20.0,   # open profit before trail arms
     "lock_pts"               : 10.0,   # profit locked the moment it arms
-    "trail_distance_pts"     : 10.0,   # thereafter trail this far behind peak
+    "trail_step_pts"         : 10.0,   # SL steps up by this much for every additional
+                                        # trail_step_pts of favorable move beyond activation
     "sl_grace_seconds"       : 5,
-
-    # ── FIX F: time stop ──────────────────────────────────────────────────────
-    "max_hold_seconds"       : 300,
-    "time_stop_min_profit"   : 12.0,
 
     # ── Risk caps removed (2026-08-12) ─────────────────────────────────────────
     # Pure paper-data collection phase: no max daily loss, no max trades/day,
@@ -340,7 +337,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
             f"min_body={CFG['min_body_pts']}pts "
             f"SL=-{CFG['sl_points']} | trail: lock +{CFG['trail_activate_pts']}, "
-            f"trail {CFG['trail_distance_pts']} behind peak (unlimited upside)"
+            f"then steps +{CFG['trail_step_pts']} per extra +{CFG['trail_step_pts']} (unlimited upside)"
         )
 
     # ── Pre-market ────────────────────────────────────────────────────────────
@@ -531,10 +528,8 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         t["peak"] = max(t["peak"], price)
         gain = t["peak"] - t["entry"]
         if gain >= CFG["trail_activate_pts"]:
-            locked_sl = max(
-                t["entry"] + CFG["lock_pts"],
-                t["peak"]  - CFG["trail_distance_pts"],
-            )
+            steps = int((gain - CFG["trail_activate_pts"]) // CFG["trail_step_pts"])
+            locked_sl = t["entry"] + CFG["lock_pts"] + steps * CFG["trail_step_pts"]
             if locked_sl > t["sl"]:
                 t["sl"] = locked_sl
                 t["trail_armed"] = True
@@ -543,16 +538,6 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             reason = "TRAIL_SL_HIT" if t.get("trail_armed") else "SL_HIT"
             self._do_exit(price, reason, ts)
             return
-
-        # ── FIX F: time stop for trades going nowhere ───────────────────────
-        held = (ts - t["entry_time"]).total_seconds()
-        if held >= CFG["max_hold_seconds"]:
-            if (price - t["entry"]) < CFG["time_stop_min_profit"]:
-                log.info(
-                    f"[{self.name}] Time stop | held={held:.0f}s "
-                    f"pnl={(price - t['entry']):+.2f}pts — exiting"
-                )
-                self._do_exit(price, "TIME_STOP", ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
 
@@ -960,7 +945,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} "
             f"@ {fill_price:.2f} (ltp={raw_fill:.2f}) | SL={sl:.2f} (-{CFG['sl_points']}) | "
             f"trail arms +{CFG['trail_activate_pts']} locks +{CFG['lock_pts']} then "
-            f"trails {CFG['trail_distance_pts']} behind peak | "
+            f"steps +{CFG['trail_step_pts']} per extra +{CFG['trail_step_pts']} | "
             f"est round-trip cost={rt_cost:.2f}pts | reason={reason} | order_id={order_id}"
         )
 
