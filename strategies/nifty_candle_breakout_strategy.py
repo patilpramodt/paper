@@ -170,7 +170,7 @@ CFG = {
     # ── Candle pattern parameters ─────────────────────────────────────────────
     "bucket_10s"             : 10,
     "bucket_5s"              : 5,
-    "min_body_pts"           : 6.0,   # body must be strictly greater than this
+    "min_body_pts"           : 8.0,   # body must be strictly greater than this
 
     # ── FIX A: risk / reward on OPTION PREMIUM points ─────────────────────────
     # Reward must be a MULTIPLE of risk, not a fraction. See module docstring.
