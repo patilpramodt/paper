@@ -236,7 +236,7 @@ CFG = {
     # is cost churn, not an edge. 2026-08-26 added another -1,554.
     # Files and wiring left intact so this is a one-line re-enable once there
     # is evidence the entry mode works.
-    "enabled"                 : False,
+    "enabled"                 : True,
 
     "avoid_hour"              : 10,
 
