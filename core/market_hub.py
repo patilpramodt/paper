@@ -193,6 +193,28 @@ class MarketHub:
         # WsPCR reads this to compute PCR without any external HTTP calls.
         self._last_oi      : dict[int, int]      = {}
 
+        # ── STOCK-OPTIONS SCANNER support (added for STOCK_OPT_SCANNER) ──────
+        # Liquidity data straight off the MODE_FULL tick. Zerodha sends both
+        # of these for every NFO option tick; we were throwing them away.
+        #   volume_traded : cumulative day volume for that contract
+        #   depth         : {'buy': [{price, quantity, orders} x5],
+        #                    'sell': [...]}  → top-of-book bid/ask + sizes
+        # A stock-option strategy CANNOT size a trade without these: index
+        # options have a market maker on every strike, stock options do not,
+        # and the real spread is the difference between a viable trade and a
+        # guaranteed loss on entry.
+        self._last_volume  : dict[int, int]      = {}
+        self._last_depth   : dict[int, dict]     = {}
+
+        # Token → owning strategy name. When a token has an owner, its ticks
+        # are delivered ONLY to that strategy instead of being broadcast to
+        # every registered strategy. Without this, adding ~15 stock underlyings
+        # plus their option legs means all 14+ strategies get an
+        # on_option_tick() call for every stock tick — pure wasted CPU on a
+        # single-core VPS, and every existing strategy would have to learn to
+        # ignore tokens it never asked for.
+        self._token_owner  : dict[int, str]      = {}
+
         # Shared infrastructure
         self.index_candles = CandleBuilder(minutes=5)
         self.session_vwap  = SessionVWAP()
@@ -361,6 +383,54 @@ class MarketHub:
         """
         return self._last_oi.get(token, 0)
 
+    # ── Liquidity accessors (STOCK_OPT_SCANNER) ───────────────────────────────
+
+    def last_volume(self, token: int) -> int:
+        """Cumulative day volume for a token, from the last MODE_FULL tick."""
+        return self._last_volume.get(token, 0)
+
+    def last_depth(self, token: int) -> dict | None:
+        """Raw 5-level market depth dict from the last MODE_FULL tick."""
+        return self._last_depth.get(token)
+
+    def best_bid_ask(self, token: int):
+        """
+        Top-of-book as (bid, ask, bid_qty, ask_qty).
+        Returns (None, None, 0, 0) if depth has not arrived yet.
+
+        This is the REAL spread — use it in preference to the modelled
+        core.costs.estimate_spread(), which is calibrated for index options
+        and materially understates a stock-option spread.
+        """
+        d = self._last_depth.get(token)
+        if not d:
+            return None, None, 0, 0
+        try:
+            b = (d.get("buy")  or [{}])[0]
+            a = (d.get("sell") or [{}])[0]
+            bid = b.get("price") or None
+            ask = a.get("price") or None
+            return bid, ask, int(b.get("quantity") or 0), int(a.get("quantity") or 0)
+        except Exception:
+            return None, None, 0, 0
+
+    # ── Exclusive tick routing (STOCK_OPT_SCANNER) ────────────────────────────
+
+    def set_token_owner(self, token: int, strategy_name: str):
+        """
+        Route this token's ticks ONLY to `strategy_name`.
+        Call right after subscribe() for private tokens (stock underlyings and
+        the option legs the scanner picks up). Shared index-option strikes must
+        NOT be owned — other strategies still need them.
+        """
+        with self._lock:
+            self._token_owner[token] = strategy_name
+
+    def clear_token_owner(self, token: int):
+        """Remove exclusive routing; ticks go back to the normal broadcast."""
+        with self._lock:
+            self._token_owner.pop(token, None)
+
     # ── WebSocket callbacks ───────────────────────────────────────────────────
 
     def _on_ticks(self, ws, ticks):
@@ -403,12 +473,35 @@ class MarketHub:
                     if oi:
                         self._last_oi[token] = oi
 
+                # LIQUIDITY FIX (STOCK_OPT_SCANNER): keep volume + depth.
+                # Stored for EVERY token (stock underlyings need volume too,
+                # for the volume-thrust signal — an index token has none).
+                vt = tick.get("volume_traded")
+                if vt:
+                    self._last_volume[token] = int(vt)
+                dp = tick.get("depth")
+                if dp:
+                    self._last_depth[token] = dp
+
             if token == self._index_token:
                 self._handle_index_tick(price, qty, now, tick_ts)
             elif token in self._extra_index_tokens:
                 # Extra index (e.g. Nifty 50) — route only to matching strategies
                 self._handle_extra_index_tick(token, price, now, tick_ts)
             else:
+                # OWNED TOKEN (STOCK_OPT_SCANNER): deliver to the owner only.
+                owner = self._token_owner.get(token)
+                if owner is not None:
+                    for strat in self._strategies:
+                        if strat.name != owner:
+                            continue
+                        try:
+                            strat.on_option_tick(token, price, now, tick_ts)
+                        except Exception as e:
+                            log.error(f"[{strat.name}] on_option_tick error: {e}")
+                        break
+                    continue
+
                 # Option tick — broadcast to all strategies
                 for strat in self._strategies:
                     try:
@@ -755,3 +848,4 @@ class MarketHub:
 
         ticker.close()
         log.info("MarketHub shutdown complete")
+
