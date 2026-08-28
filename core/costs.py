@@ -155,3 +155,68 @@ def net_pnl_rs(entry_px: float, exit_px: float, qty: int) -> float:
     """
     gross = (exit_px - entry_px) * qty
     return round(gross - fixed_costs_rs(qty, entry_px, exit_px), 2)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STOCK OPTIONS — separate cost profile (STOCK_OPT_SCANNER)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Everything above is calibrated for NIFTY / BANKNIFTY near-ATM contracts,
+# where a market maker quotes every strike and SPREAD_CAP_PTS = 8 is a fair
+# worst case. Single-stock options are a different market:
+#
+#   • no obligation to quote — spreads of 3-6% of premium are normal even on
+#     the most traded names, and 15%+ on the second tier
+#   • monthly expiry only, so DTE is usually 10-30 and premiums are fat
+#   • depth thins out fast beyond top-of-book
+#
+# Using the index model on a stock option understates the round-trip by 2-4x,
+# which is exactly the size of the target this strategy is chasing. So:
+#
+#   1. Prefer the REAL spread from MODE_FULL depth (hub.best_bid_ask()).
+#   2. Fall back to these constants only when depth has not arrived.
+
+STOCK_SPREAD_PCT     = 0.035   # 3.5% of premium — conservative on purpose
+STOCK_SPREAD_CAP_PTS = 25.0
+STOCK_SPREAD_MIN_PTS = 0.20
+
+
+def estimate_stock_spread(ltp: float) -> float:
+    """Modelled full bid-ask spread, in premium points, for a stock option."""
+    if ltp is None or ltp <= 0:
+        return 0.0
+    raw = ltp * STOCK_SPREAD_PCT
+    return round(min(max(raw, STOCK_SPREAD_MIN_PTS), STOCK_SPREAD_CAP_PTS), 2)
+
+
+def effective_spread(ltp: float, bid=None, ask=None) -> float:
+    """
+    The spread to actually use for a stock option.
+
+    Live depth wins when it is present and sane; the model is only a fallback.
+    A quoted spread wider than half the premium is treated as a broken/stub
+    quote and falls back to the model (the caller's liquidity gate should have
+    rejected the contract long before that anyway).
+    """
+    if bid and ask and ask > bid > 0:
+        real = ask - bid
+        if real <= max(0.5 * ltp, 1.0):
+            return round(real, 2)
+    return estimate_stock_spread(ltp)
+
+
+def stock_round_trip_cost_pts(entry_ltp: float, qty: int, bid=None, ask=None) -> float:
+    """
+    Round-trip cost per unit in PREMIUM POINTS for a stock option, using live
+    depth when available.
+
+    This is the number a rupee target must clear. If the target is Rs 500 on a
+    lot of 1500 (0.33 points) and this returns 4.0, the trade is unwinnable
+    before the signal is even evaluated — which is precisely the check
+    STOCK_OPT_SCANNER runs at entry.
+    """
+    if not entry_ltp or entry_ltp <= 0 or not qty or qty <= 0:
+        return 0.0
+    spread_pts = effective_spread(entry_ltp, bid, ask)
+    charges_rs = fixed_costs_rs(qty, entry_ltp, entry_ltp)
+    return round(spread_pts + (charges_rs / qty), 2)
+
