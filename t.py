@@ -85,7 +85,7 @@ except ImportError:
 # ── Core framework ───────────────────────────────────────────────────────────
 from core.auto_login  import auto_login
 from core.market_hub  import MarketHub
-from core.instruments import InstrumentStore
+from core.instruments import InstrumentStore, StockOptionStore
 from core.premarket   import PreMarketData
 from core.pcr_kite    import WsPCR
 from core.order_router import OrderRouter
@@ -99,13 +99,13 @@ from strategies.bb_stoch_strategy         import BBStochStrategy
 from strategies.bb_stoch_nifty_strategy  import BBStochNiftyStrategy
 from strategies.smart_hedge_strategy import SmartHedgeStrategy
 from strategies.banknifty_expiry_momentum_strategy  import BankNiftyExpiryMomentumStrategy
-# HedgedSellStrategy and NiftyExpiryStraddleStrategy — DISABLED (idle, not imported, zero RAM/CPU footprint)
 from strategies.nifty_directional_strategy          import NiftyDirectionalStrategy
 from strategies.nifty_fut_directional_strategy      import NiftyFutDirectionalStrategy
 from strategies.nifty_candle_breakout_strategy       import NiftyCandleBreakoutStrategy
 from strategies.banknifty_candle_breakout_strategy    import BankNiftyCandleBreakoutStrategy
 from strategies.nifty_candle_breakout_v2_strategy      import NiftyCandleBreakoutV2Strategy
 from strategies.banknifty_candle_breakout_v2_strategy  import BankNiftyCandleBreakoutV2Strategy
+from strategies.stock_options_scanner_strategy import StockOptionsScannerStrategy, UNIVERSE as STOCK_UNIVERSE
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -118,9 +118,7 @@ ACTIVE_STRATEGIES = [
     ScalperV7Strategy,                # Scalper V7:               all-day     11-filter momentum scalper
     BBStochStrategy,                  # BB+Stoch BankNifty:       all-day     Bollinger+Stoch+Volume
     BBStochNiftyStrategy,             # BB+Stoch Nifty:           all-day     Bollinger+Stoch+Volume (Nifty)
-    # HedgedSellStrategy,              # DISABLED — Iron Condor classic (idle, not instantiated)
     SmartHedgeStrategy,               # Smart Hedge:              9:35-10:15  directional spread auto-pick
-    # NiftyExpiryStraddleStrategy,     # DISABLED — SHORT straddle, Nifty WEEKLY expiry only (idle, not instantiated)
     BankNiftyExpiryMomentumStrategy,  # BankNifty Expiry Momentum: 14:00-15:20 directional buy, BankNifty MONTHLY expiry only
     NiftyDirectionalStrategy,         # Nifty Directional:         9:30-14:30  CE/PE buy on directional days, Mode A+B
     NiftyFutDirectionalStrategy,      # Nifty Fut Directional:     9:30-14:30  Nifty FUTURES LONG on directional days, Mode A+B
@@ -128,6 +126,7 @@ ACTIVE_STRATEGIES = [
     BankNiftyCandleBreakoutStrategy,  # BankNifty Candle Breakout: 9:15-15:15  20pt marubozu + 5s confirm + tick breakout
     NiftyCandleBreakoutV2Strategy,      # Nifty Candle Breakout V2:     9:15-15:15  C1 6pt tick trigger + C2 3pt point entry (test variant, runs alongside V1)
     BankNiftyCandleBreakoutV2Strategy,  # BankNifty Candle Breakout V2: 9:15-15:15  C1 20pt tick trigger + C2 10pt point entry (test variant, runs alongside V1)
+    StockOptionsScannerStrategy,        # Stock Opt Scanner:            9:30-14:45  15 stocks, 3-min volume thrust, multi-position, Rs500-5000 target (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -291,6 +290,20 @@ def main():
     nifty_instruments = InstrumentStore()
     nifty_instruments.load(hub.kite, option_root="NIFTY")
 
+    # ── Load single-stock option chains for STOCK_OPT_SCANNER ─────────────────
+    # Separate store: InstrumentStore filters to ONE underlying and assumes a
+    # 100-point strike step. Stock options have ~180 underlyings, per-stock
+    # strike steps, and per-stock lot sizes (RELIANCE 500, SBIN 1500 ...).
+    # Also resolves each underlying's NSE equity token — the scanner watches
+    # the STOCK for its signal and only subscribes an option leg on a trigger.
+    # If this fails the scanner's pre_market() returns False and the rest of
+    # the roster is unaffected.
+    stock_instruments = StockOptionStore()
+    try:
+        stock_instruments.load(hub.kite, universe=STOCK_UNIVERSE)
+    except Exception as e:
+        log.error(f"StockOptionStore load failed — STOCK_OPT_SCANNER will skip today: {e}")
+
     # ── Register Nifty 50 index token with MarketHub ───────────────────────────
     # MarketHub routes ticks for this token exclusively to strategies whose
     # INDEX_TOKEN class attribute == 256265 (i.e. SpikeNiftyStrategy).
@@ -411,7 +424,11 @@ def main():
             # SpikeNiftyStrategy needs Nifty-specific PreMarketData and instruments.
             # All other strategies use the shared BankNifty pm and instruments.
             strat_index = getattr(strat, "INDEX_TOKEN", None)
-            if strat_index == 256265:
+            if strat.name == "STOCK_OPT_SCANNER":
+                # Needs the stock chain, not an index chain. PreMarketData is
+                # BankNifty-specific and unused by this strategy.
+                ok = strat.pre_market(pm, stock_instruments)
+            elif strat_index == 256265:
                 ok = strat.pre_market(nifty_pm, nifty_instruments)
             else:
                 ok = strat.pre_market(pm, instruments)
