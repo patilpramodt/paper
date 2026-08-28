@@ -101,12 +101,24 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
 ═══════════════════════════════════════════════════════════════════════════
   EXIT LADDER
 ═══════════════════════════════════════════════════════════════════════════
-   SL_HIT       fixed points below entry, sized at entry
-   TARGET       unrealised >= target_rs_min and trailing not yet armed
-   TRAIL_HIT    after trail_arm_rs, lock and trail behind the peak
-   MAX_TARGET   unrealised >= target_rs_max — take it, do not get greedy
-   TIME_STOP    open longer than time_stop_min without reaching trail_arm
+  Evaluated HIGHEST FIRST on every option tick AND on the heartbeat sweep:
+
+   MAX_TARGET   unrealised >= target_rs_max (5000) — hard exit
+   SL_HIT       price <= stop, trail not yet armed
+   TRAIL_HIT    price <= stop, trail armed
+   (ratchet)    trail armed -> stop follows peak by trail_atr_mult x opt ATR
+   (arm)        unrealised >= trail_arm_rs (900) -> arm trail, lock 400
+   (protect)    unrealised >= target_rs_min (500) -> raise stop, KEEP RUNNING
    EOD          force square-off at close_time
+
+  Rs 500 does NOT close the trade. Set book_at_base_target=True for the old
+  hard-exit-at-500 behaviour.
+
+  There is no time stop and no trade-count limit: max_open_positions,
+  max_trades_per_stock, max_trades_day and time_stop_min are all None, so
+  nothing kills or blocks a trade on age or count. This is a paper strategy
+  and a filtered record cannot tell you what the raw signal is worth. The
+  stop loss, the Rs 5,000 cap and the EOD square-off are the only exits.
 
   NOTE ON THE EOD BUG: the square-off runs BEFORE the trading-window guard
   in _heartbeat(). In spike.py and all four candle-breakout files the
@@ -191,23 +203,30 @@ CFG = {
 
     # ── sizing / targets (rupees) ────────────────────────────────────────────
     "lots":              1,         # always 1 lot
-    "target_rs_min":     500.0,     # base take-profit
+    "target_rs_min":     500.0,     # PROTECT level — stop moves up, trade continues
+    "trail_arm_rs":      900.0,     # trail arms here
     "target_rs_max":     5000.0,    # hard cap — never hold past this
-    "trail_arm_rs":      900.0,     # arm the trail here instead of exiting
-    "trail_lock_rs":     400.0,     # locked profit once armed
-    "trail_give_rs":     700.0,     # how far behind peak the stop trails
-    "max_loss_rs":       1200.0,    # ceiling on the SL, in rupees
+    "protect_lock_rs":   150.0,     # profit locked when target_rs_min is reached
+    "trail_lock_rs":     400.0,     # minimum profit locked once the trail arms
+    "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
+    "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
+    "book_at_base_target": False,   # True = old behaviour (hard exit at Rs 500)
+    "max_loss_rs":       1200.0,    # HARD ceiling on risk, in rupees
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
-    "min_sl_pts":        2.0,
+    "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
     "min_sl_to_cost_ratio": 3.0,    # SL must be >= 3x the round-trip cost
 
     # ── position book ────────────────────────────────────────────────────────
-    "max_open_positions":   3,
-    "max_trades_per_stock": 1,
-    "max_trades_day":       8,
-    "time_stop_min":        25,
-    "stale_price_sec":      45,     # ignore prices older than this for exits
+    # PAPER DATA COLLECTION: every count-based trade blocker is off. Same
+    # decision made for the candle-breakout strategies on 2026-08-12 — a
+    # filtered record cannot tell you what the raw signal is worth.
+    # None = unlimited. Set a number to re-enable any of these.
+    "max_open_positions":   None,
+    "max_trades_per_stock": None,
+    "max_trades_day":       None,
+    "time_stop_min":        None,   # time stop REMOVED — no trade is killed on age
+    "stale_price_sec":      45,     # profit decisions ignore prints older than this
 
     # ── output ───────────────────────────────────────────────────────────────
     "csv_file": "stock_opt_scanner_trades.csv",
@@ -397,12 +416,29 @@ class StockOptionsScannerStrategy(BaseStrategy):
                                  block="no_option_tick")
                 self._drop_pending(tok)
 
-        # ── time stop on open positions ──────────────────────────────────────
+        # ── STOP-LOSS SWEEP (FIX) ────────────────────────────────────────────
+        # _manage_position() only runs when the OPTION ticks. Stock options
+        # can go minutes between prints, so a leg that stops trading was
+        # previously left completely unstopped while the underlying ran
+        # against it. The heartbeat rides BankNifty index ticks, which arrive
+        # continuously all session, so the stop is now evaluated regardless of
+        # whether our own contract has printed.
         for tok in list(self._positions.keys()):
-            tr = self._positions[tok]
-            age_min = (ts - tr["entry_ts"]).total_seconds() / 60.0
-            if age_min >= CFG["time_stop_min"] and not tr["trail_armed"]:
-                self._exit(tok, "TIME_STOP", ts)
+            px = self.get_price(tok)
+            if px:
+                self._manage_position(tok, px, ts)
+
+        # ── time stop ────────────────────────────────────────────────────────
+        # Disabled by default (time_stop_min = None). Age alone says nothing
+        # about whether a breakout is going to work; killing a flat trade at
+        # 25 minutes was removing exactly the delayed continuations the
+        # strategy exists to catch. Set an integer to re-enable.
+        if CFG["time_stop_min"]:
+            for tok in list(self._positions.keys()):
+                tr = self._positions[tok]
+                age_min = (ts - tr["entry_ts"]).total_seconds() / 60.0
+                if age_min >= CFG["time_stop_min"] and not tr["trail_armed"]:
+                    self._exit(tok, "TIME_STOP", ts)
 
     # ══════════════════════════════════════════════════════════════════════════
     # TICK ROUTING — stock spot ticks and option leg ticks both land here
@@ -478,15 +514,17 @@ class StockOptionsScannerStrategy(BaseStrategy):
             return
         if ts.hour in CFG["avoid_hours"]:
             return
-        if self._trades_today >= CFG["max_trades_day"]:
+        # Count-based blockers are opt-in (all None by default — see CFG).
+        # A stock may hold several concurrent positions on DIFFERENT strikes;
+        # _arm_entry() still refuses a second position on the same token,
+        # because _positions is keyed by token and a duplicate would silently
+        # overwrite the first trade's record.
+        if CFG["max_trades_day"] and self._trades_today >= CFG["max_trades_day"]:
             return
-        if len(self._positions) + len(self._pending) >= CFG["max_open_positions"]:
+        if CFG["max_open_positions"] and \
+                len(self._positions) + len(self._pending) >= CFG["max_open_positions"]:
             return
-        if st.trades_today >= CFG["max_trades_per_stock"]:
-            return
-        if any(p["sym"] == st.sym for p in self._pending.values()):
-            return
-        if any(p["sym"] == st.sym for p in self._positions.values()):
+        if CFG["max_trades_per_stock"] and st.trades_today >= CFG["max_trades_per_stock"]:
             return
         if len(st.bars) < CFG["min_bars"]:
             return
@@ -632,10 +670,22 @@ class StockOptionsScannerStrategy(BaseStrategy):
             )
 
         # ── SL sizing and the cost-ratio guard ───────────────────────────────
-        sl_pts = min(CFG["max_loss_rs"] / qty, CFG["sl_atr_mult"] * p["opt_atr"])
-        sl_pts = max(sl_pts, CFG["min_sl_pts"])
-        if block is None and sl_pts < CFG["min_sl_to_cost_ratio"] * rt_pts:
-            block = f"sl={sl_pts:.2f} < {CFG['min_sl_to_cost_ratio']}x cost({rt_pts:.2f})"
+        # FIX: the old code did `sl_pts = max(sl_pts, min_sl_pts)` with a 2.0
+        # floor, which SILENTLY BROKE the rupee risk cap on every large-lot
+        # stock. SBIN at qty=1500: max_loss_rs/qty = 0.80pts, the floor forced
+        # 2.00pts, and actual risk became Rs 3,000 against a stated cap of
+        # Rs 1,200 — 2.5x the intended size, on the biggest lots in the book.
+        #
+        # The money cap is now absolute. If the room it allows is too tight to
+        # survive the round-trip cost, the TRADE IS REJECTED rather than the
+        # stop being widened past the cap.
+        sl_pts   = min(CFG["max_loss_rs"] / qty, CFG["sl_atr_mult"] * p["opt_atr"])
+        required = max(CFG["min_sl_pts"], CFG["min_sl_to_cost_ratio"] * rt_pts)
+        if block is None and sl_pts < required:
+            block = (
+                f"sl={sl_pts:.2f}pts (Rs{sl_pts * qty:.0f}) < required {required:.2f}pts "
+                f"[{CFG['min_sl_to_cost_ratio']}x cost {rt_pts:.2f}] — rejected, not widened"
+            )
 
         if block:
             log.info(f"[{self.name}] {sym} {p['opt_symbol']} entry BLOCKED — {block}")
@@ -665,7 +715,20 @@ class StockOptionsScannerStrategy(BaseStrategy):
             "qty": qty, "lot": lot, "entry": fill, "entry_ts": ts,
             "order_id": order_id, "sl": round(fill - sl_pts, 2),
             "sl_pts": sl_pts, "rt_pts": rt_pts, "spread": spread,
-            "peak": fill, "trail_armed": False, "opt_atr": p["opt_atr"],
+            "peak": fill, "trail_armed": False, "protected": False,
+            "opt_atr": p["opt_atr"],
+            # ATR-based trail distance, fixed at entry. FIX: the old trail was
+            # a flat Rs 700 converted to points at runtime, which made the
+            # distance a function of LOT SIZE rather than volatility —
+            # 1.40pts on RELIANCE (lot 500) but 0.47pts on SBIN (lot 1500),
+            # the latter being inside a normal spread. Now it scales with the
+            # contract's own expected movement, with a floor of 2x spread so
+            # it can never sit inside the quote.
+            "trail_pts": max(
+                CFG["trail_atr_mult"] * p["opt_atr"],
+                CFG["min_trail_pts"],
+                2.0 * spread,
+            ),
             "entry_oi": oi, "entry_volume": volume,
         }
         self._positions[tok] = tr
@@ -692,54 +755,95 @@ class StockOptionsScannerStrategy(BaseStrategy):
     # ══════════════════════════════════════════════════════════════════════════
 
     def _manage_position(self, tok: int, ltp: float, ts: datetime):
+        """
+        Exit ladder. Called from option ticks AND from the heartbeat sweep.
+
+        ORDER MATTERS — this is the bug that was fixed here. The old version
+        checked the Rs 500 base target LAST but the Rs 900 trail-arm BEFORE
+        it, in a chain of early returns. A trade climbing normally
+        (400 → 500 → 600 → 900) hit the Rs 500 exit at step 5 and was closed
+        long before it could ever reach step 3. The trail only armed if a
+        SINGLE tick jumped from under 500 to over 900. So the runner
+        mechanism the design describes was effectively dead: every winner was
+        a Rs 500 winner, and the Rs 5,000 cap was unreachable.
+
+        Now the ladder is evaluated HIGHEST FIRST, and Rs 500 no longer closes
+        the trade — it moves the stop up and lets the trade continue:
+
+            >= target_rs_max (5000)  -> hard exit
+            price <= stop            -> exit (SL_HIT or TRAIL_HIT)
+            trail armed              -> ratchet the ATR trail
+            >= trail_arm_rs (900)    -> arm trail, lock trail_lock_rs
+            >= target_rs_min (500)   -> lock protect_lock_rs, keep running
+                                        (or hard-exit if book_at_base_target)
+        """
         tr  = self._positions[tok]
         qty = tr["qty"]
 
-        # Stale-price guard. Stock options tick far less often than index
-        # options; acting on a 60-second-old print produces phantom SL hits.
-        pts = self.get_price_ts(tok)
-        if pts and (ts - pts).total_seconds() > CFG["stale_price_sec"]:
+        pts   = self.get_price_ts(tok)
+        stale = bool(pts and (ts - pts).total_seconds() > CFG["stale_price_sec"])
+
+        exit_px = round(max(0.05, ltp - tr["spread"] / 2.0), 2)
+        unreal  = (exit_px - tr["entry"]) * qty - fixed_costs_rs(qty, tr["entry"], exit_px)
+
+        # ── 1. hard cap ──────────────────────────────────────────────────────
+        if unreal >= CFG["target_rs_max"]:
+            self._exit(tok, "MAX_TARGET", ts, ltp)
+            return
+
+        # ── 2. stop loss — evaluated even on a stale print ───────────────────
+        # A leg that has stopped trading is exactly when the stop matters
+        # most. Skipping this on staleness is what left positions unstopped.
+        if ltp <= tr["sl"]:
+            self._exit(tok, "TRAIL_HIT" if tr["trail_armed"] else "SL_HIT", ts, ltp)
+            return
+
+        # Everything below is a PROFIT decision, and those should not be made
+        # on an old print — a stale high would ratchet the trail to a level
+        # the market has already left.
+        if stale:
             return
 
         if ltp > tr["peak"]:
             tr["peak"] = ltp
 
-        # Unrealised in rupees, net of the modelled exit crossing.
-        exit_px  = round(max(0.05, ltp - tr["spread"] / 2.0), 2)
-        unreal   = (exit_px - tr["entry"]) * qty - fixed_costs_rs(qty, tr["entry"], exit_px)
-        peak_rs  = (tr["peak"] - tr["spread"] / 2.0 - tr["entry"]) * qty
-
-        # 1. hard cap — do not hold past the top of the target band
-        if unreal >= CFG["target_rs_max"]:
-            self._exit(tok, "MAX_TARGET", ts, ltp)
-            return
-
-        # 2. stop loss
-        if ltp <= tr["sl"]:
-            self._exit(tok, "TRAIL_HIT" if tr["trail_armed"] else "SL_HIT", ts, ltp)
-            return
-
-        # 3. arm the trail once the trade is running
-        if not tr["trail_armed"] and unreal >= CFG["trail_arm_rs"]:
-            tr["trail_armed"] = True
-            tr["sl"] = round(tr["entry"] + CFG["trail_lock_rs"] / qty, 2)
-            log.info(
-                f"[{self.name}] {tr['opt_symbol']} trail ARMED at Rs{unreal:.0f} — "
-                f"SL locked to {tr['sl']:.2f} (Rs{CFG['trail_lock_rs']:.0f})"
-            )
-            return
-
-        # 4. trail behind the peak
+        # ── 3. ratchet the ATR trail ─────────────────────────────────────────
         if tr["trail_armed"]:
-            new_sl = round(tr["peak"] - CFG["trail_give_rs"] / qty, 2)
+            new_sl = round(tr["peak"] - tr["trail_pts"], 2)
             if new_sl > tr["sl"]:
                 tr["sl"] = new_sl
             return
 
-        # 5. base target — taken only while the trail is unarmed. Above
-        #    trail_arm_rs the trail takes over and lets the winner run.
+        # ── 4. arm the trail ─────────────────────────────────────────────────
+        if unreal >= CFG["trail_arm_rs"]:
+            tr["trail_armed"] = True
+            lock   = round(tr["entry"] + CFG["trail_lock_rs"] / qty, 2)
+            trail  = round(tr["peak"] - tr["trail_pts"], 2)
+            tr["sl"] = max(lock, trail, tr["sl"])
+            log.info(
+                f"[{self.name}] {tr['opt_symbol']} TRAIL ARMED at Rs{unreal:.0f} — "
+                f"stop {tr['sl']:.2f}, trailing {tr['trail_pts']:.2f}pts behind peak"
+            )
+            return
+
+        # ── 5. protect level — move the stop up, do NOT close the trade ──────
         if unreal >= CFG["target_rs_min"]:
-            self._exit(tok, "TARGET", ts, ltp)
+            if CFG["book_at_base_target"]:
+                self._exit(tok, "TARGET", ts, ltp)
+                return
+            if not tr["protected"]:
+                tr["protected"] = True
+                # The lock must clear the round-trip cost, otherwise
+                # "locked profit" is a loss once the exit is paid for.
+                lock_pts = max(CFG["protect_lock_rs"] / qty, tr["rt_pts"] * 1.10)
+                new_sl   = round(tr["entry"] + lock_pts, 2)
+                if new_sl > tr["sl"]:
+                    tr["sl"] = new_sl
+                log.info(
+                    f"[{self.name}] {tr['opt_symbol']} PROTECT at Rs{unreal:.0f} — "
+                    f"stop raised to {tr['sl']:.2f} (locks ~Rs{lock_pts * qty:.0f}), "
+                    f"trade continues toward Rs{CFG['trail_arm_rs']:.0f}"
+                )
 
     def _exit(self, tok: int, reason: str, ts: datetime, ltp: float = None):
         tr = self._positions.get(tok)
@@ -747,8 +851,29 @@ class StockOptionsScannerStrategy(BaseStrategy):
             return
         qty = tr["qty"]
 
+        # FIX: the old fallback was `self.get_price(tok) or tr["entry"]`.
+        # When a leg had gone silent the exit was booked AT THE ENTRY PRICE
+        # and logged as a Rs 0 breakeven — corrupting the P&L record on
+        # precisely the trades most likely to be losers. The last real print
+        # is now used, and the row is flagged so these can be excluded from
+        # any expectancy calculation.
+        stale_exit = 0
         if ltp is None:
-            ltp = self.get_price(tok) or tr["entry"]
+            ltp  = self.get_price(tok)
+            pts  = self.get_price_ts(tok)
+            if pts and (ts - pts).total_seconds() > CFG["stale_price_sec"]:
+                stale_exit = 1
+                log.warning(
+                    f"[{self.name}] {tr['opt_symbol']} exiting on a STALE price "
+                    f"({(ts - pts).total_seconds():.0f}s old) — P&L unreliable"
+                )
+            if ltp is None:
+                ltp = tr["entry"]
+                stale_exit = 1
+                log.error(
+                    f"[{self.name}] {tr['opt_symbol']} NO price available at exit — "
+                    f"booking at entry. This row is not real P&L."
+                )
 
         res = self._place_sell_with_retry(tr["opt_symbol"], tok, qty, ltp)
         if res is None:
@@ -769,6 +894,7 @@ class StockOptionsScannerStrategy(BaseStrategy):
         tr.update({
             "exit_price": exit_px, "exit_reason": reason,
             "pnl": net, "gross_pnl": gross, "time_in_trade_s": tis,
+            "stale_exit": stale_exit,
         })
         self._completed.append(tr)
         self._positions.pop(tok, None)
@@ -794,6 +920,7 @@ class StockOptionsScannerStrategy(BaseStrategy):
         "price", "qty", "lot", "sl", "sl_pts", "status", "pnl", "gross_pnl",
         "cost_drag", "rt_cost_pts", "spread", "reason", "mode", "order_id",
         "time_in_trade_s", "entry_oi", "entry_volume", "opt_atr", "peak",
+        "trail_pts", "protected", "trail_armed", "stale_exit",
     ]
 
     _SIGNAL_FIELDS = [
@@ -816,6 +943,10 @@ class StockOptionsScannerStrategy(BaseStrategy):
             "time_in_trade_s": round(tr.get("time_in_trade_s", 0)),
             "entry_oi": tr.get("entry_oi", ""), "entry_volume": tr.get("entry_volume", ""),
             "opt_atr": round(tr.get("opt_atr", 0), 2), "peak": round(tr.get("peak", 0), 2),
+            "trail_pts": round(tr.get("trail_pts", 0), 2),
+            "protected": int(tr.get("protected", False)),
+            "trail_armed": int(tr.get("trail_armed", False)),
+            "stale_exit": tr.get("stale_exit", 0),
         }
         self._write_csv(CFG["csv_file"], self._TRADE_FIELDS, row)
 
