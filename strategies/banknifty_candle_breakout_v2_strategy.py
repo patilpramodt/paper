@@ -246,7 +246,7 @@ CFG = {
     # specifically is the worst of the four candle-breakouts at -6,009 over
     # 206 trades, and added another -2,421 on 2026-08-26.
     # Set True to re-enable; nothing else was removed.
-    "enabled"                 : False,
+    "enabled"                 : True,
 
     "avoid_hour"              : 10,
 
