@@ -106,6 +106,7 @@ from strategies.banknifty_candle_breakout_strategy    import BankNiftyCandleBrea
 from strategies.nifty_candle_breakout_v2_strategy      import NiftyCandleBreakoutV2Strategy
 from strategies.banknifty_candle_breakout_v2_strategy  import BankNiftyCandleBreakoutV2Strategy
 from strategies.stock_options_scanner_strategy import StockOptionsScannerStrategy, UNIVERSE as STOCK_UNIVERSE
+from strategies.stock_options_scanner_realtime_strategy import StockOptionsScannerRealtimeStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -126,7 +127,8 @@ ACTIVE_STRATEGIES = [
     BankNiftyCandleBreakoutStrategy,  # BankNifty Candle Breakout: 9:15-15:15  20pt marubozu + 5s confirm + tick breakout
     NiftyCandleBreakoutV2Strategy,      # Nifty Candle Breakout V2:     9:15-15:15  C1 6pt tick trigger + C2 3pt point entry (test variant, runs alongside V1)
     BankNiftyCandleBreakoutV2Strategy,  # BankNifty Candle Breakout V2: 9:15-15:15  C1 20pt tick trigger + C2 10pt point entry (test variant, runs alongside V1)
-    StockOptionsScannerStrategy,        # Stock Opt Scanner:            9:30-14:45  15 stocks, 3-min volume thrust, multi-position, Rs500-5000 target (PAPER only)
+    StockOptionsScannerStrategy,          # Stock Opt Scanner V1:  9:30-14:45  15 stocks, bar-close 3-min thrust entry (PAPER only)
+    StockOptionsScannerRealtimeStrategy,  # Stock Opt Scanner RT:  9:30-14:45  same 15 stocks, real-time tick-level volume-surge entry (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -424,9 +426,9 @@ def main():
             # SpikeNiftyStrategy needs Nifty-specific PreMarketData and instruments.
             # All other strategies use the shared BankNifty pm and instruments.
             strat_index = getattr(strat, "INDEX_TOKEN", None)
-            if strat.name == "STOCK_OPT_SCANNER":
-                # Needs the stock chain, not an index chain. PreMarketData is
-                # BankNifty-specific and unused by this strategy.
+            if strat.name in ("STOCK_OPT_SCANNER", "STOCK_OPT_SCANNER_RT"):
+                # Both use the same fixed 15-stock chain. PreMarketData is
+                # BankNifty-specific and unused by either strategy.
                 ok = strat.pre_market(pm, stock_instruments)
             elif strat_index == 256265:
                 ok = strat.pre_market(nifty_pm, nifty_instruments)
