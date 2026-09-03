@@ -3,90 +3,76 @@ strategies/nifty_candle_breakout_strategy.py
 
 NIFTY_CANDLE_BREAKOUT — 10s marubozu + 5s confirm + tick breakout, Nifty 50 only.
 
-═══════════════════════════════════════════════════════════════════════════
-  WHAT CHANGED IN THIS VERSION  (2026-08 audit)  — read this first
-═══════════════════════════════════════════════════════════════════════════
-
-FIX A — THE STRATEGY COULD NOT BE PROFITABLE AS CONFIGURED.
-  Old settings: sl_points=15, trail_activate_pts=5, trail_distance_pts=5.
-  Once a trade gained 5 points the stop locked at entry+5 and then trailed
-  only 5 points behind the peak. Nifty ATM premium noise is routinely 2-4
-  points, so essentially every winner was stopped out at exactly +5 while
-  every loser paid the full -15. Gross breakeven win-rate = 15/(15+5) = 75%.
-
-  Then apply real costs. core/costs.py prices a round-trip on a ~140-point
-  Nifty ATM option at ~2.7 premium points (bid-ask on both legs + Rs 40
-  brokerage + STT + exchange + GST). Net winner = +2.3, net loser = -17.7.
-  Required win-rate to break even: 88.6%. No 10-second breakout pattern
-  wins 9 times out of 10.
-
-  Fix: the reward must be a multiple of the risk, not a fraction of it.
-    - sl_points          15 -> 12   (tighter initial risk)
-    - trail_activate_pts  5 -> 14   (~1.2R before anything is locked)
-    - lock_pts            —  -> 6   (what gets locked when trail arms)
-    - trail_distance_pts  5 -> 9    (room to let a winner run)
-  Net winner is now open-ended with a realistic floor of ~+3.3 after costs,
-  net loser is -14.7. Breakeven win-rate falls from 88.6% to ~35-45%
-  depending on how far winners run.
-
-FIX B — PAPER P&L IGNORED ALL EXECUTION COSTS.
-  OrderRouter._paper_fill() returns the raw LTP for both legs, and
-  _finalize_exit() computed `(sell_price - entry) * qty`. Zero spread, zero
-  brokerage. Every paper number this strategy has ever produced is
-  optimistic by ~2.7 points/unit (~Rs 175/trade at qty=65).
-  Fix: entry uses core.costs.entry_fill(), exit uses core.costs.exit_fill(),
-  P&L uses core.costs.net_pnl_rs(). Gross and net are both logged so the
-  size of the cost drag stays visible.
-
-FIX C — RISK CAPS ADDED, THEN REMOVED AGAIN FOR PAPER DATA COLLECTION (2026-08-12).
-  Daily-loss halt, max-trades/day, consecutive-loss halt, and post-loss
-  cooldown were added and then explicitly stripped back out at the user's
-  request: this is a paper-trading phase and the goal is a clean,
-  completely unfiltered record of every setup the pattern fires — not a
-  record filtered by risk gates. The strategy scans 09:15-15:00 with
-  nothing capping trade count or daily P&L; the trailing stop below is
-  the only exit-side control left.
-
-FIX D — SUBSCRIPTION REFCOUNT LEAK.
-  _fire_entry() called subscribe_option() on every entry; nothing ever
-  called unsubscribe_option(). MarketHub refcounts subscriptions, so each
-  trade permanently incremented the count for that strike and the token was
-  never released — for the whole session, across every strike traded.
-  Fix: _finalize_exit() releases the token it acquired.
-
-FIX E — THE INDICATORS WERE COMPUTED AND THEN THROWN AWAY.
-  compute_fast_indicators() ran on every signal event, was written to CSV,
-  and never influenced anything. A 10-second breakout taken against the
-  session trend is the single most common way this pattern loses.
-  Fix: two cheap directional gates, both optional via CFG:
-    - require_vwap_side  : CE only above session VWAP, PE only below
-    - require_supertrend : CE only when fast Supertrend is UP, PE when DOWN
-  Both fail OPEN when the indicator isn't ready yet, so early-session
-  behaviour is unchanged. Every rejection is logged with event=GATE_BLOCK
-  in the signals CSV so you can measure exactly what they cost you.
-
-FIX F — TIME STOP. [REMOVED 2026-08-27 — trades now only exit via SL/trailing
-  SL or EOD force-close, no time-based exit.]
-  A breakout that is right is right within a minute or two. Sitting in a
-  dead trade only burns theta and ties up the live slot.
-  Fix: max_hold_seconds exits any trade that is not in profit after N sec.
-
-═══════════════════════════════════════════════════════════════════════════
-  ORIGINAL PATTERN SPEC (unchanged)
-═══════════════════════════════════════════════════════════════════════════
+REQUIREMENTS (as given)
+────────────────────────
   1. Nifty only.
-  2. Every closed 10-second index candle is a "trigger" (C1) if its body
-     (|close - open|) is strictly greater than min_body_pts.
-  3. The very next 5-second candle must close the SAME colour as C1,
-     otherwise the setup is abandoned.
-  4. Once confirmed, watch price tick-by-tick for the rest of that 10-second
-     window. The moment price breaks the confirm candle's high (GREEN -> CE)
-     or low (RED -> PE), enter immediately.
-  5. If the watched 10-second window closes with no breakout, reset to SCAN.
+  2. Watch every closed 10-second index candle. A candle qualifies as a
+     "trigger" (C1) if it has NO wick (open/close occupy the full
+     high-low range, within a small tolerance) AND its body
+     (|close - open|) is strictly greater than 10 points.
+  3. After C1 closes, watch the very next 5-second candle (the first
+     half of the following 10s bucket). If it closes the SAME color as
+     C1 → confirmed, otherwise the setup is abandoned.
+  4. Once confirmed, watch price tick-by-tick for the rest of that same
+     10-second window (the "next 10 sec candle", which the confirm
+     5s candle is the first half of). The moment price breaks the
+     confirm candle's high (GREEN → CE) or low (RED → PE), enter
+     IMMEDIATELY — no waiting for any candle to close.
+  5. SL/TP are fixed at 10 points on the OPTION PREMIUM (not the index),
+     matching the convention used by SPIKE / SPIKE_NIFTY.
+  6. "Skip" rule: entry also requires price to have crossed the confirm
+     candle's CLOSE (not just high/low) — for a clean GREEN breakout the
+     close is always <= high so this is implied, but it's checked
+     explicitly for symmetry and safety. If the watched 10-second window
+     closes with no breakout, the setup is abandoned and the state
+     machine resets to scan for a fresh C1 (per explicit confirmation —
+     we do NOT keep watching subsequent windows).
+
+CLARIFICATIONS CONFIRMED WITH USER
+────────────────────────────────────
+  - "last close" in the skip rule = the CONFIRM 5-second candle's close.
+  - SL/TP of 10 points = option premium points (like SPIKE/SPIKE_NIFTY),
+    not index points.
+  - Breakout is only watched within the single 10-second candle right
+    after the confirm candle. If it closes with no breakout, reset.
+
+ASSUMPTIONS (stated — not covered by the spec, flag if wrong)
+─────────────────────────────────────────────────────────────
+  - This strategy is NOT limited to the 9:15 open like SPIKE/SPIKE_NIFTY.
+    It scans all day (09:15–15:00 for new setups, force-exits any open
+    trade by 15:15) and can take MULTIPLE trades per day, one at a time.
+  - "No wick" allows a small tolerance (wick_tolerance_pts, default 0.5)
+    since real tick data essentially never produces an exact-zero wick.
+  - ATM strike is recomputed at the moment of each signal (not fixed at
+    market open), since this strategy can fire at any time of day and
+    spot may have drifted from the pre-market ATM. This mirrors the
+    pattern used in nifty_directional_strategy.py.
+  - One trade at a time for this strategy; the global live-trade slot
+    (OrderRouter) still applies on top of that in LIVE_MODE.
 
 INDEX ROUTING
+──────────────
   INDEX_TOKEN = 256265 (NSE:NIFTY 50). MarketHub routes Nifty ticks here
-  exclusively. Uses the shared nifty_pm / nifty_instruments wired in t.py.
+  exclusively, same mechanism used by SPIKE_NIFTY / BB_STOCH_NIFTY /
+  NIFTY_DIRECTIONAL. Uses the shared nifty_pm / nifty_instruments already
+  wired up in t.py for any strategy with this INDEX_TOKEN.
+
+LIVE / PAPER MODE
+─────────────────
+  LIVE_MODE = False below. Flip to True only when ready to trade real
+  money — all other strategies are unaffected by this flag.
+
+ORDER EXECUTION / ROBUSTNESS
+──────────────────────────────
+  Mirrors the bug-fixed patterns already established in spike_nifty.py /
+  nifty_directional_strategy.py:
+    - _exit_in_progress guard against concurrent exit attempts.
+    - Slot released ONLY after position is confirmed closed.
+    - Emergency exit background thread if SELL fails repeatedly in
+      LIVE_MODE (position stays open, slot stays locked, retried in the
+      background rather than silently abandoned).
+    - SL/TP checked only after a short grace period post-fill to avoid
+      acting on stale buffered ticks.
 """
 
 import csv
@@ -100,8 +86,6 @@ from typing import Optional
 from core.base_strategy import BaseStrategy
 from core.candle import SecondCandleBuilder
 from core.instruments import get_atm_strike
-from core.fast_indicators import compute_fast_indicators, CANDLE_WINDOW, INDICATOR_FIELDS
-from core.costs import entry_fill, exit_fill, net_pnl_rs, round_trip_cost_pts
 
 log = logging.getLogger("strategy.nifty_candle_breakout")
 
@@ -110,42 +94,6 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 
 def _now_ist() -> datetime:
     return datetime.now(tz=_IST).replace(tzinfo=None)
-
-
-def strike_from_symbol(sym: str) -> str:
-    """
-    Best-effort strike extraction from an option tradingsymbol for CSV logging.
-
-    FIX (2026-08-26): the old version walked backwards collecting digits until
-    it hit a non-digit. That works for BANKNIFTY26AUG57600PE (the "AUG" stops
-    the walk at 57600) but NOT for weekly NIFTY symbols like NIFTY2690124350CE,
-    which have no letter between the date code and the strike — the walk
-    swallowed the whole numeric block and logged strike=2690124350. Every Nifty
-    row in nifty_candle_breakout_trades.csv is affected.
-
-    New rule: strip the CE/PE suffix, then take the LAST 5 digits if the
-    remaining numeric tail is longer than 5 (index strikes are 4-5 digits and
-    always the trailing part of the symbol); otherwise take the whole tail.
-    Monthly symbols with an alpha month code are unaffected.
-    """
-    for suffix in ("CE", "PE"):
-        if sym.endswith(suffix):
-            tail = sym[:-2]
-            num = ""
-            for ch in reversed(tail):
-                if ch.isdigit():
-                    num = ch + num
-                else:
-                    break
-            if not num:
-                return ""
-            # Monthly symbols (…26SEP57600) stop at the alpha month code, so
-            # `num` is already just the strike. Weekly Nifty symbols
-            # (NIFTY26901 24350) give one long run — the strike is the tail.
-            if len(num) > 5:
-                num = num[-5:]
-            return num
-    return "".join(ch for ch in sym if ch.isdigit())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,100 +111,19 @@ CFG = {
 
     # ── Session windows ───────────────────────────────────────────────────────
     "start_time"             : dtime(9, 15),
-    "warmup_until"           : dtime(9, 20),   # no entries in the first 5 min
-    "last_entry_time"        : dtime(15, 0),   # stop scanning for NEW setups
+    "last_entry_time"        : dtime(15, 0),   # stop scanning for NEW setups after this
     "close_time"             : dtime(15, 15),  # force-exit any open trade
 
     # ── Candle pattern parameters ─────────────────────────────────────────────
     "bucket_10s"             : 10,
     "bucket_5s"              : 5,
-    "min_body_pts"           : 8.0,   # body must be strictly greater than this
+    "min_body_pts"           : 10.0,   # body must be strictly greater than this
+    "wick_tolerance_pts"     : 0.5,    # "no wick" allowed tolerance
 
-    # ── FIX A: risk / reward on OPTION PREMIUM points ─────────────────────────
-    # Reward must be a MULTIPLE of risk, not a fraction. See module docstring.
-    "sl_points"              : 12.0,  # initial risk stop
-    "trail_activate_pts"     : 10.0,  # profit needed before trail arms
-    "lock_pts"               : 5.0,   # profit locked the moment it arms
-    "trail_step_pts"         : 5.0,   # SL steps up by this much for every additional
-                                       # trail_step_pts of favorable move beyond activation
+    # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
+    "sl_points"              : 10.0,
+    "tp_points"              : 10.0,
     "sl_grace_seconds"       : 5,
-
-    # ── Risk caps removed (2026-08-12) ─────────────────────────────────────────
-    # Pure paper-data collection phase: no max daily loss, no max trades/day,
-    # no consecutive-loss halt, no post-loss cooldown. Every setup that fires
-    # takes a trade so the CSV reflects the strategy's raw, unfiltered
-    # behaviour.
-    "enforce_direction_gate" : False,
-
-    # ── FIX E: directional gates (were computed but unused) ───────────────────
-    # Both fail OPEN when the indicator is not ready, so early-session
-    # behaviour is identical to before. Set False to restore old behaviour.
-    "require_vwap_side"      : True,   # only takes effect if enforce_direction_gate=True
-    "require_supertrend"     : True,   # only takes effect if enforce_direction_gate=True
-
-    # ── Indicator filter (added 2026-08-18, retuned 2026-08-18 for August-only) ─
-    # Best-performing filter found for THIS strategy on AUGUST-2026 trades
-    # ONLY (08-03 to 08-18, ~45 indicator-ready trades): RSI strongly in the
-    # trade's direction (>rsi_strong for CE, <100-rsi_strong for PE) AND RSI
-    # inside a TIGHT band [rsi_tight_min, rsi_tight_max] — narrower than the
-    # first cut, which used a loose [20,80] band.
-    # August sample: 45 trades / 53.3% WR / -Rs 4,294 baseline -> 8 trades /
-    # 87.5% WR / +Rs 1,362 (net flipped positive; the looser band only
-    # reached 21 trades / 66.7% WR / -Rs 168 — still negative).
-    #
-    # CAVEAT (also logged at runtime — see _indicator_filter_allowed): this
-    # is the weakest-sample strategy of the four (fewest trades), and the
-    # tight band above shrinks the trade count further (8 trades in the
-    # August sample) — a small-sample result, tuned specifically to August
-    # at the user's request, NOT re-checked against the pre-August
-    # (Jul24-Aug10) sample. Defaults to OFF (fails open), same convention as
-    # enforce_direction_gate above — flip True only after re-validating.
-    # REVERTED 2026-08-25: this is the strategy whose own caveat turned out
-    # to matter most. Full-history backtest (2026-07-14 to 2026-08-25) shows
-    # it was the ONLY net-profitable candle-breakout of the four overall
-    # (+8,007 / +58 per trade across 137 trades) — almost entirely from the
-    # pre-08-19 period (+70/trade, n=133). Since this tight-RSI filter
-    # activated 08-19 the strategy has taken 4 trades total and gone
-    # completely silent on 4 of the last 4 sessions (08-20, 08-21, 08-24,
-    # 08-25) — not because the market stopped moving, but because
-    # "Confirm 5s candle mismatch" is resetting almost every scan, and the
-    # few that do confirm mostly get killed by this RSI band on top. Leave
-    # OFF; this strategy did not need fixing, it needed to be left alone.
-    # See /areas/paper-main.md.
-    "enforce_indicator_filter": False,
-    "rsi_strong"               : 60.0,  # RSI must exceed this for CE (below 100-this for PE)
-    "rsi_tight_min"            : 30.0,
-    "rsi_tight_max"            : 70.0,
-
-    # ── Weakest-hour guard (added 2026-08-25) ─────────────────────────────────
-    # Hour 10 (10:00-10:59) is the one consistently negative hour across all
-    # four candle-breakout variants in the 27-session backtest. Skips NEW
-    # setups only; an already-open trade is still managed normally.
-    "avoid_hour"              : 10,
-
-    # ── Entry-hour allow-list (added 2026-08-26) ──────────────────────────────
-    # Full-history entry-paired backtest (2026-07-14 -> 2026-08-26, 275
-    # marubozu + 381 c1_c2 trades) shows the ONLY hour that is independently
-    # positive in BOTH July and August is 09:00-09:59:
-    #     marubozu 09h : +10,958 over 108 trades (Jul +6,001/72, Aug +4,957/36)
-    #     marubozu 12h : +5,113  over  43 trades (Jul +5,233,   Aug   -120)
-    #     hours 10/11/13/14 : negative or month-dependent in every cut
-    # Set to None to disable the gate and scan every hour again.
-    "entry_hours"             : (9, 12),
-
-    # ── Minimum SL-to-cost ratio (added 2026-08-26) ───────────────────────────
-    # The point-based SL/trail below were calibrated on near-expiry options
-    # trading at ~130 premium, where round_trip_cost_pts() is ~3.5pts against a
-    # 30pt stop (8.6x). After the monthly expiry rolls, BankNifty ATM premium
-    # jumps to ~900 and the modelled round-trip cost jumps to ~11.6pts — the
-    # same 30pt stop is now only 2.6x cost and ~3% of premium, i.e. pure noise.
-    # On 2026-08-26 all four BankNifty entries were taken on 34-DTE SEP options
-    # at 588-928 premium; three of four died on TIME_STOP or SL for -1,340.
-    # This gate refuses any entry where the modelled stop is not at least
-    # min_sl_to_cost_ratio x the modelled round-trip cost. It is premium-aware
-    # and self-adjusting, so no DTE constant has to be maintained.
-    # Set to None to disable.
-    "min_sl_to_cost_ratio"    : 3.5,
 
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
@@ -269,7 +136,8 @@ CFG = {
 
 class NiftyCandleBreakoutStrategy(BaseStrategy):
 
-    # Routes Nifty 50 index ticks here exclusively.
+    # Routes Nifty 50 index ticks here exclusively (shared with other
+    # Nifty strategies — MarketHub delivers to every strategy with this token).
     INDEX_TOKEN = 256265
 
     LIVE_MODE = LIVE_MODE
@@ -285,47 +153,43 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         self._c5  = SecondCandleBuilder(seconds=CFG["bucket_5s"])
 
         self._market_opened = False
-        self._expiry_date   = None
-        self._instruments   = None
+        self._expiry_date    = None
+        self._instruments    = None
 
-        # ── Pattern state machine: SCAN → WAIT_CONFIRM → WATCH_BREAKOUT ───────
+        # ── Pattern state machine ─────────────────────────────────────────────
+        # states: SCAN → WAIT_CONFIRM → WATCH_BREAKOUT → (SCAN)
         self._state              = "SCAN"
-        self._c1                 = None
-        self._trigger_color      = None
-        self._confirm5           = None
-        self._breakout_window_ts = None
-
-        self._signal_meta = None
-        self._pm          = None
+        self._c1                 = None   # trigger 10s candle dict
+        self._trigger_color      = None   # "GREEN" / "RED"
+        self._confirm5           = None   # confirm 5s candle dict
+        self._breakout_window_ts = None   # ts of the 10s bucket being watched
 
         self._trade         = None
-        self._pending_entry = None
-        self._trades_today  = 0
-        self._today_pnl     = 0.0
-        self._completed     = []
+        self._pending_entry  = None
+        self._trades_today   = 0
+        self._today_pnl      = 0.0
+        self._completed      = []
 
         self._lock = threading.Lock()
 
         mode_tag = "[LIVE]" if LIVE_MODE else "[PAPER]"
         log.info(
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
-            f"min_body={CFG['min_body_pts']}pts | SL=-{CFG['sl_points']} "
-            f"trail arms at +{CFG['trail_activate_pts']} locking +{CFG['lock_pts']}, "
-            f"then steps +{CFG['trail_step_pts']} per extra +{CFG['trail_step_pts']} gained | no risk caps (paper data phase) | "
-            f"gates: vwap={CFG['require_vwap_side']} st={CFG['require_supertrend']}"
+            f"min_body={CFG['min_body_pts']}pts wick_tol={CFG['wick_tolerance_pts']}pts "
+            f"SL=-{CFG['sl_points']} TP=+{CFG['tp_points']}"
         )
 
     # ── Pre-market ────────────────────────────────────────────────────────────
 
     def pre_market(self, pm, instruments) -> bool:
+        """
+        Receives Nifty-specific PreMarketData + InstrumentStore (routed by
+        t.py because INDEX_TOKEN == 256265). No pre-subscription of a fixed
+        ATM pair is done here — ATM drifts through the day and this strategy
+        can fire at any time, so the strike is resolved fresh at signal time.
+        """
         self._instruments = instruments
         self._expiry_date = pm.expiry_date
-        self._pm          = pm
-
-        # Reset daily counters (matters when the process is long-lived).
-        self._trades_today  = 0
-        self._today_pnl     = 0.0
-        self._completed     = []
 
         log.info(
             f"[{self.name}] Pre-market | expiry={pm.expiry_date} "
@@ -333,109 +197,12 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         )
         return True
 
-    # ── Indicator snapshot ────────────────────────────────────────────────────
-
-    def _indicator_snapshot(self, spot: float) -> dict:
-        """
-        VWAP / PCR / EMA slope / RSI slope / MACD histogram / ATR% / Supertrend
-        from this strategy's own rolling 10s candle buffer plus live hub VWAP
-        and live PCR.
-
-        FIX E: this is no longer log-only. _direction_allowed() reads
-        spot_vs_vwap and supertrend_dir from it as entry gates.
-        """
-        candles = self._c10.last_n_closed(CANDLE_WINDOW)
-        # FIX (2026-08-26): hub.session_vwap is fed ONLY by the BankNifty
-        # index tick, so this used to compare Nifty spot (~24,300) against a
-        # BankNifty VWAP (~57,500) — spot_vs_vwap was "BELOW" on 73 of 73
-        # logged rows. With enforce_direction_gate=True that would have
-        # blocked 100% of CE entries and passed 100% of PE. Use the Nifty one.
-        vwap    = self._hub.nifty_vwap.value
-        pcr     = self._pm.pcr if self._pm is not None else None
-        return compute_fast_indicators(candles, spot=spot, vwap=vwap, pcr=pcr)
-
-    # ── FIX E: directional gates ──────────────────────────────────────────────
-
-    def _direction_allowed(self, signal: str, ind: dict) -> tuple:
-        """
-        Returns (allowed: bool, reason: str).
-
-        Both gates FAIL OPEN when the underlying indicator is blank/not ready,
-        so nothing changes during warm-up or if fast_indicators errors out.
-        TEST PHASE: also fails open entirely while enforce_direction_gate=False —
-        see the CFG comment above.
-        """
-        if not CFG["enforce_direction_gate"]:
-            return True, ""
-        if CFG["require_vwap_side"]:
-            side = ind.get("spot_vs_vwap", "")
-            if side == "BELOW" and signal == "CE":
-                return False, "vwap_side_below_for_CE"
-            if side == "ABOVE" and signal == "PE":
-                return False, "vwap_side_above_for_PE"
-
-        if CFG["require_supertrend"] and ind.get("indicators_ready"):
-            st = ind.get("supertrend_dir", "")
-            if st == "DOWN" and signal == "CE":
-                return False, "supertrend_down_for_CE"
-            if st == "UP" and signal == "PE":
-                return False, "supertrend_up_for_PE"
-
-        return True, ""
-
-    # ── Indicator filter (added 2026-08-18) ────────────────────────────────────
-
-    def _indicator_filter_allowed(self, signal: str, ind: dict) -> tuple:
-        """
-        Returns (allowed: bool, reason: str).
-
-        Best combo found for NIFTY_CANDLE_BREAKOUT on AUGUST-2026 data
-        specifically: RSI strongly aligned with trade direction AND RSI
-        inside a tight band. See CFG comment for the before/after numbers
-        and the generalization caveat.
-
-        Fails open when indicators aren't ready yet or CFG flag is off —
-        same convention as _direction_allowed above.
-        """
-        if not CFG["enforce_indicator_filter"]:
-            return True, ""
-        if not ind.get("indicators_ready"):
-            return True, ""
-
-        rsi = ind.get("rsi")
-        if rsi is None or rsi == "":
-            return True, ""
-
-        if signal == "CE" and rsi <= CFG["rsi_strong"]:
-            return False, "rsi_not_strong_bullish"
-        if signal == "PE" and rsi >= (100.0 - CFG["rsi_strong"]):
-            return False, "rsi_not_strong_bearish"
-        if not (CFG["rsi_tight_min"] <= rsi <= CFG["rsi_tight_max"]):
-            return False, "rsi_outside_tight_band"
-
-        return True, ""
-
     # ── Tick handlers ─────────────────────────────────────────────────────────
 
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
-        if t < CFG["start_time"]:
-            return
-
-        # FIX (2026-08-26): the old guard was
-        #     if t < start_time or t > close_time: return
-        # which returns BEFORE the close_time force-exit below for every tick
-        # after 15:15:00. An open position could therefore survive the
-        # square-off entirely and only exit if its own SL happened to trigger
-        # later (observed live in spike_nifty on 2026-08-26: entry 12:17,
-        # exit 15:31:34 — sixteen minutes past close_time). Square off first,
-        # then return.
-        if t > CFG["close_time"]:
-            if (self._trade and self._trade["state"] == "OPEN"
-                    and not self._trade.get("_exit_in_progress")):
-                opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
-                self._do_exit(opt_price, "EOD_CLOSE", ts)
+        if t < CFG["start_time"] or t > CFG["close_time"]:
             return
 
         if not self._market_opened and t >= CFG["start_time"]:
@@ -457,17 +224,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         if self._trade is not None:
             return
 
-        # No new setups too close to EOD, or during opening warm-up.
-        if t >= CFG["last_entry_time"] or t < CFG["warmup_until"]:
-            return
-
-        # No new setups during the historically weakest hour — see CFG note.
-        if CFG.get("avoid_hour") is not None and t.hour == CFG["avoid_hour"]:
-            return
-
-        # Entry-hour allow-list — see CFG["entry_hours"].
-        _hours = CFG.get("entry_hours")
-        if _hours is not None and t.hour not in _hours:
+        # No new setups too close to EOD.
+        if t >= CFG["last_entry_time"]:
             return
 
         # ── Pattern state machine ─────────────────────────────────────────────
@@ -481,17 +239,13 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
 
         elif self._state == "WATCH_BREAKOUT":
             self._check_breakout_tick(price, ts)
+            # If the watched window just closed with no breakout, reset.
             if (self._state == "WATCH_BREAKOUT" and closed10 is not None
                     and closed10["ts"] == self._breakout_window_ts):
                 log.info(
                     f"[{self.name}] No breakout within watched window "
                     f"({self._breakout_window_ts.strftime('%H:%M:%S')}) — resetting scan"
                 )
-                if self._c1 is not None and self._confirm5 is not None:
-                    ind = self._indicator_snapshot(self._confirm5["close"])
-                    self._log_signal_csv(self._signal_row(
-                        self._breakout_window_ts, "NO_BREAKOUT", ind
-                    ))
                 self._reset_pattern_state()
 
     def on_candle(self, candle: dict, ts: datetime):
@@ -499,7 +253,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
 
     def on_option_tick(self, token: int, price: float, ts: datetime, tick_ts: datetime = None):
         """
-        Resolves a pending entry and manages the trailing / time stop.
+        Resolves a pending entry (if the option had no valid live price at
+        signal time) and manages fixed SL/TP for the open trade.
         """
         # ── Resolve pending entry ─────────────────────────────────────────────
         if (self._pending_entry and token == self._pending_entry["token"]
@@ -519,45 +274,36 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         if self._trade["state"] != "OPEN" or self._trade.get("_exit_in_progress"):
             return
 
-        # ── SL grace period ───────────────────────────────────────────────────
+        # ── SL / TP grace period ──────────────────────────────────────────────
         sl_active_from = self._trade.get("sl_active_from")
         if sl_active_from is not None and ts < sl_active_from:
             return
 
-        t = self._trade
-        t["peak"] = max(t["peak"], price)
-        gain      = t["peak"] - t["entry"]
-
-        # ── Stepped trail: once armed, SL locks in discrete steps ────────────
-        # At +trail_activate_pts, SL locks to entry+lock_pts. Thereafter, for
-        # every additional trail_step_pts of favorable move (measured off the
-        # peak), the SL steps up by trail_step_pts. This never trails smoothly
-        # behind the peak — it only ratchets up at each step boundary.
-        if gain >= CFG["trail_activate_pts"]:
-            steps = int((gain - CFG["trail_activate_pts"]) // CFG["trail_step_pts"])
-            locked_sl = t["entry"] + CFG["lock_pts"] + steps * CFG["trail_step_pts"]
-            if locked_sl > t["sl"]:
-                t["sl"] = locked_sl
-                t["trail_armed"] = True
-
-        if price <= t["sl"]:
-            reason = "TRAIL_SL_HIT" if t.get("trail_armed") else "SL_HIT"
-            self._do_exit(price, reason, ts)
-            return
+        if price <= self._trade["sl"]:
+            self._do_exit(price, "SL_HIT", ts)
+        elif price >= self._trade["tp"]:
+            self._do_exit(price, "TP_HIT", ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
 
     def _check_trigger_candle(self, c: dict):
-        """10s candle with body strictly > min_body_pts."""
+        """
+        Rule 2: no-wick 10s candle with body strictly > min_body_pts.
+        """
         body = c["close"] - c["open"]
         if abs(body) <= CFG["min_body_pts"]:
+            return
+
+        upper_wick = c["high"] - max(c["open"], c["close"])
+        lower_wick = min(c["open"], c["close"]) - c["low"]
+        if upper_wick > CFG["wick_tolerance_pts"] or lower_wick > CFG["wick_tolerance_pts"]:
             return
 
         color = "GREEN" if body > 0 else "RED"
 
         self._c1            = c
         self._trigger_color = color
-        self._state         = "WAIT_CONFIRM"
+        self._state          = "WAIT_CONFIRM"
 
         log.info(
             f"[{self.name}] Trigger candle (C1) {color} | "
@@ -565,11 +311,10 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             f"body={abs(body):.1f} @ {c['ts'].strftime('%H:%M:%S')} — waiting for confirm 5s"
         )
 
-        ind = self._indicator_snapshot(c["close"])
-        self._log_signal_csv(self._signal_row(c["ts"], "TRIGGER", ind))
-
     def _check_confirm_candle(self, c5: dict, ts: datetime):
-        """The next 5s candle must close the same colour as C1."""
+        """
+        Rule 3: the next 5s candle must close the same color as C1.
+        """
         if c5["close"] > c5["open"]:
             color5 = "GREEN"
         elif c5["close"] < c5["open"]:
@@ -582,108 +327,34 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
                 f"[{self.name}] Confirm 5s candle mismatch "
                 f"(C1={self._trigger_color} confirm={color5}) — resetting scan"
             )
-            self._confirm5 = c5
-            ind = self._indicator_snapshot(c5["close"])
-            self._log_signal_csv(self._signal_row(c5["ts"], "CONFIRM_MISMATCH", ind))
             self._reset_pattern_state()
             return
 
         self._confirm5           = c5
-        self._breakout_window_ts = c5["ts"]
-        self._state              = "WATCH_BREAKOUT"
+        self._breakout_window_ts = c5["ts"]   # also the start of the 10s bucket being watched
+        self._state               = "WATCH_BREAKOUT"
 
         log.info(
             f"[{self.name}] Confirm 5s candle matches ({color5}) | "
             f"o={c5['open']:.1f} h={c5['high']:.1f} l={c5['low']:.1f} c={c5['close']:.1f} "
             f"@ {c5['ts'].strftime('%H:%M:%S')} — watching breakout in next 10s window"
         )
-        ind = self._indicator_snapshot(c5["close"])
-        self._log_signal_csv(self._signal_row(c5["ts"], "CONFIRM_MATCH", ind))
 
     def _check_breakout_tick(self, price: float, ts: datetime):
-        """Immediate entry the instant price breaks the confirm candle's high/low."""
+        """
+        Rule 4 + 6: immediate entry the instant price breaks the confirm
+        candle's high/low AND has crossed its close (implied for a clean
+        breakout, checked explicitly for the stated skip rule).
+        """
         c5 = self._confirm5
-        if c5 is None:
-            return
-
         if self._trigger_color == "GREEN":
-            triggered = price > c5["high"] and price > c5["close"]
-            signal    = "CE"
+            if price > c5["high"] and price > c5["close"]:
+                self._reset_pattern_state()
+                self._fire_entry("CE", price, ts)
         else:
-            triggered = price < c5["low"] and price < c5["close"]
-            signal    = "PE"
-
-        if not triggered:
-            return
-
-        ind = self._indicator_snapshot(price)
-
-        # ── FIX E: directional gates ─────────────────────────────────────────
-        allowed, reason = self._direction_allowed(signal, ind)
-        if not allowed:
-            log.info(
-                f"[{self.name}] Setup blocked by direction gate: {reason} "
-                f"(signal={signal} vwap_side={ind.get('spot_vs_vwap', '?')} "
-                f"st={ind.get('supertrend_dir', '?')}) — skipping"
-            )
-            row = self._signal_row(ts, "GATE_BLOCK", ind, breakout_price=price)
-            row["block_reason"] = reason
-            self._log_signal_csv(row)
-            self._reset_pattern_state()
-            return
-
-        # ── Indicator filter (RSI strength + RSI band) ────────────────────────
-        i_allowed, i_reason = self._indicator_filter_allowed(signal, ind)
-        if not i_allowed:
-            log.info(
-                f"[{self.name}] Setup blocked by indicator filter: {i_reason} "
-                f"(signal={signal} rsi={ind.get('rsi', '?')}) — skipping"
-            )
-            row = self._signal_row(ts, "GATE_BLOCK", ind, breakout_price=price)
-            row["block_reason"] = i_reason
-            self._log_signal_csv(row)
-            self._reset_pattern_state()
-            return
-
-        self._log_signal_csv(
-            self._signal_row(ts, "BREAKOUT_ENTER", ind, breakout_price=price)
-        )
-        self._signal_meta = self._build_signal_meta(price, ts, ind)
-        self._reset_pattern_state()
-        self._fire_entry(signal, price, ts)
-
-    def _signal_row(self, ts, event: str, ind: dict, breakout_price=None) -> dict:
-        c1 = self._c1 or {}
-        c5 = self._confirm5 or {}
-        body = (abs(c1["close"] - c1["open"])
-                if ("close" in c1 and "open" in c1) else "")
-        return {
-            "timestamp"     : ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "event"         : event,
-            "color"         : self._trigger_color or "",
-            "c1_open"       : c1.get("open", ""),  "c1_high" : c1.get("high", ""),
-            "c1_low"        : c1.get("low", ""),   "c1_close": c1.get("close", ""),
-            "c1_body"       : round(body, 2) if body != "" else "",
-            "confirm_open"  : c5.get("open", ""),  "confirm_high": c5.get("high", ""),
-            "confirm_low"   : c5.get("low", ""),   "confirm_close": c5.get("close", ""),
-            "breakout_price": round(breakout_price, 2) if breakout_price else "",
-            "block_reason"  : "",
-            **ind,
-        }
-
-    def _build_signal_meta(self, breakout_price: float, ts: datetime, ind: dict = None) -> dict:
-        c1, c5 = self._c1 or {}, self._confirm5 or {}
-        return {
-            "index_price"   : breakout_price,
-            "weekday"       : ts.strftime("%A"),
-            "c1_body"       : round(abs(c1.get("close", 0) - c1.get("open", 0)), 2),
-            "c1_open"       : c1.get("open", ""), "c1_high": c1.get("high", ""),
-            "c1_low"        : c1.get("low", ""),  "c1_close": c1.get("close", ""),
-            "confirm_open"  : c5.get("open", ""), "confirm_high": c5.get("high", ""),
-            "confirm_low"   : c5.get("low", ""),  "confirm_close": c5.get("close", ""),
-            "breakout_price": round(breakout_price, 2),
-            **(ind or {}),
-        }
+            if price < c5["low"] and price < c5["close"]:
+                self._reset_pattern_state()
+                self._fire_entry("PE", price, ts)
 
     def _reset_pattern_state(self):
         self._state              = "SCAN"
@@ -712,84 +383,66 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         opt_price = self.get_price(token)
 
         if not opt_price or opt_price <= 0:
-            log.warning(f"[{self.name}] No live price yet for {sym} — storing pending entry")
+            log.warning(
+                f"[{self.name}] No live price yet for {sym} — storing pending entry"
+            )
             self._pending_entry = {
                 "sym": sym, "token": token, "signal": signal, "ts": ts, "reason": reason
             }
             return
 
-        # ── SL-to-cost sanity gate — see CFG["min_sl_to_cost_ratio"] ──────────
-        _ratio = CFG.get("min_sl_to_cost_ratio")
-        if _ratio is not None:
-            _est_cost = round_trip_cost_pts(entry_fill(opt_price), CFG["quantity"])
-            if _est_cost > 0 and CFG["sl_points"] < _ratio * _est_cost:
-                log.info(
-                    f"[{self.name}] Entry SKIPPED (sl_to_cost) | {sym} ltp={opt_price:.2f} "
-                    f"| sl={CFG['sl_points']:.1f}pts vs est round-trip cost={_est_cost:.2f}pts "
-                    f"(ratio={CFG['sl_points'] / _est_cost:.2f} < {_ratio}) — premium too high "
-                    f"for a point-based stop"
-                )
-                self.unsubscribe_option(token)
-                return
-
         if not self._acquire_slot():
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
-            self.unsubscribe_option(token)   # FIX D
             return
 
         result = self._place_buy(sym, token, CFG["quantity"], opt_price)
         if result is None:
             self._release_slot()
-            self.unsubscribe_option(token)   # FIX D
             log.error(f"[{self.name}] BUY order FAILED for {sym} — entry aborted")
             return
 
-        order_id, raw_fill = result
-
-        # ── FIX B: pay the spread on entry ───────────────────────────────────
-        # Live mode already gives a real exchange average_price, so the model
-        # is only applied to paper fills.
-        fill_price = raw_fill if LIVE_MODE else entry_fill(raw_fill)
+        order_id, fill_price = result
 
         sl = fill_price - CFG["sl_points"]
+        tp = fill_price + CFG["tp_points"]
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
 
-        rt_cost = round_trip_cost_pts(fill_price, CFG["quantity"])
-
-        meta = self._signal_meta or {}
-        self._signal_meta = None
         self._trade = {
             "state"            : "OPEN",
             "symbol"           : sym,
             "token"            : token,
             "signal"           : signal,
             "entry"            : fill_price,
-            "raw_ltp"          : raw_fill,
             "sl"               : sl,
-            "tp"               : None,   # no fixed TP — trailing stop only
-            "peak"             : fill_price,
+            "tp"               : tp,
             "entry_time"       : ts,
             "sl_active_from"   : sl_active_from,
             "order_id"         : order_id,
             "qty"              : CFG["quantity"],
-            "trail_armed"      : False,
-            "rt_cost_pts"      : rt_cost,
             "_exit_in_progress": False,
-            "meta"             : meta,
         }
         self._trades_today += 1
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         log.info(
-            f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} "
-            f"@ {fill_price:.2f} (ltp={raw_fill:.2f}) | SL={sl:.2f} (-{CFG['sl_points']}) | "
-            f"trail arms +{CFG['trail_activate_pts']} locks +{CFG['lock_pts']} then "
-            f"steps +{CFG['trail_step_pts']} per extra +{CFG['trail_step_pts']} | "
-            f"est round-trip cost={rt_cost:.2f}pts | reason={reason} | order_id={order_id}"
+            f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} @ {fill_price:.2f} | "
+            f"SL={sl:.2f} (-{CFG['sl_points']}) TP={tp:.2f} (+{CFG['tp_points']}) | "
+            f"reason={reason} | order_id={order_id}"
         )
 
-        self._log_csv(self._trade_row(ts, "ENTRY", fill_price, sl, "OPEN", 0, 0,
-                                      reason, order_id, meta, "", ""))
+        self._log_csv({
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol"   : sym,
+            "action"   : "ENTRY",
+            "price"    : fill_price,
+            "sl"       : round(sl, 2),
+            "tp"       : round(tp, 2),
+            "status"   : "OPEN",
+            "pnl"      : 0,
+            "reason"   : reason,
+            "mode"     : mode_tag,
+            "order_id" : order_id,
+        })
 
     # ── Exit ──────────────────────────────────────────────────────────────────
 
@@ -806,10 +459,10 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         )
 
         if result is not None:
-            order_id, raw_sell = result
+            order_id, sell_price = result
             t["state"] = "CLOSED"
             self._release_slot()
-            self._finalize_exit(t, raw_sell, order_id, reason, ts)
+            self._finalize_exit(t, sell_price, order_id, reason, ts)
             return
 
         if LIVE_MODE:
@@ -861,8 +514,8 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
                     )
                     t["state"] = "CLOSED"
                     self._release_slot()
-                    self._finalize_exit(t, ref_price, None,
-                                        f"{reason}_EXCHANGE_CLOSED", _now_ist())
+                    now = _now_ist()
+                    self._finalize_exit(t, ref_price, None, f"{reason}_EXCHANGE_CLOSED", now)
                     return
 
                 ltp = self.get_price(t["token"]) or ref_price
@@ -875,11 +528,10 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
                     t["state"] = "CLOSED"
                     self._release_slot()
                     log.info(
-                        f"[{self.name}] Emergency exit SUCCESS on attempt {attempt} "
-                        f"@ {sell_price:.2f}"
+                        f"[{self.name}] Emergency exit SUCCESS on attempt {attempt} @ {sell_price:.2f}"
                     )
-                    self._finalize_exit(t, sell_price, order_id,
-                                        f"{reason}_EMERGENCY", _now_ist())
+                    now = _now_ist()
+                    self._finalize_exit(t, sell_price, order_id, f"{reason}_EMERGENCY", now)
                     return
 
                 log.error(
@@ -896,9 +548,6 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
             )
             t["state"] = "CLOSED"
             self._release_slot()
-            # Still release the token so the WebSocket subscription doesn't leak.
-            self.unsubscribe_option(t["token"])
-            self._trade = None
 
         thread = threading.Thread(
             target=_loop, name="nifty-candle-breakout-emergency-exit", daemon=True,
@@ -906,118 +555,45 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         thread.start()
         log.info(f"[{self.name}] Emergency exit thread started for {t['symbol']}")
 
-    def _finalize_exit(self, t: dict, raw_sell: float, order_id: Optional[str],
-                       reason: str, ts: datetime):
-        # ── FIX B: pay the spread on exit, then subtract brokerage/STT/GST ───
-        sell_price = raw_sell if LIVE_MODE else exit_fill(raw_sell)
-        gross_pnl  = round((sell_price - t["entry"]) * t["qty"], 2)
-        pnl        = net_pnl_rs(t["entry"], sell_price, t["qty"])
+    def _finalize_exit(self, t: dict, sell_price: float, order_id: Optional[str], reason: str, ts: datetime):
+        pnl = (sell_price - t["entry"]) * t["qty"]
         self._today_pnl += pnl
 
-        time_in_trade_s = round((ts - t["entry_time"]).total_seconds(), 1)
-        if "SL_HIT" in reason:
-            sl_tp_slippage = round(t["sl"] - sell_price, 2)
-        else:
-            sl_tp_slippage = ""
-
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
-        slip_tag = f" | slip={sl_tp_slippage}" if sl_tp_slippage != "" else ""
         log.info(
             f"[{self.name}] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
-            f"(ltp={raw_sell:.2f}) | gross={gross_pnl:.0f} net={pnl:.0f} "
-            f"({pnl / t['qty']:.1f}/unit) | cost_drag={gross_pnl - pnl:.0f} | "
-            f"Today={self._today_pnl:.0f} | held={time_in_trade_s:.0f}s"
-            f"{slip_tag} | order_id={order_id}"
+            f"| PnL={pnl:.0f} ({pnl / t['qty']:.1f}/unit) | Today={self._today_pnl:.0f} | "
+            f"order_id={order_id}"
         )
 
-        self._log_csv(self._trade_row(
-            ts, "EXIT", sell_price, t["sl"], "CLOSED", pnl, gross_pnl,
-            reason, order_id, t.get("meta", {}), time_in_trade_s, sl_tp_slippage,
-            symbol=t["symbol"],
-        ))
-        self._completed.append({
-            **t, "exit_price": sell_price, "exit_reason": reason,
-            "pnl": pnl, "gross_pnl": gross_pnl,
+        self._log_csv({
+            "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol"   : t["symbol"],
+            "action"   : "EXIT",
+            "price"    : sell_price,
+            "sl"       : round(t["sl"], 2),
+            "tp"       : round(t["tp"], 2),
+            "status"   : "CLOSED",
+            "pnl"      : round(pnl, 2),
+            "reason"   : reason,
+            "mode"     : mode_tag,
+            "order_id" : order_id,
         })
+        self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
 
-        # FIX D: release the WebSocket subscription this trade acquired.
-        try:
-            self.unsubscribe_option(t["token"])
-        except Exception as e:
-            log.warning(f"[{self.name}] unsubscribe error for {t['token']}: {e}")
-
+        # Trade fully resolved — free up scanning for the next setup.
         self._trade = None
         self._reset_pattern_state()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _trade_row(self, ts, action, price, sl, status, pnl, gross_pnl,
-                   reason, order_id, meta, time_in_trade_s, sl_tp_slippage,
-                   symbol=None) -> dict:
-        sym = symbol or (self._trade or {}).get("symbol", "")
-        return {
-            "timestamp"      : ts.strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol"         : sym,
-            "action"         : action,
-            "price"          : price,
-            "sl"             : round(sl, 2) if sl else "",
-            "tp"             : "",
-            "status"         : status,
-            "pnl"            : round(pnl, 2),
-            "gross_pnl"      : round(gross_pnl, 2),
-            "cost_drag"      : round(gross_pnl - pnl, 2),
-            "reason"         : reason,
-            "mode"           : "LIVE" if LIVE_MODE else "PAPER",
-            "order_id"       : order_id,
-            "weekday"        : meta.get("weekday", ts.strftime("%A")),
-            "strike"         : strike_from_symbol(sym),
-            "c1_body"        : meta.get("c1_body", ""),
-            "c1_open"        : meta.get("c1_open", ""),
-            "c1_high"        : meta.get("c1_high", ""),
-            "c1_low"         : meta.get("c1_low", ""),
-            "c1_close"       : meta.get("c1_close", ""),
-            "confirm_open"   : meta.get("confirm_open", ""),
-            "confirm_high"   : meta.get("confirm_high", ""),
-            "confirm_low"    : meta.get("confirm_low", ""),
-            "confirm_close"  : meta.get("confirm_close", ""),
-            "breakout_price" : meta.get("breakout_price", ""),
-            "time_in_trade_s": time_in_trade_s,
-            "sl_tp_slippage" : sl_tp_slippage,
-            **{k: meta.get(k, "") for k in INDICATOR_FIELDS},
-        }
 
     def _log_csv(self, row: dict):
         fname  = CFG["csv_file"]
         exists = os.path.isfile(fname)
         fields = [
             "timestamp", "symbol", "action", "price",
-            "sl", "tp", "status", "pnl", "gross_pnl", "cost_drag",
-            "reason", "mode", "order_id",
-            "weekday", "strike",
-            "c1_body", "c1_open", "c1_high", "c1_low", "c1_close",
-            "confirm_open", "confirm_high", "confirm_low", "confirm_close",
-            "breakout_price", "time_in_trade_s", "sl_tp_slippage",
-        ] + INDICATOR_FIELDS
-        with open(fname, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            if not exists:
-                w.writeheader()
-            w.writerow({k: row.get(k, "") for k in fields})
-
-    def _log_signal_csv(self, row: dict):
-        """
-        Logs EVERY trigger candle regardless of outcome — including the new
-        GATE_BLOCK and RISK_BLOCK events, so you can measure exactly what the
-        new filters cost you before deciding to keep them.
-        """
-        fname  = CFG["csv_file"].replace("_trades.csv", "_signals.csv")
-        exists = os.path.isfile(fname)
-        fields = [
-            "timestamp", "event", "color",
-            "c1_open", "c1_high", "c1_low", "c1_close", "c1_body",
-            "confirm_open", "confirm_high", "confirm_low", "confirm_close",
-            "breakout_price", "block_reason",
-        ] + INDICATOR_FIELDS
+            "sl", "tp", "status", "pnl", "reason", "mode", "order_id",
+        ]
         with open(fname, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields)
             if not exists:
@@ -1028,27 +604,11 @@ class NiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(f"\n[{self.name}] {'='*50}")
         log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
         log.info(f"[{self.name}] Trades taken   : {self._trades_today}")
-
-        wins   = [t for t in self._completed if t["pnl"] > 0]
-        losses = [t for t in self._completed if t["pnl"] <= 0]
-        gross  = sum(t.get("gross_pnl", 0) for t in self._completed)
-
         for t in self._completed:
             log.info(
                 f"[{self.name}]   {t['symbol']} [{t['exit_reason']}] "
                 f"entry={t['entry']:.2f} exit={t['exit_price']:.2f} "
-                f"gross={t.get('gross_pnl', 0):.0f} net={t['pnl']:.0f} "
-                f"({t['pnl'] / t['qty']:.1f}/unit)"
+                f"PnL={t['pnl']:.0f} ({t['pnl'] / t['qty']:.1f}/unit)"
             )
-
-        if self._completed:
-            wr = len(wins) / len(self._completed) * 100
-            log.info(
-                f"[{self.name}] W/L            : {len(wins)}/{len(losses)}  "
-                f"(win rate {wr:.1f}%)"
-            )
-        log.info(f"[{self.name}] Gross PnL      : {gross:.0f}")
-        log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
-        log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
+        log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'='*50}\n")
-
