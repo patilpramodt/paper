@@ -94,9 +94,9 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
   reacts within seconds of the move starting instead of at the next bar
   boundary:
 
-   1. VOLUME SURGE   volume traded in the last 30s >= 3x the stock's own
+   1. VOLUME SURGE   volume traded in the last 15s >= 3x the stock's own
                      normal pace for a window that length
-   2. VELOCITY       |% price change| over that same 30s >= 0.15%, sign
+   2. VELOCITY       |% price change| over that same 15s >= 0.10%, sign
                      picks the side (up -> CE, down -> PE)
 
   Both are raw tick-stream measurements — no smoothing, no waiting for a
@@ -111,7 +111,7 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
   Then, once the option leg's first tick arrives (option gates):
    6. PREMIUM     ltp within [prem_min, prem_max]
    7. SPREAD      (ask-bid) <= max(max_spread_pct x ltp, max_spread_abs)
-   8. DEPTH       ask_qty >= depth_mult x our quantity
+   8. DEPTH       ask_qty >= depth_mult (2x) x our quantity
    9. VOLUME/OI   day volume >= min_opt_volume_lots x lot, oi >= min_oi
   10. FEASIBILITY points needed for target_rs_min <= feas_mult x expected
                   option ATR (stock ATR x ~0.5 ATM delta)
@@ -196,9 +196,9 @@ CFG = {
     "avoid_hours":     (),             # e.g. (10,) to re-enable the block
 
     # ── SIGNAL: real-time volume surge (leading, tick-level) ─────────────────
-    "surge_window_sec":     30,
+    "surge_window_sec":     15,   # was 30 (2026-09-03): shrunk to catch moves earlier
     "surge_mult":          3.0,   # window volume vs the stock's normal pace
-    "min_roc_pct":        0.15,   # % price move across the window; sign picks side
+    "min_roc_pct":        0.10,   # was 0.15 (2026-09-03): catch smaller moves earlier
     "confirm_mode":  "one_confirm",  # "immediate" | "one_confirm"
     "confirm_window_sec":   20,
     "surge_cooldown_sec":  180,   # one entry per surge, per stock
@@ -223,7 +223,7 @@ CFG = {
     "prem_max":            400.0,
     "max_spread_pct":      0.015,   # 1.5% of premium
     "max_spread_abs":      1.00,    # ...or this many points, whichever larger
-    "depth_mult":          3.0,     # ask_qty must be this x our qty
+    "depth_mult":          2.0,     # was 3.0 (2026-09-03): loosened, was blocking many valid surges
     "min_opt_volume_lots": 200,     # day volume, in lots
     "min_oi":              50000,   # contracts
 
