@@ -211,7 +211,7 @@ CFG = {
     "min_bars":         5,
     "breakout_lookback": 5,
     "vol_avg_bars":     20,
-    "atr_bars":         14,
+    "atr_bars":         4,
 
     # ── option selection ─────────────────────────────────────────────────────
     "atm_offset_steps": 0,      # 0 = ATM. 1 = one step OTM (cheaper, lower delta)
