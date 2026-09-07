@@ -197,7 +197,7 @@ CFG = {
 
     # ── SIGNAL: real-time volume surge (leading, tick-level) ─────────────────
     "surge_window_sec":     15,   # was 30 (2026-09-03): shrunk to catch moves earlier
-    "surge_mult":          3.0,   # window volume vs the stock's normal pace
+    "surge_mult":          2.0,   # window volume vs the stock's normal pace
     "min_roc_pct":        0.10,   # was 0.15 (2026-09-03): catch smaller moves earlier
     "confirm_mode":  "one_confirm",  # "immediate" | "one_confirm"
     "confirm_window_sec":   20,
