@@ -229,14 +229,14 @@ CFG = {
 
     # ── sizing / targets (rupees) ────────────────────────────────────────────
     "lots":              1,         # always 1 lot
-    "target_rs_min":     500.0,     # PROTECT level — stop moves up, trade continues
+    "target_rs_min":     300.0,     # TEST: hard TP level for this 1-day experiment
     "trail_arm_rs":      900.0,     # trail arms here
     "target_rs_max":     5000.0,    # hard cap — never hold past this
     "protect_lock_rs":   150.0,     # profit locked when target_rs_min is reached
     "trail_lock_rs":     400.0,     # minimum profit locked once the trail arms
     "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
     "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
-    "book_at_base_target": False,   # True = old behaviour (hard exit at Rs 500)
+    "book_at_base_target": True,    # TEST: hard exit at the base target (Rs 300)
     "max_loss_rs":       1200.0,    # HARD ceiling on risk, in rupees
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
@@ -738,24 +738,16 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             block = f"premium={ltp:.2f}"
         elif spread > max(CFG["max_spread_pct"] * ltp, CFG["max_spread_abs"]):
             block = f"spread={spread:.2f}"
-        elif ask_qty and ask_qty < CFG["depth_mult"] * qty:
-            block = f"ask_qty={ask_qty}<{CFG['depth_mult'] * qty:.0f}"
+        # TEST: ask-quantity/depth gate disabled for the 1-day experiment.
         elif volume and volume < CFG["min_opt_volume_lots"] * lot:
             block = f"opt_volume={volume}"
         elif oi and oi < CFG["min_oi"]:
             block = f"oi={oi}"
 
-        # ── feasibility: can this contract reach Rs target_rs_min at all? ────
-        # The whole point of the strategy. target_pts is what the premium must
-        # move for the minimum rupee target; if that exceeds what the option
-        # typically moves in a bar or two, the trade is dead on arrival
-        # regardless of how good the stock signal was.
+        # TEST: feasibility gate disabled for the 1-day experiment.
+
+        # Target movement is informational only during this 1-day test.
         target_pts = CFG["target_rs_min"] / qty + rt_pts
-        if block is None and target_pts > CFG["feas_mult"] * p["opt_atr"]:
-            block = (
-                f"infeasible: need {target_pts:.2f}pts for Rs{CFG['target_rs_min']:.0f} "
-                f"(qty={qty}), option ATR≈{p['opt_atr']:.2f}"
-            )
 
         # ── SL sizing and the cost-ratio guard ───────────────────────────────
         # FIX: the old code did `sl_pts = max(sl_pts, min_sl_pts)` with a 2.0
