@@ -200,8 +200,8 @@ CFG = {
     "surge_mult":          2.0,   # window volume vs the stock's normal pace
     "min_roc_pct":        0.10,   # was 0.15 (2026-09-03): catch smaller moves earlier
     "confirm_mode":  "one_confirm",  # "immediate" | "one_confirm"
-    "confirm_window_sec":   20,
-    "surge_cooldown_sec":  180,   # one entry per surge, per stock
+    "confirm_window_sec":   15,
+    "surge_cooldown_sec":  120,   # one entry per surge, per stock
 
     "require_breakout":  False,   # optional structural filters — OFF: they add lag
     "require_vwap_align": False,
@@ -241,7 +241,7 @@ CFG = {
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
-    "min_sl_to_cost_ratio": 3.0,    # SL must be >= 3x the round-trip cost
+    "min_sl_to_cost_ratio": 0.0,    # SL must be >= 3x the round-trip cost
 
     # ── position book ────────────────────────────────────────────────────────
     # PAPER DATA COLLECTION: every count-based trade blocker is off. Same
