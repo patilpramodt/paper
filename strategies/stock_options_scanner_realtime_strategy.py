@@ -219,8 +219,8 @@ CFG = {
     "opt_tick_wait_s":  20,     # how long to wait for the leg's first tick
 
     # ── option liquidity gates ───────────────────────────────────────────────
-    "prem_min":            15.0,
-    "prem_max":            400.0,
+    "prem_min":            5.0,
+    "prem_max":            40000.0,
     "max_spread_pct":      0.015,   # 1.5% of premium
     "max_spread_abs":      1.00,    # ...or this many points, whichever larger
     "depth_mult":          2.0,     # was 3.0 (2026-09-03): loosened, was blocking many valid surges
