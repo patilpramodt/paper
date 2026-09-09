@@ -241,7 +241,7 @@ CFG = {
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
-    "min_sl_to_cost_ratio": 0.0,    # SL must be >= 3x the round-trip cost
+    "min_sl_to_cost_ratio": 1.0,    # SL must be >= 3x the round-trip cost
 
     # ── position book ────────────────────────────────────────────────────────
     # PAPER DATA COLLECTION: every count-based trade blocker is off. Same
