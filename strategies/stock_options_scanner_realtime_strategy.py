@@ -237,8 +237,8 @@ CFG = {
     "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
     "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
     "book_at_base_target": True,    # TEST: hard exit at the base target (Rs 300)
-    "max_loss_rs":       1200.0,    # HARD ceiling on risk, in rupees
-    "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
+    "max_loss_rs":       10000.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
+    "sl_atr_mult":       0.90,      # unused for now — sl_pts is hardcoded to the flat cap below, see _try_fill_pending
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
     "min_sl_to_cost_ratio": 1.0,    # SL must be >= 3x the round-trip cost
@@ -759,7 +759,10 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         # The money cap is now absolute. If the room it allows is too tight to
         # survive the round-trip cost, the TRADE IS REJECTED rather than the
         # stop being widened past the cap.
-        sl_pts   = min(CFG["max_loss_rs"] / qty, CFG["sl_atr_mult"] * p["opt_atr"])
+        # TEST (entry-quality isolation): ATR term dropped — SL is now purely
+        # the flat money cap, uniform in rupees across every stock in the
+        # universe regardless of that stock's option volatility.
+        sl_pts   = CFG["max_loss_rs"] / qty
         required = max(CFG["min_sl_pts"], CFG["min_sl_to_cost_ratio"] * rt_pts)
         if block is None and sl_pts < required:
             block = (
@@ -1094,4 +1097,3 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
         log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'=' * 50}\n")
-
