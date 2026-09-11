@@ -4,23 +4,32 @@ eod_report_rt.py — STOCK_OPT_SCANNER_RT end-of-day report.
 
 Outputs:
   - stdout: per-trade detail (full diagnostics for SL_HIT only) +
-    SL_HIT premature-vs-genuine summary + indicator effectiveness.
+    TP entry-to-target drawdown summary + SL_HIT premature-vs-genuine
+    summary + indicator effectiveness + a 60-second time-stop
+    simulation + a max_loss_rs=2000 SL-recalculation simulation.
   - logs/<date>/eod_diagnostics_<date>.csv: one row per trade, every field.
-  - logs/indicator_effectiveness_log.csv: APPENDS one row per indicator
-    per day, in the stable logs/ folder (NOT the dated subfolder) —
-    this is the cross-day record of whether an indicator's win-rate
-    split is real or one-day noise, so it must persist across runs.
+  - logs/indicator_effectiveness_log.csv: cross-day indicator tracking,
+    stable non-dated location.
 
-Indicator effectiveness methodology: for each indicator, split today's
-trades into "cut" (would be rejected by the rule) vs "kept", then
-compare win rates. RSI and Bollinger %B use fixed, conventional
-overbought/oversold thresholds. EMA gap has no such convention, so
-it's calibrated to today's own quartile spread instead — see the
-"rule" text per indicator in the output.
+Time-stop simulation: applies to ALL trades. Walk 1-min candles from
+entry to entry+60s: target if reached, else force-exit at the close
+of the candle covering the 60s mark. FIRST-CANDLE FIX applied: the
+candle containing entry_time usually starts before entry_time, so
+its HIGH/LOW can reflect a pre-entry price — only that candle's
+CLOSE is used for threshold checks; every later candle uses HIGH/LOW
+normally, since those are fully post-entry.
+
+Max-loss simulation: applies to ALL trades. Recomputes today's SL at
+a hypothetical max_loss_rs (flat sl_pts = max_loss_rs/qty, same
+formula the strategy itself currently uses), walking candles from
+entry to session close (15:15). Same first-candle fix as above. When
+a single 1-min candle touches BOTH the SL and target level, SL is
+assumed to trigger first — OHLC data can't disambiguate order within
+a bar, so this is the conservative assumption (doesn't let the
+simulation look better than reality by resolving ties in its favor).
 
 Kite's historical API caps at 1-minute bars — this reflects 1-min
-underlying price action, not the tick-level view the live strategy
-actually used. Screening signal, not a live replay.
+price action, not tick-level. Screening signal, not a live replay.
 
 Run from repo root (~/paper). Reuses token.json — does not log in.
 """
@@ -29,7 +38,7 @@ import json
 import os
 import time as time_mod
 from collections import defaultdict
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 
 import pandas as pd
 
@@ -48,6 +57,8 @@ WIN_REASONS = {"TARGET", "TRAIL_HIT", "MAX_TARGET"}
 LOSS_REASONS = {"SL_HIT"}
 MARKET_OPEN = dtime(9, 15)
 BB_PERIOD, BB_STD = 20, 2.0
+TIME_STOP_SEC = 60  # 1-min bar floor — 50s isn't distinguishable from 60s at this resolution
+SIM_MAX_LOSS_RS = 2000.0  # hypothetical flat SL cap to test
 
 
 def load_today_trades(csv_file=CSV_FILE, target_date=None):
@@ -137,6 +148,127 @@ def check_counterfactual(kite, nfo_map, trade):
     return result
 
 
+def win_trade_drawdown(kite, nfo_map, trade):
+    token = nfo_map.get(trade["symbol"])
+    if token is None:
+        return {"checked": False, "note": "instrument_token not found"}
+    if trade["exit_time"] <= trade["entry_time"]:
+        return {"checked": False, "note": "exit at/before entry timestamp"}
+    try:
+        candles = kite.historical_data(token, trade["entry_time"], trade["exit_time"], "minute")
+    except Exception as e:
+        return {"checked": False, "note": f"historical_data failed: {e}"}
+    if not candles:
+        return {"checked": False, "note": "no candles for entry-to-exit window"}
+
+    qty, entry = trade["qty"], trade["entry_price"]
+    lowest_low = candles[0]["low"]
+    lowest_low_time = candles[0]["date"]
+    for c in candles:
+        if c["low"] < lowest_low:
+            lowest_low = c["low"]
+            lowest_low_time = c["date"]
+    worst_unreal = (lowest_low - entry) * qty - fixed_costs_rs(qty, entry, lowest_low)
+    time_to_tp_sec = int((trade["exit_time"] - trade["entry_time"]).total_seconds())
+
+    return {
+        "checked": True,
+        "entry_to_tp_low": round(lowest_low, 2),
+        "entry_to_tp_low_time": lowest_low_time,
+        "entry_to_tp_worst_unreal_rs": round(worst_unreal, 0),
+        "time_to_tp_sec": time_to_tp_sec,
+    }
+
+
+def simulate_time_stop_trade(kite, nfo_map, trade, time_stop_sec=TIME_STOP_SEC):
+    token = nfo_map.get(trade["symbol"])
+    if token is None:
+        return {"checked": False, "note": "instrument_token not found"}
+
+    time_stop_mark = trade["entry_time"] + timedelta(seconds=time_stop_sec)
+    window_end = time_stop_mark + timedelta(minutes=2)
+    try:
+        candles = kite.historical_data(token, trade["entry_time"], window_end, "minute")
+    except Exception as e:
+        return {"checked": False, "note": f"historical_data failed: {e}"}
+    if not candles:
+        return {"checked": False, "note": "no candles for entry window"}
+
+    qty, entry = trade["qty"], trade["entry_price"]
+    target_rs = RT_CFG["target_rs_min"]
+
+    tp_hit_price = None
+    time_stop_close = candles[0]["close"]
+    for i, c in enumerate(candles):
+        c_date = c["date"].replace(tzinfo=None) if c["date"].tzinfo else c["date"]
+        if c_date > time_stop_mark:
+            break
+        time_stop_close = c["close"]
+        check_price = c["close"] if i == 0 else c["high"]
+        unreal = (check_price - entry) * qty - fixed_costs_rs(qty, entry, check_price)
+        if tp_hit_price is None and unreal >= target_rs:
+            tp_hit_price = check_price
+
+    if tp_hit_price is not None:
+        sim_pnl = (tp_hit_price - entry) * qty - fixed_costs_rs(qty, entry, tp_hit_price)
+        return {"checked": True, "sim_reason": "TARGET",
+                "sim_exit_price": round(tp_hit_price, 2), "sim_pnl": round(sim_pnl, 0)}
+    sim_pnl = (time_stop_close - entry) * qty - fixed_costs_rs(qty, entry, time_stop_close)
+    return {"checked": True, "sim_reason": f"TIME_STOP_{time_stop_sec}S",
+            "sim_exit_price": round(time_stop_close, 2), "sim_pnl": round(sim_pnl, 0)}
+
+
+def simulate_max_loss_trade(kite, nfo_map, trade, max_loss_rs=SIM_MAX_LOSS_RS):
+    token = nfo_map.get(trade["symbol"])
+    if token is None:
+        return {"checked": False, "note": "instrument_token not found"}
+    close_time = RT_CFG["close_time"]
+    to_dt = datetime.combine(trade["entry_time"].date(), close_time)
+    if to_dt <= trade["entry_time"]:
+        return {"checked": False, "note": "entry at/after session close"}
+    try:
+        candles = kite.historical_data(token, trade["entry_time"], to_dt, "minute")
+    except Exception as e:
+        return {"checked": False, "note": f"historical_data failed: {e}"}
+    if not candles:
+        return {"checked": False, "note": "no candles for entry-to-close window"}
+
+    qty, entry = trade["qty"], trade["entry_price"]
+    target_rs = RT_CFG["target_rs_min"]
+    sl_pts = max_loss_rs / qty
+    sl_price = entry - sl_pts
+
+    last_close, last_date = candles[0]["close"], candles[0]["date"]
+    for i, c in enumerate(candles):
+        last_close, last_date = c["close"], c["date"]
+        if i == 0:
+            # first candle may start before entry — only close is safely post-entry
+            price = c["close"]
+            if price <= sl_price:
+                pnl = (price - entry) * qty - fixed_costs_rs(qty, entry, price)
+                return {"checked": True, "sim_reason": "SL_HIT", "sim_exit_price": round(price, 2),
+                        "sim_exit_time": c["date"], "sim_pnl": round(pnl, 0)}
+            unreal = (price - entry) * qty - fixed_costs_rs(qty, entry, price)
+            if unreal >= target_rs:
+                return {"checked": True, "sim_reason": "TARGET", "sim_exit_price": round(price, 2),
+                        "sim_exit_time": c["date"], "sim_pnl": round(unreal, 0)}
+            continue
+        # SL checked first when a bar touches both — conservative tie-break,
+        # OHLC alone can't say which happened first within the same minute
+        if c["low"] <= sl_price:
+            pnl = (sl_price - entry) * qty - fixed_costs_rs(qty, entry, sl_price)
+            return {"checked": True, "sim_reason": "SL_HIT", "sim_exit_price": round(sl_price, 2),
+                    "sim_exit_time": c["date"], "sim_pnl": round(pnl, 0)}
+        unreal_high = (c["high"] - entry) * qty - fixed_costs_rs(qty, entry, c["high"])
+        if unreal_high >= target_rs:
+            return {"checked": True, "sim_reason": "TARGET", "sim_exit_price": round(c["high"], 2),
+                    "sim_exit_time": c["date"], "sim_pnl": round(unreal_high, 0)}
+
+    pnl = (last_close - entry) * qty - fixed_costs_rs(qty, entry, last_close)
+    return {"checked": True, "sim_reason": "EOD", "sim_exit_price": round(last_close, 2),
+            "sim_exit_time": last_date, "sim_pnl": round(pnl, 0)}
+
+
 def load_entry_signal(stock, entry_time, signals_csv=SIGNALS_CSV):
     try:
         f = open(signals_csv, newline="")
@@ -199,6 +331,41 @@ def entry_diagnostics(candles):
     }
 
 
+def print_time_stop_simulation(trades, time_stop_sims, time_stop_sec=TIME_STOP_SEC):
+    checked = [(t, time_stop_sims.get(t["order_id"])) for t in trades]
+    checked = [(t, s) for t, s in checked if s and s["checked"]]
+    print(f"\n=== Simulation A: exit at TP, or force-exit at {time_stop_sec}s otherwise (applies to ALL trades) ===")
+    print(f"{'Symbol':<20}{'Entry':<9}{'SimReason':<18}{'SimPnL':>8}{'OrigReason':<12}{'OrigPnL':>9}")
+    print("-" * 78)
+    for t, s in checked:
+        print(f"{t['symbol']:<20}{t['entry_time'].strftime('%H:%M:%S'):<9}{s['sim_reason']:<18}"
+              f"{s['sim_pnl']:>8.0f}{t['reason']:<12}{t['pnl']:>9.0f}")
+    sim_total = sum(s["sim_pnl"] for _, s in checked)
+    orig_total = sum(t["pnl"] for t, _ in checked)
+    print("-" * 78)
+    print(f"{'TOTAL':<47}{sim_total:>8.0f}{'':<12}{orig_total:>9.0f}")
+    print(f"Actual: Rs{orig_total:.0f}   Simulated: Rs{sim_total:.0f}   Difference: Rs{sim_total - orig_total:+.0f}")
+
+
+def print_max_loss_simulation(trades, max_loss_sims, max_loss_rs=SIM_MAX_LOSS_RS):
+    checked = [(t, max_loss_sims.get(t["order_id"])) for t in trades]
+    checked = [(t, s) for t, s in checked if s and s["checked"]]
+    print(f"\n=== Simulation B: SL recalculated at max_loss_rs=Rs{max_loss_rs:.0f} (flat cap, applies to ALL trades) ===")
+    print("(When one candle touches both SL and target, SL is assumed to trigger first — conservative tie-break.)")
+    print(f"{'Symbol':<20}{'Entry':<9}{'SimReason':<10}{'SimPnL':>8}{'OrigReason':<12}{'OrigPnL':>9}")
+    print("-" * 70)
+    for t, s in checked:
+        print(f"{t['symbol']:<20}{t['entry_time'].strftime('%H:%M:%S'):<9}{s['sim_reason']:<10}"
+              f"{s['sim_pnl']:>8.0f}{t['reason']:<12}{t['pnl']:>9.0f}")
+    sim_total = sum(s["sim_pnl"] for _, s in checked)
+    orig_total = sum(t["pnl"] for t, _ in checked)
+    sl_count = sum(1 for _, s in checked if s["sim_reason"] == "SL_HIT")
+    print("-" * 70)
+    print(f"{'TOTAL':<41}{sim_total:>8.0f}{'':<12}{orig_total:>9.0f}")
+    print(f"{sl_count}/{len(checked)} trades would SL_HIT under Rs{max_loss_rs:.0f}. "
+          f"Actual: Rs{orig_total:.0f}   Simulated: Rs{sim_total:.0f}   Difference: Rs{sim_total - orig_total:+.0f}")
+
+
 def print_report(trades, counterfactuals, diagnostics, entry_signals):
     if not trades:
         print("No completed STOCK_OPT_SCANNER_RT trades today.")
@@ -240,6 +407,26 @@ def print_report(trades, counterfactuals, diagnostics, entry_signals):
     total = sum(t["pnl"] for t in trades)
     print("-" * 62)
     print(f"{'TOTAL':<51}{total:>7.0f}")
+
+
+def print_win_drawdowns(win_trades, win_drawdowns):
+    checked = [(t, win_drawdowns.get(t["order_id"])) for t in win_trades]
+    checked = [(t, d) for t, d in checked if d and d["checked"]]
+    print(f"\n=== TP trades: entry-to-target drawdown & time-to-TP (n={len(checked)}/{len(win_trades)} checked) ===")
+    if not checked:
+        print("  no checked win trades")
+        return
+    for t, d in checked:
+        mins, secs = divmod(d["time_to_tp_sec"], 60)
+        print(f"  {t['symbol']:<22} entry {t['entry_time'].strftime('%H:%M:%S')}  "
+              f"time_to_tp={mins}m{secs}s  low={d['entry_to_tp_low']} at "
+              f"{d['entry_to_tp_low_time'].strftime('%H:%M:%S')}  worst_unreal=Rs{d['entry_to_tp_worst_unreal_rs']:.0f}  "
+              f"final_pnl=Rs{t['pnl']:.0f}")
+    times = [d["time_to_tp_sec"] for _, d in checked]
+    worst = [d["entry_to_tp_worst_unreal_rs"] for _, d in checked]
+    avg_min, avg_sec = divmod(round(sum(times) / len(times)), 60)
+    print(f"  avg time_to_tp={avg_min}m{avg_sec}s   avg worst_unreal=Rs{sum(worst)/len(worst):.0f}   "
+          f"never dipped negative: {sum(1 for w in worst if w >= 0)}/{len(worst)}")
 
 
 def sl_hit_breakdown(stop_trades, counterfactuals, diagnostics):
@@ -374,12 +561,16 @@ def print_indicator_effectiveness(results):
         print(f"    Avg value — winners: {r['avg_value_winners']}  losers: {r['avg_value_losers']}")
 
 
-def write_report_csv(trades, counterfactuals, diagnostics, entry_signals, out_path):
+def write_report_csv(trades, counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims,
+                      diagnostics, entry_signals, out_path):
     fields = [
         "symbol", "stock", "entry_time", "exit_time", "entry_price", "exit_price",
         "reason", "pnl", "qty",
         "tp_checked", "would_have_hit_target", "tp_hit_time", "tp_hit_price",
         "lowest_point", "lowest_point_time", "worst_unreal_rs", "target_rs",
+        "win_entry_to_tp_low", "win_entry_to_tp_low_time", "win_entry_to_tp_worst_unreal_rs", "time_to_tp_sec",
+        "sim_time_stop_reason", "sim_time_stop_exit_price", "sim_time_stop_pnl",
+        "sim_max_loss_reason", "sim_max_loss_exit_price", "sim_max_loss_pnl",
         "live_roc", "live_vol_ratio", "live_vwap", "live_close",
         "rsi", "stoch_k", "stoch_d", "stoch_overbought", "stoch_oversold",
         "pct_b", "bb_extreme", "ema_gap_pct",
@@ -409,6 +600,22 @@ def write_report_csv(trades, counterfactuals, diagnostics, entry_signals, out_pa
                     if cf["would_have_hit_target"]:
                         row["tp_hit_time"] = cf["tp_hit_time"].strftime("%H:%M:%S")
                         row["tp_hit_price"] = cf["tp_hit_price"]
+            wd = win_drawdowns.get(t["order_id"])
+            if wd and wd["checked"]:
+                row["win_entry_to_tp_low"] = wd["entry_to_tp_low"]
+                row["win_entry_to_tp_low_time"] = wd["entry_to_tp_low_time"].strftime("%H:%M:%S")
+                row["win_entry_to_tp_worst_unreal_rs"] = wd["entry_to_tp_worst_unreal_rs"]
+                row["time_to_tp_sec"] = wd["time_to_tp_sec"]
+            ts = time_stop_sims.get(t["order_id"])
+            if ts and ts["checked"]:
+                row["sim_time_stop_reason"] = ts["sim_reason"]
+                row["sim_time_stop_exit_price"] = ts["sim_exit_price"]
+                row["sim_time_stop_pnl"] = ts["sim_pnl"]
+            ml = max_loss_sims.get(t["order_id"])
+            if ml and ml["checked"]:
+                row["sim_max_loss_reason"] = ml["sim_reason"]
+                row["sim_max_loss_exit_price"] = ml["sim_exit_price"]
+                row["sim_max_loss_pnl"] = ml["sim_pnl"]
             sig = entry_signals.get(t["order_id"])
             if sig:
                 row["live_roc"] = sig.get("roc", "")
@@ -443,8 +650,10 @@ def append_study_log(effectiveness, run_date, log_path=STUDY_LOG_CSV):
 if __name__ == "__main__":
     trades = load_today_trades()
     stop_trades = [t for t in trades if t["reason"] in STOP_REASONS]
+    win_trades = [t for t in trades if t["reason"] in WIN_REASONS]
 
-    counterfactuals, diagnostics, entry_signals = {}, {}, {}
+    counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims = {}, {}, {}, {}
+    diagnostics, entry_signals = {}, {}
     if trades:
         kite = load_kite()
         nfo_map = build_token_map(kite, "NFO")
@@ -454,6 +663,18 @@ if __name__ == "__main__":
             counterfactuals[t["order_id"]] = check_counterfactual(kite, nfo_map, t)
             time_mod.sleep(0.35)
 
+        for t in win_trades:
+            win_drawdowns[t["order_id"]] = win_trade_drawdown(kite, nfo_map, t)
+            time_mod.sleep(0.35)
+
+        for t in trades:
+            time_stop_sims[t["order_id"]] = simulate_time_stop_trade(kite, nfo_map, t)
+            time_mod.sleep(0.35)
+
+        for t in trades:
+            max_loss_sims[t["order_id"]] = simulate_max_loss_trade(kite, nfo_map, t)
+            time_mod.sleep(0.35)
+
         for t in trades:
             entry_signals[t["order_id"]] = load_entry_signal(t["stock"], t["entry_time"])
             candles = fetch_underlying_candles(kite, nse_map, t["stock"], t["entry_time"].date(), t["entry_time"])
@@ -461,13 +682,16 @@ if __name__ == "__main__":
             diagnostics[t["order_id"]] = entry_diagnostics(candles)
 
     print_report(trades, counterfactuals, diagnostics, entry_signals)
+    print_win_drawdowns(win_trades, win_drawdowns)
     sl_rows = sl_hit_breakdown(stop_trades, counterfactuals, diagnostics)
     print_sl_breakdown(sl_rows)
     effectiveness = indicator_effectiveness(trades, diagnostics)
     print_indicator_effectiveness(effectiveness)
+    print_time_stop_simulation(trades, time_stop_sims)
+    print_max_loss_simulation(trades, max_loss_sims)
 
     today_str = str(date.today())
     dated_dir = os.path.join(LOGS_DIR, today_str)
-    write_report_csv(trades, counterfactuals, diagnostics, entry_signals,
-                      os.path.join(dated_dir, f"eod_diagnostics_{today_str}.csv"))
+    write_report_csv(trades, counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims,
+                      diagnostics, entry_signals, os.path.join(dated_dir, f"eod_diagnostics_{today_str}.csv"))
     append_study_log(effectiveness, today_str)
