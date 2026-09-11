@@ -100,7 +100,9 @@ cat /root/paper/config_secrets.env
 On **new VPS**:
 ```bash
 nano /root/paper/config_secrets.env
-# paste the 5 ZERODHA_* values, save (Ctrl+O, Enter, Ctrl+X)
+# paste the 5 ZERODHA_* values, plus TELEGRAM_BOT_TOKEN and
+# TELEGRAM_CHAT_ID if using the EOD Telegram analysis (Step 14/15
+# below) — save (Ctrl+O, Enter, Ctrl+X)
 chmod 600 /root/paper/config_secrets.env
 ```
 
@@ -239,7 +241,7 @@ grep -n "python3" ml_predictor/run_daily_trackers.sh   # confirm the change
 ```
 
 **Also set the execute bit.** A fresh `git clone` does not preserve/set the execute
-permission reliably across VPS moves, and the crontab entry (Step 12 below) calls
+permission reliably across VPS moves, and the crontab entry (Step 11 below) calls
 this script directly as `./ml_predictor/run_daily_trackers.sh` rather than via
 `bash ml_predictor/run_daily_trackers.sh` — without `+x` it fails silently every day
 with `Permission denied` in `cron.log`, and the ML predictor never actually runs even
@@ -315,6 +317,15 @@ Verify:
 crontab -l
 ```
 
+**Note (added post-migration):** the `35 15 * * 1-5 systemctl stop algo` line
+predates SEBI's Closing Auction Session change (rolled out 2026-08-03), which
+pushed the real derivatives-segment close to 15:41. This cron time still stops
+the process at 15:35, clipping the last ~6 minutes of trading regardless of
+what the bot's own internal `market_close_for()` logic says — a hard
+`systemctl stop` doesn't care about application-level close-time awareness.
+Worth updating to `41 15 * * 1-5` (or later, for buffer) — not yet done as of
+this note, flagged here so it isn't lost.
+
 ---
 
 ## 12. First live day — watch it once
@@ -326,6 +337,128 @@ tail -f /root/paper/trader.log
 ```
 around 9:00–9:15 AM IST to confirm scheduled start behaves the same as the
 manual test in Step 8. After one clean day, trust it fully.
+
+---
+
+## 13. Claude Code — install + headless auth for scheduled jobs
+
+Not part of the original migration — added later to support the EOD
+diagnostic/analysis pipeline (Steps 14–15). Optional if you're not using
+those, but harmless to set up regardless.
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+claude --version
+```
+
+Then run `claude` interactively once to log in (Pro/Max/Team subscription, or
+a Console API-billed account — the free claude.ai tier doesn't include Code
+access). This is a **per-VPS, OAuth-based login** — it does not travel with
+the repo or with `config_secrets.env`. **Must be redone on every new VPS.**
+
+**Verify headless mode works before relying on it in cron** — interactive
+login succeeding doesn't guarantee `-p` (non-interactive) mode authenticates
+the same way; this is a known gotcha with OAuth-based sessions specifically:
+
+```bash
+claude -p "Reply with exactly: HEADLESS OK" --permission-mode auto --permission-prompts none
+```
+
+Expect `HEADLESS OK` printed directly. If this hangs or fails to authenticate
+while interactive `claude` works fine, do not build cron jobs on top of it
+until this specific check passes.
+
+**Note:** official docs also mention a `--bare` flag as the recommended mode
+for scripted/scheduled runs generally — **do not use it here.** `--bare` never
+reads OAuth credentials and requires `ANTHROPIC_API_KEY` instead, which breaks
+a Pro/Max subscription login. Stick with `--permission-mode auto
+--permission-prompts none` as shown above.
+
+---
+
+## 14. Telegram bot for daily delivery
+
+One-time setup, independent of any VPS — do this from a phone/browser, not
+the VPS itself:
+
+1. Telegram → message **@BotFather** → `/newbot` → follow prompts (pick a
+   display name, then a username ending in `bot`) → save the API token it
+   returns.
+2. Message your new bot directly (anything, e.g. `/start`) — Telegram bots
+   can't message you first, so this one-time message unlocks delivery.
+3. Visit `https://api.telegram.org/bot<TOKEN>/getUpdates` (append a throwaway
+   query param like `?x=1` if the browser caches a stale empty result) and
+   read `"chat":{"id":...}` in the response — that number is the chat_id.
+
+Add both to `config_secrets.env` alongside the 5 `ZERODHA_*` values (see
+Step 5) — same file, same `chmod 600`, same "never commit" rule:
+
+```bash
+cat >> /root/paper/config_secrets.env << 'EOF'
+TELEGRAM_BOT_TOKEN=<token>
+TELEGRAM_CHAT_ID=<chat_id>
+EOF
+```
+
+Test delivery independent of any report code:
+```bash
+source /root/paper/config_secrets.env
+curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  -d "chat_id=${TELEGRAM_CHAT_ID}" -d "text=Test from VPS"
+```
+
+**The bot/token/chat_id are NOT tied to any specific VPS.** If migrating,
+just copy these two values into the new `config_secrets.env` along with the
+Zerodha ones — no need to create a new bot.
+
+---
+
+## 15. EOD diagnostic report + Telegram analysis (STOCK_OPT_SCANNER_RT)
+
+`eod_report_rt.py` (in git, comes with the clone) reads today's
+`stock_opt_scanner_rt_trades.csv` / `_signals.csv`, reuses `token.json` (no
+separate login — same access token the live bot generated that morning), and
+for every SL_HIT trade walks post-exit candles to check whether a wider stop
+would have reached target, and how deep the drawdown would have gone first.
+It also runs a whole-day "would this indicator have helped" check for RSI,
+Bollinger %B, and EMA gap — splitting trades into what each would cut vs.
+keep, and comparing win rates.
+
+Outputs:
+- `logs/<date>/eod_diagnostics_<date>.csv` — one row per trade, every field.
+- `logs/indicator_effectiveness_log.csv` — **stable, non-dated location** —
+  appends one row per indicator per day. This is the cross-day trend record;
+  it must NOT live inside a per-day folder or it resets to empty every day
+  and the whole point of tracking indicator effectiveness over time is lost.
+
+Run it manually to confirm before trusting it to cron:
+```bash
+cd /root/paper && /root/paper/venv/bin/python3 eod_report_rt.py
+```
+
+`eod_analysis_prompt.md` (also in git) is the instruction set Claude Code
+reads each day: run the script above, read its output plus the full
+`indicator_effectiveness_log.csv` history for day-over-day trend context,
+write a short narrative analysis (not just restate the numbers), send it to
+Telegram via curl. Test it manually once before cron:
+```bash
+cd /root/paper && claude -p "$(cat eod_analysis_prompt.md)" --permission-mode auto --permission-prompts none
+```
+Check Telegram for the message before moving on.
+
+Add to crontab (`crontab -e`), after the existing `stop algo` line — 16:00
+IST gives a buffer after the 15:35 stop (see the Step 11 note about that time
+possibly needing to move later) and lets Kite's post-close data settle:
+
+```cron
+0 16 * * 1-5 cd /root/paper && /root/.local/bin/claude -p "$(cat eod_analysis_prompt.md)" --permission-mode auto --permission-prompts none >> logs/cron_eod_analysis.log 2>&1
+```
+
+**Uses `/root/.local/bin/claude`, the full path — not plain `claude`.** Same
+reason as the venv-python rule in Step 11: cron's PATH doesn't include
+`~/.local/bin` the way an interactive shell's does, so the bare command name
+won't resolve.
 
 ---
 
@@ -342,6 +475,10 @@ manual test in Step 8. After one clean day, trust it fully.
 - [ ] `run_daily_trackers.sh` internal `python3` call also uses venv path
 - [ ] Fix pushed to GitHub (or at least committed locally) so next migration inherits it
 - [ ] First live cron-triggered day watched manually via `tail -f trader.log`
+- [ ] `.gitignore` actually working: `git check-ignore -v token.json config_secrets.env` prints a match for both
+- [ ] Claude Code installed, logged in, AND headless mode verified (`claude -p "..." --permission-mode auto --permission-prompts none` prints output, doesn't hang) — only if using Steps 13-15
+- [ ] Telegram bot token + chat_id in `config_secrets.env`, test message delivered — only if using Steps 14-15
+- [ ] EOD analysis cron job present in `crontab -l`, uses full path `/root/.local/bin/claude` — only if using Step 15
 
 ---
 
@@ -363,3 +500,4 @@ manual test in Step 8. After one clean day, trust it fully.
 | `/etc/systemd/system/algo.service` | OS-level config, not part of repo |
 | Crontab | Per-machine, not part of repo |
 | venv paths in service file, crontab, and `run_daily_trackers.sh` | Only needed if using a venv instead of system-wide pip install (recommended after the 24.04/Python 3.11 conflict seen here) |
+| Claude Code login (Step 13) | Per-machine OAuth session, not stored in repo or `config_secrets.env` |
