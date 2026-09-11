@@ -237,7 +237,7 @@ CFG = {
     "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
     "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
     "book_at_base_target": True,    # TEST: hard exit at the base target (Rs 300)
-    "max_loss_rs":       10000.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
+    "max_loss_rs":       2100.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
     "sl_atr_mult":       0.90,      # unused for now — sl_pts is hardcoded to the flat cap below, see _try_fill_pending
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
