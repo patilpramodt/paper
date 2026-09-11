@@ -6,7 +6,8 @@ Outputs:
   - stdout: per-trade detail (full diagnostics for SL_HIT only) +
     TP entry-to-target drawdown summary + SL_HIT premature-vs-genuine
     summary + indicator effectiveness + a 60-second time-stop
-    simulation + a max_loss_rs=2000 SL-recalculation simulation.
+    simulation + a max_loss_rs=2000 SL-recalculation simulation +
+    a ratcheting profit-lock trailing-stop simulation.
   - logs/<date>/eod_diagnostics_<date>.csv: one row per trade, every field.
   - logs/indicator_effectiveness_log.csv: cross-day indicator tracking,
     stable non-dated location.
@@ -27,6 +28,18 @@ a single 1-min candle touches BOTH the SL and target level, SL is
 assumed to trigger first — OHLC data can't disambiguate order within
 a bar, so this is the conservative assumption (doesn't let the
 simulation look better than reality by resolving ties in its favor).
+
+Profit-lock simulation: applies to ALL trades. Replaces the fixed
+target with a step trailing stop: each time unrealized profit reaches
+a new rung, the floor rises to that rung's protected value and never
+drops back down, even after a pullback. Before the first rung, the
+floor is the trade's own recorded SL price (trade['sl']) — identical
+downside to what actually happened. Exits the moment price falls to
+the active floor, or at session close (15:15) otherwise. Same
+first-candle fix, and the same conservative tie-break as above: within
+one candle the floor is checked BEFORE it is ratcheted higher, so a
+same-bar rise-then-fall can't "rescue" a stop-out by raising the floor
+ahead of the check.
 
 Kite's historical API caps at 1-minute bars — this reflects 1-min
 price action, not tick-level. Screening signal, not a live replay.
@@ -59,6 +72,15 @@ MARKET_OPEN = dtime(9, 15)
 BB_PERIOD, BB_STD = 20, 2.0
 TIME_STOP_SEC = 60  # 1-min bar floor — 50s isn't distinguishable from 60s at this resolution
 SIM_MAX_LOSS_RS = 2000.0  # hypothetical flat SL cap to test
+
+# Profit-lock ladder: (unrealized_profit_threshold_rs, new_protected_profit_rs).
+# Rung 1 is a special case (locks Rs250 rather than Rs0); from rung 2 onward
+# the protected amount is simply the previous rung's threshold (a one-step
+# trail). Matches the specified table exactly for the first 6 rungs and
+# extends the same "protected = previous threshold" rule beyond Rs1,800.
+PROFIT_LOCK_STEP_RS = 300.0
+PROFIT_LOCK_FIRST_RS = 250.0
+PROFIT_LOCK_LEVELS = 30  # rungs generated; last rung threshold = STEP * LEVELS
 
 
 def load_today_trades(csv_file=CSV_FILE, target_date=None):
@@ -269,6 +291,98 @@ def simulate_max_loss_trade(kite, nfo_map, trade, max_loss_rs=SIM_MAX_LOSS_RS):
             "sim_exit_time": last_date, "sim_pnl": round(pnl, 0)}
 
 
+def build_profit_lock_ladder(step=PROFIT_LOCK_STEP_RS, first_lock=PROFIT_LOCK_FIRST_RS,
+                              n_levels=PROFIT_LOCK_LEVELS):
+    ladder = []
+    for n in range(1, n_levels + 1):
+        threshold = step * n
+        protected = first_lock if n == 1 else step * (n - 1)
+        ladder.append((threshold, protected))
+    return ladder
+
+
+PROFIT_LOCK_LADDER = build_profit_lock_ladder()
+
+
+def simulate_trailing_lock_trade(kite, nfo_map, trade, ladder=PROFIT_LOCK_LADDER):
+    """
+    Simulation C: ratcheting profit-lock trailing stop, applies to ALL trades.
+
+    Replaces the fixed target with the profit-lock ladder above. Before any
+    rung is reached, the floor is the trade's own recorded SL (trade['sl'])
+    — identical downside to what actually happened. Each rung reached
+    raises the floor to that rung's protected profit; the floor never
+    drops back down, and a lower rung already passed is never re-applied.
+    Exits the instant price falls to the active floor, or at session
+    close (15:15) if never triggered — there is no fixed take-profit; the
+    ladder is the only thing that caps the exit.
+
+    Conservative tie-break: within a single candle the floor is checked
+    BEFORE it's ratcheted up, so a same-bar rise-then-fall can't "rescue"
+    a stop-out by raising the floor ahead of the check. Same first-candle
+    handling as the other simulations (the candle containing entry_time
+    can start before entry_time, so only its close is used — folded into
+    the loop below by setting hi=lo=close for i==0, rather than a separate
+    branch).
+    """
+    token = nfo_map.get(trade["symbol"])
+    if token is None:
+        return {"checked": False, "note": "instrument_token not found"}
+    close_time = RT_CFG["close_time"]
+    to_dt = datetime.combine(trade["entry_time"].date(), close_time)
+    if to_dt <= trade["entry_time"]:
+        return {"checked": False, "note": "entry at/after session close"}
+    try:
+        candles = kite.historical_data(token, trade["entry_time"], to_dt, "minute")
+    except Exception as e:
+        return {"checked": False, "note": f"historical_data failed: {e}"}
+    if not candles:
+        return {"checked": False, "note": "no candles for entry-to-close window"}
+
+    qty, entry = trade["qty"], trade["entry_price"]
+    orig_sl_price = trade["sl"]
+    # rs -> price levels; costs excluded from the level check itself (same
+    # convention as sl_price in simulate_max_loss_trade), applied only when
+    # the final pnl is computed
+    price_ladder = [(entry + thr / qty, entry + prot / qty) for thr, prot in ladder]
+
+    active_floor_price = orig_sl_price
+    active_locked_rs = None  # still on the original SL until the first rung hits
+    highest_rung_hit = -1
+
+    last_close, last_date = candles[0]["close"], candles[0]["date"]
+    for i, c in enumerate(candles):
+        last_close, last_date = c["close"], c["date"]
+        if i == 0:
+            hi = lo = c["close"]
+        else:
+            hi, lo = c["high"], c["low"]
+
+        # 1) check the floor as it stood BEFORE this candle's high is considered
+        if lo <= active_floor_price:
+            exit_price = active_floor_price
+            pnl = (exit_price - entry) * qty - fixed_costs_rs(qty, entry, exit_price)
+            reason = "TRAIL_LOCK_HIT" if active_locked_rs is not None else "SL_HIT"
+            return {"checked": True, "sim_reason": reason, "sim_exit_price": round(exit_price, 2),
+                    "sim_exit_time": c["date"], "sim_pnl": round(pnl, 0),
+                    "sim_locked_rs": active_locked_rs}
+
+        # 2) ratchet the floor up using the best price this candle reached,
+        #    for use on the NEXT candle's check
+        for idx in range(highest_rung_hit + 1, len(price_ladder)):
+            thr_price, prot_price = price_ladder[idx]
+            if hi >= thr_price:
+                highest_rung_hit = idx
+                active_floor_price = prot_price
+                active_locked_rs = ladder[idx][1]
+            else:
+                break
+
+    pnl = (last_close - entry) * qty - fixed_costs_rs(qty, entry, last_close)
+    return {"checked": True, "sim_reason": "EOD", "sim_exit_price": round(last_close, 2),
+            "sim_exit_time": last_date, "sim_pnl": round(pnl, 0), "sim_locked_rs": active_locked_rs}
+
+
 def load_entry_signal(stock, entry_time, signals_csv=SIGNALS_CSV):
     try:
         f = open(signals_csv, newline="")
@@ -363,6 +477,28 @@ def print_max_loss_simulation(trades, max_loss_sims, max_loss_rs=SIM_MAX_LOSS_RS
     print("-" * 70)
     print(f"{'TOTAL':<41}{sim_total:>8.0f}{'':<12}{orig_total:>9.0f}")
     print(f"{sl_count}/{len(checked)} trades would SL_HIT under Rs{max_loss_rs:.0f}. "
+          f"Actual: Rs{orig_total:.0f}   Simulated: Rs{sim_total:.0f}   Difference: Rs{sim_total - orig_total:+.0f}")
+
+
+def print_trailing_lock_simulation(trades, trail_sims, ladder=PROFIT_LOCK_LADDER):
+    checked = [(t, trail_sims.get(t["order_id"])) for t in trades]
+    checked = [(t, s) for t, s in checked if s and s["checked"]]
+    top = ladder[0]
+    print(f"\n=== Simulation C: ratcheting profit-lock trail (first rung Rs{top[0]:.0f}->Rs{top[1]:.0f}, "
+          f"then +Rs{PROFIT_LOCK_STEP_RS:.0f}/rung, floor only moves up; applies to ALL trades) ===")
+    print("(Floor is checked before it's ratcheted up each candle — conservative tie-break, same as Simulation B.)")
+    print(f"{'Symbol':<20}{'Entry':<9}{'SimReason':<16}{'Locked':>8}{'SimPnL':>8}{'OrigReason':<12}{'OrigPnL':>9}")
+    print("-" * 86)
+    for t, s in checked:
+        locked = f"{s['sim_locked_rs']:.0f}" if s["sim_locked_rs"] is not None else "-"
+        print(f"{t['symbol']:<20}{t['entry_time'].strftime('%H:%M:%S'):<9}{s['sim_reason']:<16}"
+              f"{locked:>8}{s['sim_pnl']:>8.0f}{t['reason']:<12}{t['pnl']:>9.0f}")
+    sim_total = sum(s["sim_pnl"] for _, s in checked)
+    orig_total = sum(t["pnl"] for t, _ in checked)
+    locked_count = sum(1 for _, s in checked if s["sim_locked_rs"] is not None)
+    print("-" * 86)
+    print(f"{'TOTAL':<53}{sim_total:>8.0f}{'':<12}{orig_total:>9.0f}")
+    print(f"{locked_count}/{len(checked)} trades reached at least one lock rung. "
           f"Actual: Rs{orig_total:.0f}   Simulated: Rs{sim_total:.0f}   Difference: Rs{sim_total - orig_total:+.0f}")
 
 
@@ -562,7 +698,7 @@ def print_indicator_effectiveness(results):
 
 
 def write_report_csv(trades, counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims,
-                      diagnostics, entry_signals, out_path):
+                      trailing_lock_sims, diagnostics, entry_signals, out_path):
     fields = [
         "symbol", "stock", "entry_time", "exit_time", "entry_price", "exit_price",
         "reason", "pnl", "qty",
@@ -571,6 +707,7 @@ def write_report_csv(trades, counterfactuals, win_drawdowns, time_stop_sims, max
         "win_entry_to_tp_low", "win_entry_to_tp_low_time", "win_entry_to_tp_worst_unreal_rs", "time_to_tp_sec",
         "sim_time_stop_reason", "sim_time_stop_exit_price", "sim_time_stop_pnl",
         "sim_max_loss_reason", "sim_max_loss_exit_price", "sim_max_loss_pnl",
+        "sim_trail_lock_reason", "sim_trail_lock_exit_price", "sim_trail_lock_pnl", "sim_trail_lock_locked_rs",
         "live_roc", "live_vol_ratio", "live_vwap", "live_close",
         "rsi", "stoch_k", "stoch_d", "stoch_overbought", "stoch_oversold",
         "pct_b", "bb_extreme", "ema_gap_pct",
@@ -616,6 +753,12 @@ def write_report_csv(trades, counterfactuals, win_drawdowns, time_stop_sims, max
                 row["sim_max_loss_reason"] = ml["sim_reason"]
                 row["sim_max_loss_exit_price"] = ml["sim_exit_price"]
                 row["sim_max_loss_pnl"] = ml["sim_pnl"]
+            tl = trailing_lock_sims.get(t["order_id"])
+            if tl and tl["checked"]:
+                row["sim_trail_lock_reason"] = tl["sim_reason"]
+                row["sim_trail_lock_exit_price"] = tl["sim_exit_price"]
+                row["sim_trail_lock_pnl"] = tl["sim_pnl"]
+                row["sim_trail_lock_locked_rs"] = tl["sim_locked_rs"] if tl["sim_locked_rs"] is not None else ""
             sig = entry_signals.get(t["order_id"])
             if sig:
                 row["live_roc"] = sig.get("roc", "")
@@ -652,7 +795,7 @@ if __name__ == "__main__":
     stop_trades = [t for t in trades if t["reason"] in STOP_REASONS]
     win_trades = [t for t in trades if t["reason"] in WIN_REASONS]
 
-    counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims = {}, {}, {}, {}
+    counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims, trailing_lock_sims = {}, {}, {}, {}, {}
     diagnostics, entry_signals = {}, {}
     if trades:
         kite = load_kite()
@@ -676,6 +819,10 @@ if __name__ == "__main__":
             time_mod.sleep(0.35)
 
         for t in trades:
+            trailing_lock_sims[t["order_id"]] = simulate_trailing_lock_trade(kite, nfo_map, t)
+            time_mod.sleep(0.35)
+
+        for t in trades:
             entry_signals[t["order_id"]] = load_entry_signal(t["stock"], t["entry_time"])
             candles = fetch_underlying_candles(kite, nse_map, t["stock"], t["entry_time"].date(), t["entry_time"])
             time_mod.sleep(0.35)
@@ -689,9 +836,11 @@ if __name__ == "__main__":
     print_indicator_effectiveness(effectiveness)
     print_time_stop_simulation(trades, time_stop_sims)
     print_max_loss_simulation(trades, max_loss_sims)
+    print_trailing_lock_simulation(trades, trailing_lock_sims)
 
     today_str = str(date.today())
     dated_dir = os.path.join(LOGS_DIR, today_str)
     write_report_csv(trades, counterfactuals, win_drawdowns, time_stop_sims, max_loss_sims,
-                      diagnostics, entry_signals, os.path.join(dated_dir, f"eod_diagnostics_{today_str}.csv"))
+                      trailing_lock_sims, diagnostics, entry_signals,
+                      os.path.join(dated_dir, f"eod_diagnostics_{today_str}.csv"))
     append_study_log(effectiveness, today_str)
