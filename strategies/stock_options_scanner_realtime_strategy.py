@@ -122,16 +122,23 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
 ═══════════════════════════════════════════════════════════════════════════
   Evaluated HIGHEST FIRST on every option tick AND on the heartbeat sweep:
 
-   MAX_TARGET   unrealised >= target_rs_max (5000) — hard exit
-   SL_HIT       price <= stop, trail not yet armed
-   TRAIL_HIT    price <= stop, trail armed
-   (ratchet)    trail armed -> stop follows peak by trail_atr_mult x opt ATR
-   (arm)        unrealised >= trail_arm_rs (900) -> arm trail, lock 400
-   (protect)    unrealised >= target_rs_min (500) -> raise stop, KEEP RUNNING
-   EOD          force square-off at close_time
+   MAX_TARGET      unrealised >= target_rs_max (5000) — hard exit
+   SL_HIT          price <= floor, no rung locked yet
+   TRAIL_LOCK_HIT  price <= floor, at least one rung locked
+   (lock rung)     every target_rs_min (300) of unrealised profit raises the
+                   floor to the PREVIOUS rung's value; first rung locks
+                   protect_lock_rs (250) instead of 0. Floor only moves up,
+                   never re-applies a lower rung. There is no fixed
+                   take-profit — the ladder is the only thing that caps the
+                   exit before target_rs_max.
+   EOD             force square-off at close_time
 
-  Rs 500 does NOT close the trade. Set book_at_base_target=True for the old
-  hard-exit-at-500 behaviour.
+  2026-09-15: replaced the old two-stage lock (protect at target_rs_min,
+  arm an ATR trail at trail_arm_rs) with this ratcheting ladder — validated
+  against a day of logged trades via the EOD report's Simulation C first
+  (86/105 trades reached a rung; simulated swing vs the flat exit was
+  roughly +19.7k on that one day). trail_arm_rs / trail_lock_rs /
+  trail_atr_mult / min_trail_pts / book_at_base_target are no longer read.
 
   There is no time stop and no trade-count limit: max_open_positions,
   max_trades_per_stock, max_trades_day and time_stop_min are all None, so
@@ -229,14 +236,14 @@ CFG = {
 
     # ── sizing / targets (rupees) ────────────────────────────────────────────
     "lots":              1,         # always 1 lot
-    "target_rs_min":     300.0,     # TEST: hard TP level for this 1-day experiment
-    "trail_arm_rs":      900.0,     # trail arms here
+    "target_rs_min":     300.0,     # ladder rung spacing (rungs at 300, 600, 900, ...)
+    "trail_arm_rs":      900.0,     # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "target_rs_max":     5000.0,    # hard cap — never hold past this
-    "protect_lock_rs":   150.0,     # profit locked when target_rs_min is reached
-    "trail_lock_rs":     400.0,     # minimum profit locked once the trail arms
-    "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
-    "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
-    "book_at_base_target": True,    # TEST: hard exit at the base target (Rs 300)
+    "protect_lock_rs":   250.0,     # first ladder rung's locked profit (rung>=2 locks the previous rung instead)
+    "trail_lock_rs":     400.0,     # UNUSED — superseded by the 300-ladder below (2026-09-15)
+    "trail_atr_mult":    0.50,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
+    "min_trail_pts":     0.30,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
+    "book_at_base_target": False,   # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "max_loss_rs":       2100.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
     "sl_atr_mult":       0.90,      # unused for now — sl_pts is hardcoded to the flat cap below, see _try_fill_pending
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
@@ -799,6 +806,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             "order_id": order_id, "sl": round(fill - sl_pts, 2),
             "sl_pts": sl_pts, "rt_pts": rt_pts, "spread": spread,
             "peak": fill, "trail_armed": False, "protected": False,
+            "locked_rs": None,
             "opt_atr": p["opt_atr"],
             # ATR-based trail distance, fixed at entry. FIX: the old trail was
             # a flat Rs 700 converted to points at runtime, which made the
@@ -841,24 +849,26 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         """
         Exit ladder. Called from option ticks AND from the heartbeat sweep.
 
-        ORDER MATTERS — this is the bug that was fixed here. The old version
-        checked the Rs 500 base target LAST but the Rs 900 trail-arm BEFORE
-        it, in a chain of early returns. A trade climbing normally
-        (400 → 500 → 600 → 900) hit the Rs 500 exit at step 5 and was closed
-        long before it could ever reach step 3. The trail only armed if a
-        SINGLE tick jumped from under 500 to over 900. So the runner
-        mechanism the design describes was effectively dead: every winner was
-        a Rs 500 winner, and the Rs 5,000 cap was unreachable.
+        ORDER MATTERS — this is the bug that was fixed here originally. The
+        old version checked the Rs 500 base target LAST but the Rs 900
+        trail-arm BEFORE it, in a chain of early returns. A trade climbing
+        normally (400 → 500 → 600 → 900) hit the Rs 500 exit at step 5 and
+        was closed long before it could ever reach step 3. So the runner
+        mechanism the design describes was effectively dead: every winner
+        was a Rs 500 winner, and the Rs 5,000 cap was unreachable. The floor
+        is still always checked BEFORE it's raised, for the same reason.
 
-        Now the ladder is evaluated HIGHEST FIRST, and Rs 500 no longer closes
-        the trade — it moves the stop up and lets the trade continue:
+        2026-09-15: the two-stage lock (protect at target_rs_min, arm an ATR
+        trail at trail_arm_rs) was replaced with a ratcheting Rs-300
+        profit-lock ladder — see CFG comments. Every rung reached raises the
+        floor to the PREVIOUS rung's value and never re-applies a lower one:
 
             >= target_rs_max (5000)  -> hard exit
-            price <= stop            -> exit (SL_HIT or TRAIL_HIT)
-            trail armed              -> ratchet the ATR trail
-            >= trail_arm_rs (900)    -> arm trail, lock trail_lock_rs
-            >= target_rs_min (500)   -> lock protect_lock_rs, keep running
-                                        (or hard-exit if book_at_base_target)
+            price <= floor           -> exit (SL_HIT, or TRAIL_LOCK_HIT once
+                                         a rung has been locked)
+            every target_rs_min (300) of unrealised profit -> floor rises to
+                                         the previous rung (first rung locks
+                                         protect_lock_rs)
         """
         tr  = self._positions[tok]
         qty = tr["qty"]
@@ -874,15 +884,15 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             self._exit(tok, "MAX_TARGET", ts, ltp)
             return
 
-        # ── 2. stop loss — evaluated even on a stale print ───────────────────
+        # ── 2. floor — evaluated even on a stale print ───────────────────────
         # A leg that has stopped trading is exactly when the stop matters
         # most. Skipping this on staleness is what left positions unstopped.
         if ltp <= tr["sl"]:
-            self._exit(tok, "TRAIL_HIT" if tr["trail_armed"] else "SL_HIT", ts, ltp)
+            self._exit(tok, "TRAIL_LOCK_HIT" if tr["locked_rs"] else "SL_HIT", ts, ltp)
             return
 
         # Everything below is a PROFIT decision, and those should not be made
-        # on an old print — a stale high would ratchet the trail to a level
+        # on an old print — a stale high would ratchet the floor to a level
         # the market has already left.
         if stale:
             return
@@ -890,42 +900,24 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         if ltp > tr["peak"]:
             tr["peak"] = ltp
 
-        # ── 3. ratchet the ATR trail ─────────────────────────────────────────
-        if tr["trail_armed"]:
-            new_sl = round(tr["peak"] - tr["trail_pts"], 2)
-            if new_sl > tr["sl"]:
-                tr["sl"] = new_sl
-            return
-
-        # ── 4. arm the trail ─────────────────────────────────────────────────
-        if unreal >= CFG["trail_arm_rs"]:
-            tr["trail_armed"] = True
-            lock   = round(tr["entry"] + CFG["trail_lock_rs"] / qty, 2)
-            trail  = round(tr["peak"] - tr["trail_pts"], 2)
-            tr["sl"] = max(lock, trail, tr["sl"])
-            log.info(
-                f"[{self.name}] {tr['opt_symbol']} TRAIL ARMED at Rs{unreal:.0f} — "
-                f"stop {tr['sl']:.2f}, trailing {tr['trail_pts']:.2f}pts behind peak"
-            )
-            return
-
-        # ── 5. protect level — move the stop up, do NOT close the trade ──────
-        if unreal >= CFG["target_rs_min"]:
-            if CFG["book_at_base_target"]:
-                self._exit(tok, "TARGET", ts, ltp)
-                return
-            if not tr["protected"]:
-                tr["protected"] = True
-                # The lock must clear the round-trip cost, otherwise
-                # "locked profit" is a loss once the exit is paid for.
-                lock_pts = max(CFG["protect_lock_rs"] / qty, tr["rt_pts"] * 1.10)
-                new_sl   = round(tr["entry"] + lock_pts, 2)
+        # ── 3. ratcheting profit-lock ladder ──────────────────────────────────
+        # Every target_rs_min (300) of unrealised profit raises the floor to
+        # the PREVIOUS rung's value; the first rung locks protect_lock_rs
+        # (250) instead of 0. Floor only moves up, never re-applies a lower
+        # rung — same conservative check-before-raise order as step 2 above.
+        step  = CFG["target_rs_min"]
+        first = CFG["protect_lock_rs"]
+        rung  = int(unreal // step)
+        if rung >= 1:
+            locked = first if rung == 1 else step * (rung - 1)
+            if tr["locked_rs"] is None or locked > tr["locked_rs"]:
+                new_sl = round(tr["entry"] + locked / qty, 2)
                 if new_sl > tr["sl"]:
                     tr["sl"] = new_sl
+                tr["locked_rs"] = locked
                 log.info(
-                    f"[{self.name}] {tr['opt_symbol']} PROTECT at Rs{unreal:.0f} — "
-                    f"stop raised to {tr['sl']:.2f} (locks ~Rs{lock_pts * qty:.0f}), "
-                    f"trade continues toward Rs{CFG['trail_arm_rs']:.0f}"
+                    f"[{self.name}] {tr['opt_symbol']} LOCK Rs{locked:.0f} at "
+                    f"unreal Rs{unreal:.0f} — stop raised to {tr['sl']:.2f}"
                 )
 
     def _exit(self, tok: int, reason: str, ts: datetime, ltp: float = None):
@@ -1097,3 +1089,4 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         log.info(f"[{self.name}] Cost drag      : {gross - self._today_pnl:.0f}")
         log.info(f"[{self.name}] NET PnL        : {self._today_pnl:.0f}")
         log.info(f"[{self.name}] {'=' * 50}\n")
+
