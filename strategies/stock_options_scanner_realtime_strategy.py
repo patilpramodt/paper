@@ -125,12 +125,16 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
    MAX_TARGET      unrealised >= target_rs_max (5000) — hard exit
    SL_HIT          price <= floor, no rung locked yet
    TRAIL_LOCK_HIT  price <= floor, at least one rung locked
-   (lock rung)     every target_rs_min (300) of unrealised profit raises the
-                   floor to the PREVIOUS rung's value; first rung locks
-                   protect_lock_rs (250) instead of 0. Floor only moves up,
-                   never re-applies a lower rung. There is no fixed
-                   take-profit — the ladder is the only thing that caps the
-                   exit before target_rs_max.
+   (lock rung)     no rung locks below target_rs_min (300) any more. First
+                   rung needs first_lock_trigger_rs (400) of unrealised
+                   profit and locks protect_lock_rs (300); second rung
+                   (unreal >= 600) locks second_lock_rs (400); every rung
+                   from the third on (unreal >= 900, stepping by
+                   target_rs_min) raises the floor to the PREVIOUS rung's
+                   trigger value. Floor only moves up, never re-applies a
+                   lower rung. There is no fixed take-profit — the ladder is
+                   the only thing that caps the exit before target_rs_max.
+                   (2026-09-16: removed the old below-300 first rung.)
    EOD             force square-off at close_time
 
   2026-09-15: replaced the old two-stage lock (protect at target_rs_min,
@@ -236,10 +240,12 @@ CFG = {
 
     # ── sizing / targets (rupees) ────────────────────────────────────────────
     "lots":              1,         # always 1 lot
-    "target_rs_min":     300.0,     # ladder rung spacing (rungs at 300, 600, 900, ...)
+    "target_rs_min":     300.0,     # ladder rung spacing from the 3rd rung on (rungs at 900, 1200, 1500, ...)
     "trail_arm_rs":      900.0,     # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "target_rs_max":     5000.0,    # hard cap — never hold past this
-    "protect_lock_rs":   250.0,     # first ladder rung's locked profit (rung>=2 locks the previous rung instead)
+    "first_lock_trigger_rs": 400.0, # unrealised profit needed before the FIRST rung locks anything (2026-09-16: no lock below target_rs_min any more)
+    "protect_lock_rs":   300.0,     # first rung's locked profit = target_rs_min, never less (2026-09-16: was 250)
+    "second_lock_rs":    400.0,     # second rung (unreal >= 600) locks this instead of target_rs_min (2026-09-16, new); rung>=3 unchanged, locks the previous rung's trigger
     "trail_lock_rs":     400.0,     # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "trail_atr_mult":    0.50,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "min_trail_pts":     0.30,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
@@ -869,6 +875,14 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             every target_rs_min (300) of unrealised profit -> floor rises to
                                          the previous rung (first rung locks
                                          protect_lock_rs)
+
+        2026-09-16: removed the old below-300 first rung (used to lock
+        protect_lock_rs=250 as soon as unreal crossed 300). No rung locks
+        below target_rs_min (300) any more: first rung now needs
+        first_lock_trigger_rs (400) and locks protect_lock_rs (300); second
+        rung (unreal >= 600) locks second_lock_rs (400); third rung on
+        (unreal >= 900) is unchanged — locks the previous rung's trigger,
+        stepping by target_rs_min (300).
         """
         tr  = self._positions[tok]
         qty = tr["qty"]
@@ -901,24 +915,33 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             tr["peak"] = ltp
 
         # ── 3. ratcheting profit-lock ladder ──────────────────────────────────
-        # Every target_rs_min (300) of unrealised profit raises the floor to
-        # the PREVIOUS rung's value; the first rung locks protect_lock_rs
-        # (250) instead of 0. Floor only moves up, never re-applies a lower
-        # rung — same conservative check-before-raise order as step 2 above.
-        step  = CFG["target_rs_min"]
-        first = CFG["protect_lock_rs"]
-        rung  = int(unreal // step)
-        if rung >= 1:
-            locked = first if rung == 1 else step * (rung - 1)
-            if tr["locked_rs"] is None or locked > tr["locked_rs"]:
-                new_sl = round(tr["entry"] + locked / qty, 2)
-                if new_sl > tr["sl"]:
-                    tr["sl"] = new_sl
-                tr["locked_rs"] = locked
-                log.info(
-                    f"[{self.name}] {tr['opt_symbol']} LOCK Rs{locked:.0f} at "
-                    f"unreal Rs{unreal:.0f} — stop raised to {tr['sl']:.2f}"
-                )
+        # 2026-09-16: no rung locks below target_rs_min (300) any more.
+        # First rung needs first_lock_trigger_rs (400) of unrealised profit
+        # and locks protect_lock_rs (300, not 250); second rung
+        # (unreal >= 600) locks second_lock_rs (400). From the third rung on
+        # (unreal >= 900) it's unchanged: every further target_rs_min (300)
+        # raises the floor to the PREVIOUS rung's trigger value. Floor only
+        # moves up, never re-applies a lower rung — same conservative
+        # check-before-raise order as step 2 above.
+        step   = CFG["target_rs_min"]
+        rung   = int(unreal // step)
+        locked = None
+        if rung == 1:
+            if unreal >= CFG["first_lock_trigger_rs"]:
+                locked = CFG["protect_lock_rs"]
+        elif rung == 2:
+            locked = CFG["second_lock_rs"]
+        elif rung >= 3:
+            locked = step * (rung - 1)
+        if locked is not None and (tr["locked_rs"] is None or locked > tr["locked_rs"]):
+            new_sl = round(tr["entry"] + locked / qty, 2)
+            if new_sl > tr["sl"]:
+                tr["sl"] = new_sl
+            tr["locked_rs"] = locked
+            log.info(
+                f"[{self.name}] {tr['opt_symbol']} LOCK Rs{locked:.0f} at "
+                f"unreal Rs{unreal:.0f} — stop raised to {tr['sl']:.2f}"
+            )
 
     def _exit(self, tok: int, reason: str, ts: datetime, ltp: float = None):
         tr = self._positions.get(tok)
