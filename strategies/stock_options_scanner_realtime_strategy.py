@@ -243,14 +243,14 @@ CFG = {
     "target_rs_min":     300.0,     # ladder rung spacing from the 3rd rung on (rungs at 900, 1200, 1500, ...)
     "trail_arm_rs":      900.0,     # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "target_rs_max":     5000.0,    # hard cap — never hold past this
-    "first_lock_trigger_rs": 400.0, # unrealised profit needed before the FIRST rung locks anything (2026-09-16: no lock below target_rs_min any more)
+    "first_lock_trigger_rs": 350.0, # unrealised profit needed before the FIRST rung locks anything (2026-09-16: no lock below target_rs_min any more)
     "protect_lock_rs":   300.0,     # first rung's locked profit = target_rs_min, never less (2026-09-16: was 250)
     "second_lock_rs":    400.0,     # second rung (unreal >= 600) locks this instead of target_rs_min (2026-09-16, new); rung>=3 unchanged, locks the previous rung's trigger
     "trail_lock_rs":     400.0,     # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "trail_atr_mult":    0.50,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "min_trail_pts":     0.30,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "book_at_base_target": False,   # UNUSED — superseded by the 300-ladder below (2026-09-15)
-    "max_loss_rs":       2100.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
+    "max_loss_rs":       1900.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
     "sl_atr_mult":       0.90,      # unused for now — sl_pts is hardcoded to the flat cap below, see _try_fill_pending
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
