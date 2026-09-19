@@ -210,7 +210,7 @@ CFG = {
     "trail_lock_rs":     400.0,     # minimum profit locked once the trail arms
     "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
     "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
-    "book_at_base_target": true,   # True = old behaviour (hard exit at Rs 500)
+    "book_at_base_target": True,   # True = old behaviour (hard exit at Rs 500)
     "max_loss_rs":       1200.0,    # HARD ceiling on risk, in rupees
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
