@@ -210,7 +210,7 @@ CFG = {
     "surge_window_sec":     15,   # was 30 (2026-09-03): shrunk to catch moves earlier
     "surge_mult":          2.0,   # window volume vs the stock's normal pace
     "min_roc_pct":        0.10,   # was 0.15 (2026-09-03): catch smaller moves earlier
-    "confirm_mode":  "one_confirm",  # "immediate" | "one_confirm"
+    "confirm_mode":  "immediate",  # "immediate" | "one_confirm" (was "one_confirm")
     "confirm_window_sec":   15,
     "surge_cooldown_sec":  120,   # one entry per surge, per stock
 
