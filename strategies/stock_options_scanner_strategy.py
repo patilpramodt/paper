@@ -193,8 +193,8 @@ CFG = {
     "opt_tick_wait_s":  20,     # how long to wait for the leg's first tick
 
     # ── option liquidity gates ───────────────────────────────────────────────
-    "prem_min":            15.0,
-    "prem_max":            400.0,
+    "prem_min":            5.0,
+    "prem_max":            40000.0,
     "max_spread_pct":      0.015,   # 1.5% of premium
     "max_spread_abs":      1.00,    # ...or this many points, whichever larger
     "depth_mult":          3.0,     # ask_qty must be this x our qty
@@ -203,19 +203,19 @@ CFG = {
 
     # ── sizing / targets (rupees) ────────────────────────────────────────────
     "lots":              1,         # always 1 lot
-    "target_rs_min":     500.0,     # PROTECT level — stop moves up, trade continues
+    "target_rs_min":     300.0,     # PROTECT level — stop moves up, trade continues
     "trail_arm_rs":      900.0,     # trail arms here
     "target_rs_max":     5000.0,    # hard cap — never hold past this
     "protect_lock_rs":   150.0,     # profit locked when target_rs_min is reached
     "trail_lock_rs":     400.0,     # minimum profit locked once the trail arms
     "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
     "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
-    "book_at_base_target": False,   # True = old behaviour (hard exit at Rs 500)
+    "book_at_base_target": true,   # True = old behaviour (hard exit at Rs 500)
     "max_loss_rs":       1200.0,    # HARD ceiling on risk, in rupees
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
-    "min_sl_to_cost_ratio": 3.0,    # SL must be >= 3x the round-trip cost
+    "min_sl_to_cost_ratio": 0.0,    # SL must be >= 3x the round-trip cost
 
     # ── position book ────────────────────────────────────────────────────────
     # PAPER DATA COLLECTION: every count-based trade blocker is off. Same
