@@ -747,7 +747,7 @@ class StockOptionsScannerStrategy(BaseStrategy):
 
     def _drop_pending(self, tok: int):
         self._pending.pop(tok, None)
-        self._hub.clear_token_owner(tok)
+        self._hub.clear_token_owner(tok, self.name)
         self.unsubscribe_option(tok)
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -900,7 +900,7 @@ class StockOptionsScannerStrategy(BaseStrategy):
         self._positions.pop(tok, None)
 
         # Release the token — the refcount leak that FIX D fixed elsewhere.
-        self._hub.clear_token_owner(tok)
+        self._hub.clear_token_owner(tok, self.name)
         self.unsubscribe_option(tok)
 
         log.info(
