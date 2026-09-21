@@ -206,14 +206,24 @@ class MarketHub:
         self._last_volume  : dict[int, int]      = {}
         self._last_depth   : dict[int, dict]     = {}
 
-        # Token → owning strategy name. When a token has an owner, its ticks
-        # are delivered ONLY to that strategy instead of being broadcast to
-        # every registered strategy. Without this, adding ~15 stock underlyings
-        # plus their option legs means all 14+ strategies get an
-        # on_option_tick() call for every stock tick — pure wasted CPU on a
-        # single-core VPS, and every existing strategy would have to learn to
-        # ignore tokens it never asked for.
-        self._token_owner  : dict[int, str]      = {}
+        # Token → set of owning strategy names. When a token has owners, its
+        # ticks are delivered ONLY to those strategies instead of being
+        # broadcast to every registered strategy. Without this, adding ~15
+        # stock underlyings plus their option legs means all 14+ strategies
+        # get an on_option_tick() call for every stock tick — pure wasted CPU
+        # on a single-core VPS, and every existing strategy would have to
+        # learn to ignore tokens it never asked for.
+        #
+        # MULTI-OWNER FIX (2026-09-21): this used to be a single
+        # {token: name} slot. STOCK_OPT_SCANNER, STOCK_OPT_SCANNER_RT and
+        # STOCK_OPT_SCANNER_FLOW all claim the same 14 stock spot tokens in
+        # their own pre_market(), so whichever of the three ran last in
+        # ACTIVE_STRATEGIES silently overwrote the others' ownership —
+        # V1 and then RT went completely silent (zero stock ticks, ever)
+        # as each newer scanner was added, with no error anywhere. A token
+        # can now have multiple owners; every owner in the set is delivered
+        # the tick, and strategies outside the set still never get called.
+        self._token_owner  : dict[int, set[str]] = {}
 
         # Shared infrastructure
         self.index_candles = CandleBuilder(minutes=5)
@@ -418,18 +428,28 @@ class MarketHub:
 
     def set_token_owner(self, token: int, strategy_name: str):
         """
-        Route this token's ticks ONLY to `strategy_name`.
+        Route this token's ticks to `strategy_name`, ADDING it to whichever
+        other strategies already own the token rather than replacing them.
         Call right after subscribe() for private tokens (stock underlyings and
         the option legs the scanner picks up). Shared index-option strikes must
         NOT be owned — other strategies still need them.
         """
         with self._lock:
-            self._token_owner[token] = strategy_name
+            self._token_owner.setdefault(token, set()).add(strategy_name)
 
-    def clear_token_owner(self, token: int):
-        """Remove exclusive routing; ticks go back to the normal broadcast."""
+    def clear_token_owner(self, token: int, strategy_name: str):
+        """
+        Remove `strategy_name`'s routing claim on `token`. Ticks still route
+        to any other owner of this token; only once the last owner is
+        removed does routing fall back to the normal broadcast.
+        """
         with self._lock:
-            self._token_owner.pop(token, None)
+            owners = self._token_owner.get(token)
+            if owners is None:
+                return
+            owners.discard(strategy_name)
+            if not owners:
+                self._token_owner.pop(token, None)
 
     # ── WebSocket callbacks ───────────────────────────────────────────────────
 
@@ -489,17 +509,17 @@ class MarketHub:
                 # Extra index (e.g. Nifty 50) — route only to matching strategies
                 self._handle_extra_index_tick(token, price, now, tick_ts)
             else:
-                # OWNED TOKEN (STOCK_OPT_SCANNER): deliver to the owner only.
-                owner = self._token_owner.get(token)
-                if owner is not None:
+                # OWNED TOKEN (STOCK_OPT_SCANNER family): deliver to every
+                # current owner of this token, and no one else.
+                owners = self._token_owner.get(token)
+                if owners:
                     for strat in self._strategies:
-                        if strat.name != owner:
+                        if strat.name not in owners:
                             continue
                         try:
                             strat.on_option_tick(token, price, now, tick_ts)
                         except Exception as e:
                             log.error(f"[{strat.name}] on_option_tick error: {e}")
-                        break
                     continue
 
                 # Option tick — broadcast to all strategies
