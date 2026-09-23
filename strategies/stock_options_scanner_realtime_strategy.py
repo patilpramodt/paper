@@ -250,7 +250,7 @@ CFG = {
     "trail_atr_mult":    0.50,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "min_trail_pts":     0.30,      # UNUSED — superseded by the 300-ladder below (2026-09-15)
     "book_at_base_target": False,   # UNUSED — superseded by the 300-ladder below (2026-09-15)
-    "max_loss_rs":       1900.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
+    "max_loss_rs":       1000.0,   # TEST (entry-quality isolation): SL effectively off — EOD square-off is the real cap now
     "sl_atr_mult":       0.90,      # unused for now — sl_pts is hardcoded to the flat cap below, see _try_fill_pending
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
