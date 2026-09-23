@@ -273,6 +273,13 @@ CFG = {
 
 LIVE_MODE = False   # see design note 2 — do NOT flip without a multi-slot router
 
+# ── entry-confirmation gate ──────────────────────────────────────────────────
+# A signal no longer arms an entry immediately. Price must first trade
+# beyond the price of the very tick that triggered the surge signal ("last
+# tick high/low"), in the signal's own direction, or the signal is dropped
+# after this many seconds with no entry.
+_CONFIRM_TIMEOUT_S  = 60
+
 
 class _StockState:
     """Per-underlying rolling state built from NSE equity ticks."""
@@ -379,6 +386,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         self._by_sym       = {}                   # sym   -> _StockState
         self._positions    = {}                   # opt_token -> trade dict
         self._pending      = {}                   # opt_token -> pending entry dict
+        self._confirming   = {}                   # stock token -> confirmation-gate dict
         self._completed    = []
         self._today_pnl    = 0.0
         self._trades_today = 0
@@ -483,6 +491,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
                     self._exit(tok, "EOD", ts)
                 self._eod_done = True
             self._pending.clear()
+            self._confirming.clear()
             return
 
         # ── expire stale pending entries ─────────────────────────────────────
@@ -496,6 +505,11 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
                 self._log_signal(ts, p["sym"], "PENDING_TIMEOUT", p["side"],
                                  block="no_option_tick")
                 self._drop_pending(tok)
+
+        # ── expire stale entry-confirmation waits ────────────────────────────
+        for tok in list(self._confirming.keys()):
+            if ts >= self._confirming[tok]["deadline_ts"]:
+                self._confirm_expire(tok, ts)
 
         # ── STOP-LOSS SWEEP (FIX) ────────────────────────────────────────────
         # _manage_position() only runs when the OPTION ticks. Stock options
@@ -544,6 +558,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
     # ── stock spot ticks → 3-minute bars ─────────────────────────────────────
 
     def _on_spot_tick(self, st: _StockState, price: float, ts: datetime, tick_ts: datetime):
+        self._check_confirm(st, price, ts)
         # Volume for the bar comes from the DELTA of the cumulative
         # volume_traded field, not last_traded_quantity. last_traded_quantity
         # is the size of one print and misses everything between two ticks —
@@ -684,8 +699,60 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         if atr is None:
             self._log_signal(ts, st.sym, "NO_ATR", side, block="insufficient_bars")
             return
-        self._arm_entry(st, side, price, atr, ts, meta)
+        self._start_confirm(st, side, price, atr, ts, meta)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # ENTRY — stage 0: confirmation gate (do not enter immediately)
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _start_confirm(self, st: _StockState, side: str, spot: float,
+                        stock_atr: float, ts: datetime, meta: dict):
+        """
+        Signal fired, but the entry is not armed yet. `spot` — the price of
+        the very tick that triggered the surge — is kept as the reference
+        ("last tick high/low"). Price must trade beyond it in the signal's
+        own direction before _arm_entry() is called. If price has not
+        confirmed within _CONFIRM_TIMEOUT_S seconds, the signal is dropped
+        and no trade is taken.
+        """
+        if st.token in self._confirming:
+            return
+        self._confirming[st.token] = {
+            "st": st, "side": side, "spot": spot, "stock_atr": stock_atr,
+            "meta": meta, "ref": spot,
+            "deadline_ts": ts + timedelta(seconds=_CONFIRM_TIMEOUT_S),
+        }
+        log.info(
+            f"[{self.name}] {st.sym} {side} signal @ {spot:.2f} — awaiting "
+            f"confirmation beyond last tick {spot:.2f} (up to {_CONFIRM_TIMEOUT_S}s)"
+        )
+
+    def _check_confirm(self, st: _StockState, price: float, ts: datetime):
+        c = self._confirming.get(st.token)
+        if c is None:
+            return
+        if ts >= c["deadline_ts"]:
+            self._confirm_expire(st.token, ts)
+            return
+        confirmed = (price >= c["ref"]) if c["side"] == "UP" else (price <= c["ref"])
+        if confirmed:
+            self._confirming.pop(st.token, None)
+            log.info(
+                f"[{self.name}] {st.sym} {c['side']} confirmed @ {price:.2f} "
+                f"(ref {c['ref']:.2f})"
+            )
+            self._arm_entry(c["st"], c["side"], price, c["stock_atr"], ts, c["meta"])
+
+    def _confirm_expire(self, tok: int, ts: datetime):
+        c = self._confirming.pop(tok, None)
+        if c is None:
+            return
+        log.info(
+            f"[{self.name}] {c['st'].sym} {c['side']} confirmation timed out "
+            f"({_CONFIRM_TIMEOUT_S}s) — signal dropped, no entry"
+        )
+        self._log_signal(ts, c["st"].sym, "CONFIRM_TIMEOUT", c["side"],
+                         block="no_confirmation", ref=c["ref"])
 
     def _arm_entry(self, st: _StockState, side: str, spot: float,
                    stock_atr: float, ts: datetime, meta: dict):
