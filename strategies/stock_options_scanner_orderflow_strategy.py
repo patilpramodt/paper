@@ -146,7 +146,7 @@ CFG = {
     # ── sizing / exit (rupees, FLAT) ──────────────────────────────────────────
     "lots":        1,
     "target_rs":   300.0,       # hard TP
-    "max_loss_rs": 2000.0,      # hard SL
+    "max_loss_rs": 1000.0,      # hard SL
 
     # ── position book — no trade-count blockers ──────────────────────────────
     "max_open_positions":   None,
