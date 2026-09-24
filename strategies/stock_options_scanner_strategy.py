@@ -211,7 +211,7 @@ CFG = {
     "trail_atr_mult":    0.50,      # trail distance = this x expected option ATR
     "min_trail_pts":     0.30,      # ...never tighter than this, or 2x spread
     "book_at_base_target": True,   # True = old behaviour (hard exit at Rs 500)
-    "max_loss_rs":       1000.0,    # HARD ceiling on risk, in rupees
+    "max_loss_rs":       1900.0,    # HARD ceiling on risk, in rupees
     "sl_atr_mult":       0.90,      # SL as a fraction of expected option ATR
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
@@ -235,12 +235,21 @@ CFG = {
 LIVE_MODE = False   # see design note 2 — do NOT flip without a multi-slot router
 
 # ── entry-confirmation gate ──────────────────────────────────────────────────
-# A signal no longer arms an entry immediately. Price must first trade
-# beyond the reference level set when the signal fired — for this bar-close
-# strategy, the HIGH (UP) / LOW (DOWN) of the very bar that triggered the
-# breakout — in the signal's own direction, or the signal is dropped after
-# this many seconds with no entry.
+# A signal no longer arms an entry immediately. Confirmation is now done on
+# freshly-built _CONFIRM_CANDLE_SEC-second candles (own clock, started the
+# instant the signal fires — not aligned to the wall-clock second grid)
+# rather than on the raw tick stream. Each candle that closes is checked
+# against two conditions together:
+#   1. COLOR   the candle closed the same color as the signal — green
+#              (close > open) for UP, red (close < open) for DOWN
+#   2. LEVEL   the candle's close also cleared the reference level set when
+#              the signal fired — for this bar-close strategy, the HIGH (UP)
+#              / LOW (DOWN) of the very bar that triggered the breakout
+# The first candle to satisfy both confirms the entry. If none does within
+# _CONFIRM_TIMEOUT_S seconds (_CONFIRM_TIMEOUT_S / _CONFIRM_CANDLE_SEC
+# candles), the signal is dropped and no trade is taken.
 _CONFIRM_TIMEOUT_S  = 60
+_CONFIRM_CANDLE_SEC = 5
 
 
 class _StockState:
@@ -606,24 +615,27 @@ class StockOptionsScannerStrategy(BaseStrategy):
     def _start_confirm(self, st: _StockState, side: str, spot: float,
                         stock_atr: float, ts: datetime, meta: dict, ref: float):
         """
-        Signal fired, but the entry is not armed yet. Price must first trade
-        beyond `ref` — the HIGH (UP) or LOW (DOWN) of the very 3-min bar that
-        triggered the breakout — in the signal's own direction, before
-        _arm_entry() is called. If price has not confirmed within
-        _CONFIRM_TIMEOUT_S seconds, the signal is dropped and no trade is
-        taken.
+        Signal fired, but the entry is not armed yet. From this instant,
+        _CONFIRM_CANDLE_SEC-second candles are built off the live tick
+        stream (own clock — bucket 0 starts exactly at `ts`, not the wall-
+        clock second grid). The first such candle that both (a) closes the
+        signal's own color and (b) closes beyond `ref` — the HIGH (UP) or
+        LOW (DOWN) of the very 3-min bar that triggered the breakout — calls
+        _arm_entry(). If none does within _CONFIRM_TIMEOUT_S seconds, the
+        signal is dropped and no trade is taken.
         """
         if st.token in self._confirming:
             return
         self._confirming[st.token] = {
             "st": st, "side": side, "spot": spot, "stock_atr": stock_atr,
-            "meta": meta, "ref": ref,
+            "meta": meta, "ref": ref, "start_ts": ts, "cur5": None,
             "deadline_ts": ts + timedelta(seconds=_CONFIRM_TIMEOUT_S),
         }
         log.info(
             f"[{self.name}] {st.sym} {side} signal @ {spot:.2f} — awaiting "
-            f"confirmation beyond bar {'high' if side == 'UP' else 'low'} "
-            f"{ref:.2f} (up to {_CONFIRM_TIMEOUT_S}s)"
+            f"confirmation via {_CONFIRM_CANDLE_SEC}s candles beyond bar "
+            f"{'high' if side == 'UP' else 'low'} {ref:.2f} "
+            f"(up to {_CONFIRM_TIMEOUT_S}s)"
         )
 
     def _check_confirm(self, st: _StockState, price: float, ts: datetime):
@@ -633,14 +645,51 @@ class StockOptionsScannerStrategy(BaseStrategy):
         if ts >= c["deadline_ts"]:
             self._confirm_expire(st.token, ts)
             return
-        confirmed = (price >= c["ref"]) if c["side"] == "UP" else (price <= c["ref"])
-        if confirmed:
+
+        elapsed = (ts - c["start_ts"]).total_seconds()
+        bucket  = c["start_ts"] + timedelta(
+            seconds=_CONFIRM_CANDLE_SEC * int(elapsed // _CONFIRM_CANDLE_SEC)
+        )
+        cur5 = c["cur5"]
+
+        if cur5 is None:
+            # first tick of this signal's confirmation window — open candle 1
+            c["cur5"] = {"bucket": bucket, "o": price, "h": price, "l": price, "c": price}
+            return
+
+        if bucket == cur5["bucket"]:
+            # still inside the current 5s candle — just update it
+            cur5["h"] = max(cur5["h"], price)
+            cur5["l"] = min(cur5["l"], price)
+            cur5["c"] = price
+            return
+
+        # this tick belongs to a new 5s bucket -> the previous candle just closed
+        if self._confirm_candle_matches(cur5, c["side"], c["ref"]):
             self._confirming.pop(st.token, None)
+            color = "GREEN" if c["side"] == "UP" else "RED"
             log.info(
-                f"[{self.name}] {st.sym} {c['side']} confirmed @ {price:.2f} "
-                f"(ref {c['ref']:.2f})"
+                f"[{self.name}] {st.sym} {c['side']} confirmed — {color} "
+                f"{_CONFIRM_CANDLE_SEC}s candle o={cur5['o']:.2f} h={cur5['h']:.2f} "
+                f"l={cur5['l']:.2f} c={cur5['c']:.2f} cleared ref {c['ref']:.2f}"
             )
-            self._arm_entry(c["st"], c["side"], price, c["stock_atr"], ts, c["meta"])
+            self._arm_entry(c["st"], c["side"], cur5["c"], c["stock_atr"], ts, c["meta"])
+            return
+
+        # candle closed the wrong color / didn't clear ref — open the next one
+        c["cur5"] = {"bucket": bucket, "o": price, "h": price, "l": price, "c": price}
+
+    @staticmethod
+    def _confirm_candle_matches(c5: dict, side: str, ref: float) -> bool:
+        """
+        A _CONFIRM_CANDLE_SEC-second candle confirms the signal only when it
+        is BOTH the signal's own color (green close>open for UP, red
+        close<open for DOWN — a flat close matches neither) AND its close
+        has cleared `ref` in the signal's direction.
+        """
+        if side == "UP":
+            return c5["c"] > c5["o"] and c5["c"] >= ref
+        return c5["c"] < c5["o"] and c5["c"] <= ref
 
     def _confirm_expire(self, tok: int, ts: datetime):
         c = self._confirming.pop(tok, None)
