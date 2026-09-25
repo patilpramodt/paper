@@ -108,6 +108,7 @@ from strategies.banknifty_candle_breakout_v2_strategy  import BankNiftyCandleBre
 from strategies.stock_options_scanner_strategy import StockOptionsScannerStrategy, UNIVERSE as STOCK_UNIVERSE
 from strategies.stock_options_scanner_realtime_strategy import StockOptionsScannerRealtimeStrategy
 from strategies.stock_options_scanner_orderflow_strategy import StockOptionsScannerOrderflowStrategy
+from strategies.stock_opt_morning_breakout_strategy import StockOptMorningBreakoutStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -131,6 +132,7 @@ ACTIVE_STRATEGIES = [
     StockOptionsScannerStrategy,          # Stock Opt Scanner V1:  9:30-14:45  15 stocks, bar-close 3-min thrust entry (PAPER only)
     StockOptionsScannerRealtimeStrategy,  # Stock Opt Scanner RT:  9:30-14:45  same 15 stocks, real-time tick-level volume-surge entry (PAPER only)
     StockOptionsScannerOrderflowStrategy, # Stock Opt Scanner FLOW: 9:30-14:45 same 15 stocks, book+flow imbalance only, flat Rs300 TP / Rs2000 SL (PAPER only)
+    StockOptMorningBreakoutStrategy,      # Stock Opt Morning BO:   9:45-11:30 same 15 stocks, 5-min HOD/LOD break + NIFTY bias + RS, 2/3 ATR spot exits (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -428,8 +430,11 @@ def main():
             # SpikeNiftyStrategy needs Nifty-specific PreMarketData and instruments.
             # All other strategies use the shared BankNifty pm and instruments.
             strat_index = getattr(strat, "INDEX_TOKEN", None)
-            if strat.name in ("STOCK_OPT_SCANNER", "STOCK_OPT_SCANNER_RT", "STOCK_OPT_SCANNER_FLOW"):
-                # All three use the same fixed 15-stock chain. PreMarketData is
+            # Checked BEFORE the INDEX_TOKEN branch: STOCK_OPT_MORNING_BO has
+            # INDEX_TOKEN=256265 (for NIFTY ticks) but needs the stock chain.
+            if strat.name in ("STOCK_OPT_SCANNER", "STOCK_OPT_SCANNER_RT", "STOCK_OPT_SCANNER_FLOW",
+                              "STOCK_OPT_MORNING_BO"):
+                # All use the same fixed 15-stock chain. PreMarketData is
                 # BankNifty-specific and unused by any of them.
                 ok = strat.pre_market(pm, stock_instruments)
             elif strat_index == 256265:
