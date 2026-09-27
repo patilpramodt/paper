@@ -104,8 +104,8 @@ CFG = {
     "lots":            1,
 
     # ── limits ───────────────────────────────────────────────────────────────
-    "max_trades_per_stock": 3,
-    "max_losses_per_stock": 2,
+    "max_trades_per_stock": 3999,
+    "max_losses_per_stock": 42,
     "stale_price_sec":      45,
 
     "csv_file": "stock_opt_morning_bo_trades.csv",
