@@ -153,6 +153,8 @@ CFG = {
     "max_trades_per_stock": None,
     "max_trades_day":       None,
     "stale_price_sec":      45,
+    "t30_check_min":        30,     # at 30 min: negative -> exit, positive -> SL Rs50 below current
+    "t30_sl_rs":            50.0,
 
     # ── output ───────────────────────────────────────────────────────────────
     "csv_file": "stock_opt_scanner_flow_trades.csv",
@@ -645,6 +647,20 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             return
         if stale:
             return
+
+        # ── 30-min check: negative -> exit now; positive -> SL Rs50 below current ──
+        if not tr.get("t30_done") and (ts - tr["entry_ts"]).total_seconds() >= CFG["t30_check_min"] * 60:
+            tr["t30_done"] = True
+            if unreal < 0:
+                self._exit(tok, "T30_EXIT", ts, ltp)
+                return
+            new_sl = round(ltp - CFG["t30_sl_rs"] / qty, 2)
+            if new_sl > tr["sl"]:
+                tr["sl"] = new_sl
+            log.info(
+                f"[{self.name}] {tr['opt_symbol']} 30-MIN CHECK at Rs{unreal:.0f} — "
+                f"stop set to {tr['sl']:.2f}, trade continues"
+            )
 
         # TP — flat, immediate, no ladder
         if unreal >= CFG["target_rs"]:
