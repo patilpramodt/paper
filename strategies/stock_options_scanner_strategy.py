@@ -8,7 +8,7 @@ STOCK_OPT_SCANNER — multi-stock, multi-position option buyer.
 ═══════════════════════════════════════════════════════════════════════════
 
 Every other strategy in this repo trades ONE underlying and holds ONE
-position. This one scans ~15 liquid F&O stocks simultaneously and can hold
+position. This one scans ~23 liquid F&O stocks simultaneously and can hold
 several positions at once, buying an ATM CE or PE on whichever stock shows
 a volume-confirmed directional thrust, and exiting for a rupee-denominated
 profit between CFG["target_rs_min"] and CFG["target_rs_max"].
@@ -21,18 +21,19 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
 1. WHY IT SCANS STOCKS, NOT OPTIONS
    The obvious design is "watch every option and buy the one that moves".
    It is not implementable here:
-     • Kite's WebSocket caps around 3000 tokens per connection. 15 stocks
-       x ~40 listed strikes x 2 types = 1200 tokens for the universe alone,
-       and that is before WsPCR's ~42 index strikes and every other
-       strategy's legs. A 30-stock universe blows the cap outright.
+     • Kite's WebSocket caps around 3000 tokens per connection. 23 stocks
+       x ~40 listed strikes x 2 types = ~1840 tokens for the universe alone
+       if every strike were subscribed, and that is before WsPCR's ~42
+       index strikes and every other strategy's legs. A 40+-stock universe
+       on that design blows the cap outright.
      • The VPS is single-core. Every one of those tokens is a tick storm
        through _on_ticks() and a Python callback per strategy.
      • Option premium is a derived, laggy, noisy view of the underlying.
        Volume "in a direction" is a property OF THE STOCK.
 
-   So: subscribe the 15 NSE equity tokens (15 tokens), decide direction on
+   So: subscribe the 23 NSE equity tokens (23 tokens), decide direction on
    the stock, and only then subscribe the ONE option leg we intend to buy.
-   Peak token usage is 15 + max_open_positions. The option is checked for
+   Peak token usage is 23 + max_open_positions. The option is checked for
    liquidity at entry — which is where a liquidity check actually matters.
 
 2. WHY IT IS PAPER-ONLY (and cannot simply be flipped live)
@@ -152,14 +153,26 @@ def _now_ist() -> datetime:
 
 
 # ── Universe ─────────────────────────────────────────────────────────────────
-# 15 most consistently liquid single-stock option chains on NSE. Chosen for
+# Consistently liquid single-stock option chains on NSE. Chosen for
 # option-chain depth, not for the stock's cash turnover — a heavily traded
 # stock can still have an untradeable option chain. Any name missing from
 # the NFO dump on a given day is dropped by StockOptionStore with a warning.
+# 2026-09-28: added 8 names to widen the STOCK_OPT_MORNING_BO signal pool
+# (this list is shared with STOCK_OPT_SCANNER / _RT / _FLOW too — they pick
+# up the same 8 additional underlyings). Picked for sector spread away from
+# the original list's bank/IT weighting: BHARTIARTL (telecom), SUNPHARMA
+# (pharma), TITAN (consumer), BAJAJFINSV (NBFC/insurance), INDUSINDBK
+# (highest-beta private bank), VEDANTA (mining, distinct driver from the
+# existing steel names), ADANIPORTS (ports/logistics), DLF (real estate,
+# no prior sector exposure). All are established, high-OI F&O names, but
+# unverified against today's actual NFO chain depth — StockOptionStore
+# drops anything too thin with a warning, so a bad pick fails safe.
 UNIVERSE = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
     "TCS", "AXISBANK", "TATAMOTORS", "TATASTEEL", "BAJFINANCE",
     "KOTAKBANK", "HINDALCO", "MARUTI", "LT", "ADANIENT",
+    "BHARTIARTL", "SUNPHARMA", "TITAN", "BAJAJFINSV", "INDUSINDBK",
+    "VEDANTA", "ADANIPORTS", "DLF",
 ]
 
 
