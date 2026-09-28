@@ -480,8 +480,8 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         log.info(
             f"[{self.name}] ready | mode={'LIVE' if LIVE_MODE else 'PAPER'} | "
             f"{len(self._stocks)} underlyings | {CFG['bar_minutes']}-min bars | "
-            f"target Rs {CFG['target_rs_min']:.0f}-{CFG['target_rs_max']:.0f} | "
-            f"max {CFG['max_open_positions']} concurrent"
+            f"entry gate={CFG['gate_mode'] if CFG['require_entry_gate'] else 'OFF'} | "
+            f"exit={CFG['exit_mode']}"
         )
         for sym in universe:
             log.info(
