@@ -305,8 +305,17 @@ def main():
     # If this fails the scanner's pre_market() returns False and the rest of
     # the roster is unaffected.
     stock_instruments = StockOptionStore()
+    # RT and FLOW trade a ROLLED chain: next month's contracts on expiry-eve
+    # and expiry day (min_dte=2). 2026-09-28, the day before Sep expiry, was
+    # RT's worst day per trade (-Rs 437 avg) and the rest of the day-of-expiry
+    # behaviour was never backtested. V1 / MORNING_BO keep the nearest expiry.
+    stock_instruments_rolled = StockOptionStore()
     try:
-        stock_instruments.load(hub.kite, universe=STOCK_UNIVERSE)
+        nfo_raw = hub.kite.instruments("NFO")
+        nse_raw = hub.kite.instruments("NSE")
+        stock_instruments.load(hub.kite, universe=STOCK_UNIVERSE, nfo_raw=nfo_raw, nse_raw=nse_raw)
+        stock_instruments_rolled.load(hub.kite, universe=STOCK_UNIVERSE, nfo_raw=nfo_raw,
+                                      nse_raw=nse_raw, min_dte=2)
     except Exception as e:
         log.error(f"StockOptionStore load failed — STOCK_OPT_SCANNER will skip today: {e}")
 
@@ -432,8 +441,9 @@ def main():
             strat_index = getattr(strat, "INDEX_TOKEN", None)
             # Checked BEFORE the INDEX_TOKEN branch: STOCK_OPT_MORNING_BO has
             # INDEX_TOKEN=256265 (for NIFTY ticks) but needs the stock chain.
-            if strat.name in ("STOCK_OPT_SCANNER", "STOCK_OPT_SCANNER_RT", "STOCK_OPT_SCANNER_FLOW",
-                              "STOCK_OPT_MORNING_BO"):
+            if strat.name in ("STOCK_OPT_SCANNER_RT", "STOCK_OPT_SCANNER_FLOW"):
+                ok = strat.pre_market(pm, stock_instruments_rolled)
+            elif strat.name in ("STOCK_OPT_SCANNER", "STOCK_OPT_MORNING_BO"):
                 # All use the same fixed 15-stock chain. PreMarketData is
                 # BankNifty-specific and unused by any of them.
                 ok = strat.pre_market(pm, stock_instruments)

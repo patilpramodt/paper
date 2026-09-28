@@ -103,6 +103,9 @@ from typing import Optional
 
 from core.base_strategy import BaseStrategy
 from core.costs import effective_spread, fixed_costs_rs, net_pnl_rs
+from core.entry_gate import (
+    SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason,
+)
 
 log = logging.getLogger("strategy.stock_opt_scanner_flow")
 
@@ -139,6 +142,16 @@ CFG = {
     "flow_imbalance_threshold": 0.65,   # (buy_vol-sell_vol)/(buy_vol+sell_vol)
     "min_flow_ticks":            5,     # min classified ticks in-window before trusting flow
 
+    # 2026-09-28: market-context entry gate (core/entry_gate.py, mode
+    # "rs_off_extreme"): RS >= 0.5% vs NIFTY AND price >= 3x ATR14 back from the day's
+    # extreme. On real option candles for all 456 live FLOW trades: 54 kept,
+    # +Rs 58k (vs -Rs 115k actual), both halves positive, 4/6 days.
+    # Set require_entry_gate False to go back to the raw trigger.
+    "require_entry_gate": True,
+    "gate_mode":          "rs_off_extreme",
+    "gate_rs_min_pct":    0.5,  # stock move from open minus NIFTY's, signal direction
+    "gate_ext_min_atr":      3.0,   # price >= this x ATR14 back from day high (UP) / low (DOWN)
+
     # ── option selection ─────────────────────────────────────────────────────
     "atm_offset_steps": 0,      # 0 = ATM
     "opt_tick_wait_s":  20,     # abandon a pending entry if the leg never prints (hygiene only)
@@ -147,6 +160,16 @@ CFG = {
     "lots":        1,
     "target_rs":   300.0,       # hard TP
     "max_loss_rs": 1900.0,      # hard SL
+
+    # ── exit mode ────────────────────────────────────────────────────────────
+    # "spot"  (2026-09-28) SL 2x / TP 3x atr5 on the STOCK price, held to
+    #         target/stop/EOD — see core/entry_gate.py. On the gated FLOW
+    #         trades: +58k vs -5k for the flat TP 300 / SL 1900 below, and
+    #         +49k with the 30-min check, so that check is off. target_rs /
+    #         max_loss_rs / t30 are NOT used in this mode.
+    # "flat"  the previous TP 300 / SL 1900 exit, unchanged.
+    "exit_mode":   "spot",
+    "spot_exit":   dict(SPOT_EXIT_DEFAULTS),
 
     # ── position book — no trade-count blockers ──────────────────────────────
     "max_open_positions":   None,
@@ -209,6 +232,11 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
 
     def __init__(self, market_hub):
         super().__init__(market_hub)
+        self._gate         = EntryGate(market_hub, {
+            "mode":       CFG["gate_mode"],
+            "rs_min_pct": CFG["gate_rs_min_pct"],
+            "ext_min_atr": CFG["gate_ext_min_atr"],
+        })
         self._store        = None                 # StockOptionStore
         self._stocks        = {}                  # token -> _StockState
         self._by_sym        = {}                  # sym   -> _StockState
@@ -268,7 +296,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             f"[{self.name}] ready | mode={'LIVE' if LIVE_MODE else 'PAPER'} | "
             f"{len(self._stocks)} underlyings | book>={CFG['book_imbalance_threshold']:.2f} "
             f"AND flow>={CFG['flow_imbalance_threshold']:.2f} | "
-            f"TP Rs{CFG['target_rs']:.0f} / SL Rs{CFG['max_loss_rs']:.0f} flat"
+            f"entry gate={'ON' if CFG['require_entry_gate'] else 'OFF'} | exit={CFG['exit_mode']}"
         )
         return True
 
@@ -363,6 +391,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
                 st.flow_ticks.append((tick_ts, -dv))    # seller-initiated
             # price unchanged: not classified under the tick rule — dropped
         st.last_price = price
+        self._gate.update(st.sym, price, ts)
 
         self._evaluate(st, price, ts, tick_ts)
 
@@ -423,6 +452,14 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             return
 
         meta = {"book": book, "flow": flow}
+        if CFG["require_entry_gate"]:
+            ok, why, g = self._gate.check(st.sym, side, price, ts)
+            if not ok:
+                # no CSV row — this fires on every skewed tick and the
+                # signals file has no block_reason column
+                log.debug(f"[{self.name}] {st.sym} {side} imbalance blocked by entry gate: {why} {g}")
+                return
+            log.info(f"[{self.name}] {st.sym} {side} entry gate PASSED {g}")
         self._log_signal(ts, st.sym, "IMBALANCE_TRIGGER", side, **meta)
         log.info(
             f"[{self.name}] {st.sym} {side} imbalance @ {price:.2f} "
@@ -562,7 +599,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
         self._pending[tok] = {
             "sym": sym, "side": side, "opt_type": opt_type, "strike": strike,
             "opt_symbol": opt_symbol, "lot": lot, "qty": qty,
-            "ts": ts, "meta": meta,
+            "ts": ts, "meta": meta, "spot": spot,
         }
         self.subscribe_option(tok)
         self._hub.set_token_owner(tok, self.name)
@@ -587,6 +624,18 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
         bid, ask, _, _ = self._hub.best_bid_ask(tok)
         spread = effective_spread(ltp, bid, ask)
 
+        bracket = None
+        if CFG["exit_mode"] == "spot":
+            st_tok = self._by_sym[sym].token
+            spot   = self.get_price(st_tok) or p["spot"]
+            atr5   = self._gate.atr5(sym)
+            if not atr5:
+                log.info(f"[{self.name}] {sym} {p['opt_symbol']} entry BLOCKED — no_atr5")
+                self._drop_pending(tok)
+                return
+            bracket = spot_bracket(p["side"], spot, atr5, CFG["spot_exit"])
+            bracket["spot_token"] = st_tok
+
         res = self._place_buy(p["opt_symbol"], tok, qty, ltp)
         if res is None:
             log.error(f"[{self.name}] {p['opt_symbol']} BUY failed")
@@ -599,7 +648,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
         # makes the simulated fill honest).
         fill = round(raw_fill + spread / 2.0, 2) if not LIVE_MODE else raw_fill
 
-        sl_pts = CFG["max_loss_rs"] / qty
+        sl_pts = (CFG["spot_exit"]["backstop_rs"] if bracket else CFG["max_loss_rs"]) / qty
 
         tr = {
             "token": tok, "sym": sym, "opt_symbol": p["opt_symbol"],
@@ -609,6 +658,8 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             "sl_pts": sl_pts, "spread": spread,
             "entry_book": p["meta"]["book"], "entry_flow": p["meta"]["flow"],
         }
+        if bracket:
+            tr.update(bracket)
         self._positions[tok] = tr
         self._pending.pop(tok, None)
         self._trades_today += 1
@@ -619,6 +670,11 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             f"TP=+Rs{CFG['target_rs']:.0f} | entry_book={tr['entry_book']:+.2f} "
             f"entry_flow={tr['entry_flow']:+.2f} | open={len(self._positions)}"
         )
+        if bracket:
+            log.info(
+                f"[{self.name}] {p['opt_symbol']} spot bracket: entry {bracket['entry_spot']:.2f} "
+                f"SL {bracket['sl_spot']:.2f} TP {bracket['tp_spot']:.2f} (atr5 {bracket['atr5']:.2f})"
+            )
         self._log_trade(ts, tr, "ENTRY", fill, "OPEN", 0.0, 0.0, "")
 
     def _drop_pending(self, tok: int):
@@ -639,6 +695,13 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
 
         exit_px = round(max(0.05, ltp - tr["spread"] / 2.0), 2)
         unreal  = (exit_px - tr["entry"]) * qty - fixed_costs_rs(qty, tr["entry"], exit_px)
+
+        if "sl_spot" in tr:
+            age = (ts - tr["entry_ts"]).total_seconds() / 60.0
+            why = spot_exit_reason(tr, self.get_price(tr["spot_token"]), unreal, age, CFG["spot_exit"])
+            if why:
+                self._exit(tok, why, ts, ltp)
+            return
 
         # SL — checked even on a stale print (same reasoning as V1/RT: a
         # leg that has stopped trading is exactly when the stop matters most)

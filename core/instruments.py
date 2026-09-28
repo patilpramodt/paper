@@ -185,7 +185,7 @@ class StockOptionStore:
 
     # ── loading ───────────────────────────────────────────────────────────────
 
-    def load(self, kite, universe: list[str], nfo_raw=None, nse_raw=None):
+    def load(self, kite, universe: list[str], nfo_raw=None, nse_raw=None, min_dte: int = 0):
         """
         universe : list of underlying names as they appear in the NFO dump
                    ("RELIANCE", "HDFCBANK", ...). Names not present in the
@@ -194,6 +194,9 @@ class StockOptionStore:
                    smaller universe.
         nfo_raw / nse_raw : optional pre-fetched kite.instruments() results,
                    to avoid repeating the (large, rate-limited) download.
+        min_dte  : skip expiries fewer than this many calendar days away and
+                   use the next one (0 = nearest expiry, the old behaviour).
+                   2 rolls to next month on expiry-eve and expiry day.
         """
         want = {u.upper().strip() for u in universe} - _INDEX_ROOTS
 
@@ -217,7 +220,8 @@ class StockOptionStore:
 
         today = _today_ist()
         for sym, g in df.groupby("name"):
-            future = sorted(d for d in g["expiry"].dt.date.unique() if d >= today)
+            future = sorted(d for d in g["expiry"].dt.date.unique()
+                            if (d - today).days >= min_dte)
             if not future:
                 log.warning(f"  {sym}: no future expiry in NFO dump — skipped")
                 continue

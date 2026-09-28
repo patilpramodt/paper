@@ -165,6 +165,9 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from typing import Optional
 
 from core.base_strategy import BaseStrategy
+from core.entry_gate import (
+    SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason,
+)
 from core.costs import (
     effective_spread,
     fixed_costs_rs,
@@ -215,6 +218,15 @@ CFG = {
     "surge_cooldown_sec":  120,   # one entry per surge, per stock
 
     "require_breakout":  False,   # optional structural filters — OFF: they add lag
+    # 2026-09-28: market-context entry gate (core/entry_gate.py, mode
+    # "rs_range"): RS >= 0.1% vs NIFTY AND day range >= 12x ATR14. On real option
+    # candles for all 1201 live RT trades: 485 kept, +Rs 92k (vs -Rs 190k
+    # actual), both halves positive, 8/13 days, 47% of winners kept.
+    # Set require_entry_gate False to go back to the raw trigger.
+    "require_entry_gate": True,
+    "gate_mode":          "rs_range",
+    "gate_rs_min_pct":    0.1,  # stock move from open minus NIFTY's, signal direction
+    "gate_range_min_atr":    12.0,  # day high-low so far >= this x 1-min ATR14
     "require_vwap_align": False,
 
     # ── bar mechanics (still used for the volume baseline / ATR) ─────────────
@@ -255,6 +267,15 @@ CFG = {
     "min_sl_pts":        0.0,       # absolute floor; 0 = let the cost ratio govern
     "feas_mult":         1.20,      # target_pts <= this x expected option ATR
     "min_sl_to_cost_ratio": 0.0,    # SL must be >= 3x the round-trip cost
+
+    # ── exit mode ────────────────────────────────────────────────────────────
+    # "spot"   (2026-09-28) SL 2x / TP 3x atr5 on the STOCK price, held to
+    #          target/stop/EOD — see core/entry_gate.py. No 30-min check: on
+    #          the gated RT trades it cut +92k to +72k. The ladder /
+    #          max_loss_rs / t30 settings below are NOT used in this mode.
+    # "ladder" the previous rupee ladder exit, unchanged.
+    "exit_mode":        "spot",
+    "spot_exit":        dict(SPOT_EXIT_DEFAULTS),
 
     # ── position book ────────────────────────────────────────────────────────
     # PAPER DATA COLLECTION: every count-based trade blocker is off. Same
@@ -393,6 +414,11 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
 
     def __init__(self, market_hub):
         super().__init__(market_hub)
+        self._gate         = EntryGate(market_hub, {
+            "mode":       CFG["gate_mode"],
+            "rs_min_pct": CFG["gate_rs_min_pct"],
+            "range_min_atr": CFG["gate_range_min_atr"],
+        })
         self._store        = None                 # StockOptionStore
         self._stocks       = {}                   # token -> _StockState
         self._by_sym       = {}                   # sym   -> _StockState
@@ -607,6 +633,8 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             cur["c"] = price
             cur["v"] += dv
 
+        self._gate.update(st.sym, price, ts)
+
         # LEADING SIGNAL — evaluated on every tick, not on bar close.
         self._evaluate_surge(st, price, ts, tick_ts)
 
@@ -706,6 +734,15 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             f"[{self.name}] {st.sym} SURGE {side} @ {price:.2f} — "
             f"vol x{ratio:.1f} over {win}s, ROC {roc:+.2f}%"
         )
+
+        if CFG["require_entry_gate"]:
+            ok, why, g = self._gate.check(st.sym, side, price, ts)
+            if not ok:
+                detail = " ".join(f"{k}={v}" for k, v in g.items())
+                self._log_signal(ts, st.sym, "ENTRY_GATE_BLOCK", side,
+                                 block=f"{why} {detail}".strip(), **meta)
+                return
+            log.info(f"[{self.name}] {st.sym} {side} entry gate PASSED {g}")
 
         atr = st.atr_or_est(CFG["atr_bars"])
         if atr is None:
@@ -903,6 +940,18 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
                 f"[{CFG['min_sl_to_cost_ratio']}x cost {rt_pts:.2f}] — rejected, not widened"
             )
 
+        bracket = None
+        if block is None and CFG["exit_mode"] == "spot":
+            st_tok = self._by_sym[sym].token
+            spot   = self.get_price(st_tok) or p["spot"]
+            atr5   = self._gate.atr5(sym)
+            if not atr5:
+                block = "no_atr5"
+            else:
+                bracket = spot_bracket(p["side"], spot, atr5, CFG["spot_exit"])
+                bracket["spot_token"] = st_tok
+                sl_pts = CFG["spot_exit"]["backstop_rs"] / qty
+
         if block:
             log.info(f"[{self.name}] {sym} {p['opt_symbol']} entry BLOCKED — {block}")
             self._log_signal(ts, sym, "ENTRY_BLOCK", p["side"], block=block,
@@ -948,6 +997,8 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             ),
             "entry_oi": oi, "entry_volume": volume,
         }
+        if bracket:
+            tr.update(bracket)
         self._positions[tok] = tr
         self._pending.pop(tok, None)
         self._trades_today += 1
@@ -960,6 +1011,11 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             f"cost={rt_pts:.2f}pts spread={spread:.2f} | "
             f"open={len(self._positions)}/{CFG['max_open_positions']}"
         )
+        if bracket:
+            log.info(
+                f"[{self.name}] {p['opt_symbol']} spot bracket: entry {bracket['entry_spot']:.2f} "
+                f"SL {bracket['sl_spot']:.2f} TP {bracket['tp_spot']:.2f} (atr5 {bracket['atr5']:.2f})"
+            )
         self._log_trade(ts, tr, "ENTRY", fill, "OPEN", 0.0, 0.0, "")
 
     def _drop_pending(self, tok: int):
@@ -1012,6 +1068,13 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
 
         exit_px = round(max(0.05, ltp - tr["spread"] / 2.0), 2)
         unreal  = (exit_px - tr["entry"]) * qty - fixed_costs_rs(qty, tr["entry"], exit_px)
+
+        if "sl_spot" in tr:
+            age = (ts - tr["entry_ts"]).total_seconds() / 60.0
+            why = spot_exit_reason(tr, self.get_price(tr["spot_token"]), unreal, age, CFG["spot_exit"])
+            if why:
+                self._exit(tok, why, ts, ltp)
+            return
 
         # ── 1. hard cap ──────────────────────────────────────────────────────
         if unreal >= CFG["target_rs_max"]:
