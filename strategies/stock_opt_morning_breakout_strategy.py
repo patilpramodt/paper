@@ -107,8 +107,6 @@ CFG = {
     "max_trades_per_stock": 3999,
     "max_losses_per_stock": 42,
     "stale_price_sec":      45,
-    "t30_check_min":        30,     # at 30 min: negative -> exit, positive -> SL Rs50 below current
-    "t30_sl_rs":            50.0,
 
     "csv_file": "stock_opt_morning_bo_trades.csv",
 }
@@ -553,21 +551,6 @@ class StockOptMorningBreakoutStrategy(BaseStrategy):
         if unreal <= -CFG["max_loss_rs"]:
             self._exit(sym, "MAX_LOSS", ts, ltp)
             return
-
-        # ── 30-min check: negative -> exit now; positive -> SL Rs50 below current ──
-        if tr.get("t30_sl") is not None:
-            if ltp <= tr["t30_sl"]:
-                self._exit(sym, "T30_SL_HIT", ts, ltp)
-            return
-        if (ts - tr["entry_ts"]).total_seconds() >= CFG["t30_check_min"] * 60:
-            if unreal < 0:
-                self._exit(sym, "T30_EXIT", ts, ltp)
-                return
-            tr["t30_sl"] = round(ltp - CFG["t30_sl_rs"] / tr["qty"], 2)
-            log.info(
-                f"[{self.name}] {tr['opt_symbol']} 30-MIN CHECK at Rs{unreal:.0f} — "
-                f"stop set to {tr['t30_sl']:.2f}, trade continues"
-            )
 
     def _exit(self, sym: str, reason: str, ts: datetime, ltp: float = None):
         tr = self._positions.get(sym)
