@@ -149,6 +149,8 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
   nothing kills or blocks a trade on age or count. This is a paper strategy
   and a filtered record cannot tell you what the raw signal is worth. The
   stop loss, the Rs 5,000 cap and the EOD square-off are the only exits.
+  2026-10-01: T45 added — every trade is closed 45 min after entry
+  (t45_exit_min), whatever its P&L, unless SL/TP/EOD closed it first.
 
   NOTE ON THE EOD BUG: the square-off runs BEFORE the trading-window guard
   in _heartbeat(). In spike.py and all four candle-breakout files the
@@ -287,6 +289,7 @@ CFG = {
     "max_trades_day":       None,
     "time_stop_min":        None,   # time stop REMOVED — no trade is killed on age
     "stale_price_sec":      45,     # profit decisions ignore prints older than this
+    "t45_exit_min":         45,     # exit every trade 45 min after entry (None = off)
 
     # ── output ───────────────────────────────────────────────────────────────
     "csv_file": "stock_opt_scanner_rt_trades.csv",
@@ -558,6 +561,14 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             px = self.get_price(tok)
             if px:
                 self._manage_position(tok, px, ts)
+
+        # ── T45: exit every position 45 min after entry, whatever its P&L ────
+        # Runs on the heartbeat so a quiet option leg is still closed on time.
+        if CFG["t45_exit_min"]:
+            for tok in list(self._positions.keys()):
+                tr = self._positions[tok]
+                if (ts - tr["entry_ts"]).total_seconds() >= CFG["t45_exit_min"] * 60:
+                    self._exit(tok, "T45_EXIT", ts)
 
         # ── time stop ────────────────────────────────────────────────────────
         # Disabled by default (time_stop_min = None). Age alone says nothing

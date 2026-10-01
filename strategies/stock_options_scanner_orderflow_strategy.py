@@ -176,6 +176,7 @@ CFG = {
     "max_trades_per_stock": None,
     "max_trades_day":       None,
     "stale_price_sec":      45,
+    "t45_exit_min":         45,     # exit every trade 45 min after entry (None = off)
 
     # ── output ───────────────────────────────────────────────────────────────
     "csv_file": "stock_opt_scanner_flow_trades.csv",
@@ -350,6 +351,14 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             px = self.get_price(tok)
             if px:
                 self._manage_position(tok, px, ts)
+
+        # ── T45: exit every position 45 min after entry, whatever its P&L ────
+        # Runs on the heartbeat so a quiet option leg is still closed on time.
+        if CFG["t45_exit_min"]:
+            for tok in list(self._positions.keys()):
+                tr = self._positions[tok]
+                if (ts - tr["entry_ts"]).total_seconds() >= CFG["t45_exit_min"] * 60:
+                    self._exit(tok, "T45_EXIT", ts)
 
     # ══════════════════════════════════════════════════════════════════════════
     # TICK ROUTING
