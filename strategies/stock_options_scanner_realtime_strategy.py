@@ -191,7 +191,7 @@ def _now_ist() -> datetime:
 # the NFO dump on a given day is dropped by StockOptionStore with a warning.
 UNIVERSE = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
-    "TCS", "AXISBANK", "TATAMOTORS", "TATASTEEL", "BAJFINANCE",
+    "TCS", "AXISBANK", "TATASTEEL", "BAJFINANCE",
     "KOTAKBANK", "HINDALCO", "MARUTI", "LT", "ADANIENT",
 ]
 

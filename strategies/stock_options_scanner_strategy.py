@@ -167,12 +167,14 @@ def _now_ist() -> datetime:
 # no prior sector exposure). All are established, high-OI F&O names, but
 # unverified against today's actual NFO chain depth — StockOptionStore
 # drops anything too thin with a warning, so a bad pick fails safe.
+# 2026-10-01: removed TATAMOTORS (demerged into TMPV/TMCV) and VEDANTA (NSE
+# symbol is VEDL) — neither name exists in the NSE/NFO dumps any more.
 UNIVERSE = [
     "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
-    "TCS", "AXISBANK", "TATAMOTORS", "TATASTEEL", "BAJFINANCE",
+    "TCS", "AXISBANK", "TATASTEEL", "BAJFINANCE",
     "KOTAKBANK", "HINDALCO", "MARUTI", "LT", "ADANIENT",
     "BHARTIARTL", "SUNPHARMA", "TITAN", "BAJAJFINSV", "INDUSINDBK",
-    "VEDANTA", "ADANIPORTS", "DLF",
+    "ADANIPORTS", "DLF",
 ]
 
 

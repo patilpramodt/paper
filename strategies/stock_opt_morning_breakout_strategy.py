@@ -75,6 +75,17 @@ NIFTY_TOKEN = 256265
 CFG = {
     "enabled": True,
 
+    # ── universe ─────────────────────────────────────────────────────────────
+    # The 14 stocks the strategy was designed on. 2026-10-01 backtest (62
+    # sessions, current gates): these made +Rs411/trade; the 7 names added to
+    # the shared list on 09-28 made -Rs229/trade (negative in both halves), and
+    # 18 other liquid F&O stocks were ~flat. Shared UNIVERSE is filtered to these.
+    "universe": [
+        "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
+        "TCS", "AXISBANK", "TATASTEEL", "BAJFINANCE", "KOTAKBANK",
+        "HINDALCO", "MARUTI", "LT", "ADANIENT",
+    ],
+
     # ── session (IST) ────────────────────────────────────────────────────────
     "first_bar_start": dtime(9, 45),   # 7th bar of the day — needs an opening range
     "last_bar_start":  dtime(11, 30),
@@ -199,8 +210,9 @@ class StockOptMorningBreakoutStrategy(BaseStrategy):
             log.error(f"[{self.name}] needs a loaded StockOptionStore — check t.py wiring")
             return False
         self._store = instruments
+        universe = [s for s in self._store.universe if s in CFG["universe"]]
 
-        for sym in self._store.universe:
+        for sym in universe:
             tok = self._store.spot_token(sym)
             if not tok:
                 continue
@@ -211,7 +223,7 @@ class StockOptMorningBreakoutStrategy(BaseStrategy):
 
         self._seed_history()
 
-        dte = min(self._store.days_to_expiry(s) for s in self._store.universe)
+        dte = min(self._store.days_to_expiry(s) for s in universe)
         self._expiry_day = CFG["skip_expiry_day"] and dte <= 0
         if self._expiry_day:
             log.warning(f"[{self.name}] expiry day for the nearest series — no new entries today")
