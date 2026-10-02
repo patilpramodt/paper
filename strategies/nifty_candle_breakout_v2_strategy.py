@@ -83,6 +83,15 @@ ORDER EXECUTION / ROBUSTNESS
       background rather than silently abandoned).
     - SL/TP checked only after a short grace period post-fill to avoid
       acting on stale buffered ticks.
+
+EXIT CHANGE (2026-10-02)
+─────────────────────────
+SL 10 premium points (unchanged), NO take-profit, and a time stop that
+closes the trade time_stop_min (30) minutes after entry (reason TIME_30),
+or at close_time. Still one trade at a time. Replaying the live Sep 9–
+Oct 1 signals on Kite 1-min option candles, net of costs: SL10/TP10 lost
+-10k (-32k worst-case stress); no-TP + 30 min made +14k (+2k stress) on
+about half the trades. Thin edge — judge it on the paper record.
 """
 
 import logging
@@ -149,8 +158,9 @@ CFG = {
 
     # ── SL / TP (fixed, on OPTION PREMIUM) ────────────────────────────────────
     "sl_points"              : 10.0,
-    "tp_points"              : 10.0,
+    "tp_points"              : None,   # None = no take-profit (exit by SL / time stop / EOD)
     "sl_grace_seconds"       : 5,
+    "time_stop_min"          : 30,     # close the trade this many minutes after entry
 
     # ── Entry price freshness ─────────────────────────────────────────────────
     # Option tokens are unsubscribed after each trade, and MarketHub keeps the
@@ -210,7 +220,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         log.info(
             f"[{self.name}] Initialized {mode_tag} | qty={CFG['quantity']} "
             f"c1_move={CFG['c1_move_pts']}pts c2_move={CFG['c2_move_pts']}pts "
-            f"SL=-{CFG['sl_points']} TP=+{CFG['tp_points']}"
+            f"SL=-{CFG['sl_points']} TP={CFG['tp_points']} time_stop={CFG['time_stop_min']}min"
         )
 
     # ── Pre-market ────────────────────────────────────────────────────────────
@@ -258,6 +268,10 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             if t >= CFG["close_time"]:
                 opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
                 self._do_exit(opt_price, "EOD_CLOSE", ts)
+            elif ts >= self._trade["time_stop_at"]:
+                # Checked on index ticks too — option ticks can pause.
+                opt_price = self.get_price(self._trade["token"]) or self._trade["entry"]
+                self._do_exit(opt_price, f"TIME_{CFG['time_stop_min']}", ts)
             return
 
         # A trade is open — freeze pattern scanning until it closes.
@@ -311,6 +325,10 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         if self._trade["state"] != "OPEN" or self._trade.get("_exit_in_progress"):
             return
 
+        if ts >= self._trade["time_stop_at"]:
+            self._do_exit(price, f"TIME_{CFG['time_stop_min']}", ts)
+            return
+
         # ── SL / TP grace period ──────────────────────────────────────────────
         sl_active_from = self._trade.get("sl_active_from")
         if sl_active_from is not None and ts < sl_active_from:
@@ -318,7 +336,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
 
         if price <= self._trade["sl"]:
             self._do_exit(price, "SL_HIT", ts)
-        elif price >= self._trade["tp"]:
+        elif self._trade["tp"] is not None and price >= self._trade["tp"]:
             self._do_exit(price, "TP_HIT", ts)
 
     # ── Pattern detection ────────────────────────────────────────────────────
@@ -515,8 +533,9 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         order_id, fill_price = result
 
         sl = fill_price - CFG["sl_points"]
-        tp = fill_price + CFG["tp_points"]
+        tp = fill_price + CFG["tp_points"] if CFG["tp_points"] is not None else None
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
+        time_stop_at   = ts + timedelta(minutes=CFG["time_stop_min"])
 
         meta = self._signal_meta or {}
         self._signal_meta = None
@@ -530,6 +549,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "tp"               : tp,
             "entry_time"       : ts,
             "sl_active_from"   : sl_active_from,
+            "time_stop_at"     : time_stop_at,
             "order_id"         : order_id,
             "qty"              : CFG["quantity"],
             "_exit_in_progress": False,
@@ -538,10 +558,11 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
         self._trades_today += 1
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        tp_txt = f"{tp:.2f} (+{CFG['tp_points']})" if tp is not None else "none"
         log.info(
             f"[{self.name}] [{mode_tag}] ENTRY #{self._trades_today} {sym} @ {fill_price:.2f} | "
-            f"SL={sl:.2f} (-{CFG['sl_points']}) TP={tp:.2f} (+{CFG['tp_points']}) | "
-            f"reason={reason} | order_id={order_id}"
+            f"SL={sl:.2f} (-{CFG['sl_points']}) TP={tp_txt} | "
+            f"time stop {time_stop_at.strftime('%H:%M:%S')} | reason={reason} | order_id={order_id}"
         )
 
         meta = self._trade.get("meta", {})
@@ -551,7 +572,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "action"         : "ENTRY",
             "price"          : fill_price,
             "sl"             : round(sl, 2),
-            "tp"             : round(tp, 2),
+            "tp"             : round(tp, 2) if tp is not None else "",
             "status"         : "OPEN",
             "pnl"            : 0,
             "reason"         : reason,
@@ -720,7 +741,7 @@ class NiftyCandleBreakoutV2Strategy(BaseStrategy):
             "action"         : "EXIT",
             "price"          : sell_price,
             "sl"             : round(t["sl"], 2),
-            "tp"             : round(t["tp"], 2),
+            "tp"             : round(t["tp"], 2) if t["tp"] is not None else "",
             "status"         : "CLOSED",
             "pnl"            : round(pnl, 2),
             "reason"         : reason,
