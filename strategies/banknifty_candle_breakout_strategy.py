@@ -53,10 +53,12 @@ ASSUMPTIONS (stated — not covered by the spec, flag if wrong)
 
 INDEX ROUTING
 ──────────────
-  INDEX_TOKEN = 260105 (NSE:NIFTY BANK). MarketHub routes BankNifty ticks
-  here exclusively, same mechanism used by BANKNIFTY_EXPIRY_MOMENTUM /
-  BB_STOCH_BANKNIFTY. Uses the shared banknifty_pm / banknifty_instruments
-  already wired up in t.py for any strategy with this INDEX_TOKEN.
+  NO class-level INDEX_TOKEN attribute (deliberately — same as
+  BANKNIFTY_CANDLE_BREAKOUT_V2). BankNifty (260105) is MarketHub's MAIN
+  index, and a non-None INDEX_TOKEN makes MarketHub treat a strategy as
+  tracking a *different* index and skip it on every BankNifty tick. This
+  strategy had INDEX_TOKEN = 260105 until 2026-10-02 and never received a
+  single tick (zero triggers, zero trades) since at least 2026-09-09.
 
 LIVE / PAPER MODE
 ─────────────────
@@ -76,9 +78,7 @@ ORDER EXECUTION / ROBUSTNESS
       acting on stale buffered ticks.
 """
 
-import csv
 import logging
-import os
 import threading
 import time as _time_mod
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -86,6 +86,7 @@ from typing import Optional
 
 from core.base_strategy import BaseStrategy
 from core.candle import SecondCandleBuilder
+from core.csv_log import append_row, round_trip_cost_rs
 from core.instruments import get_atm_strike
 
 log = logging.getLogger("strategy.banknifty_candle_breakout")
@@ -125,6 +126,12 @@ CFG = {
     "tp_points"              : 10.0,
     "sl_grace_seconds"       : 5,
 
+    # ── Entry price freshness ─────────────────────────────────────────────────
+    # Option tokens are unsubscribed after each trade, and MarketHub keeps the
+    # last price after unsubscribe — never fill on a price older than this.
+    "max_price_age_sec"      : 5,
+    "pending_timeout_sec"    : 10,     # drop a pending entry with no live tick by then
+
     # ── Emergency exit (LIVE_MODE only) ───────────────────────────────────────
     "emergency_retry_sec"    : 30,
     "emergency_max_attempts" : 30,
@@ -136,9 +143,8 @@ CFG = {
 
 class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
-    # Routes BankNifty index ticks here exclusively (shared with other
-    # BankNifty strategies — MarketHub delivers to every strategy with this token).
-    INDEX_TOKEN = 260105
+    # NOTE: deliberately NO class-level INDEX_TOKEN attribute — see
+    # "INDEX ROUTING" in the module docstring.
 
     LIVE_MODE = LIVE_MODE
 
@@ -168,6 +174,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         self._pending_entry  = None
         self._trades_today   = 0
         self._today_pnl      = 0.0
+        self._today_net      = 0.0
         self._completed      = []
 
         self._lock = threading.Lock()
@@ -184,7 +191,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
     def pre_market(self, pm, instruments) -> bool:
         """
         Receives BankNifty-specific PreMarketData + InstrumentStore (routed by
-        t.py because INDEX_TOKEN == 260105). No pre-subscription of a fixed
+        t.py's default branch, as for any strategy with no INDEX_TOKEN). No pre-subscription of a fixed
         ATM pair is done here — ATM drifts through the day and this strategy
         can fire at any time, so the strike is resolved fresh at signal time.
         """
@@ -202,7 +209,10 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
     def on_tick(self, price: float, ts: datetime, tick_ts: datetime):
         t = ts.time()
 
-        if t < CFG["start_time"] or t > CFG["close_time"]:
+        # No upper bound here: the close_time force-exit below must still see
+        # ticks after close_time (the old `t > close_time: return` meant it
+        # only ran on a tick stamped exactly 15:15:00.000000 — i.e. never).
+        if t < CFG["start_time"]:
             return
 
         if not self._market_opened and t >= CFG["start_time"]:
@@ -222,6 +232,16 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
         # A trade is open — freeze pattern scanning until it closes.
         if self._trade is not None:
+            return
+
+        # Waiting on a pending fill — drop it if no live tick came in time, and
+        # don't scan meanwhile (a new signal would orphan its subscription).
+        if self._pending_entry:
+            if (ts - self._pending_entry["ts"]).total_seconds() > CFG["pending_timeout_sec"]:
+                p = self._pending_entry
+                self._pending_entry = None
+                self.unsubscribe_option(p["token"])
+                log.warning(f"[{self.name}] Pending entry for {p['sym']} timed out — dropped")
             return
 
         # No new setups too close to EOD.
@@ -378,8 +398,11 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
     def _build_entry(self, sym: str, token: int, signal: str, ts: datetime, reason: str):
         opt_price = self.get_price(token)
+        price_ts  = self.get_price_ts(token)
+        fresh = (price_ts is not None and
+                 (ts - price_ts).total_seconds() <= CFG["max_price_age_sec"])
 
-        if not opt_price or opt_price <= 0:
+        if not opt_price or opt_price <= 0 or not fresh:
             log.warning(
                 f"[{self.name}] No live price yet for {sym} — storing pending entry"
             )
@@ -389,12 +412,14 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             return
 
         if not self._acquire_slot():
+            self.unsubscribe_option(token)
             log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
             return
 
         result = self._place_buy(sym, token, CFG["quantity"], opt_price)
         if result is None:
             self._release_slot()
+            self.unsubscribe_option(token)
             log.error(f"[{self.name}] BUY order FAILED for {sym} — entry aborted")
             return
 
@@ -545,6 +570,9 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             )
             t["state"] = "CLOSED"
             self._release_slot()
+            self.unsubscribe_option(t["token"])
+            self._trade = None
+            self._reset_pattern_state()
 
         thread = threading.Thread(
             target=_loop, name="banknifty-candle-breakout-emergency-exit", daemon=True,
@@ -553,13 +581,17 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
         log.info(f"[{self.name}] Emergency exit thread started for {t['symbol']}")
 
     def _finalize_exit(self, t: dict, sell_price: float, order_id: Optional[str], reason: str, ts: datetime):
-        pnl = (sell_price - t["entry"]) * t["qty"]
+        pnl  = (sell_price - t["entry"]) * t["qty"]
+        cost = round_trip_cost_rs(t["entry"], sell_price, t["qty"])
+        net  = pnl - cost
         self._today_pnl += pnl
+        self._today_net += net
 
         mode_tag = "LIVE" if LIVE_MODE else "PAPER"
         log.info(
             f"[{self.name}] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
-            f"| PnL={pnl:.0f} ({pnl / t['qty']:.1f}/unit) | Today={self._today_pnl:.0f} | "
+            f"| PnL={pnl:.0f} ({pnl / t['qty']:.1f}/unit) net={net:.0f} | "
+            f"Today={self._today_pnl:.0f} net={self._today_net:.0f} | "
             f"order_id={order_id}"
         )
 
@@ -575,10 +607,14 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             "reason"   : reason,
             "mode"     : mode_tag,
             "order_id" : order_id,
+            "cost_rs"  : cost,
+            "net_pnl"  : round(net, 2),
         })
-        self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason, "pnl": pnl})
+        self._completed.append({**t, "exit_price": sell_price, "exit_reason": reason,
+                                "pnl": pnl, "net": net})
 
-        # Trade fully resolved — free up scanning for the next setup.
+        # Trade fully resolved — free up scanning and the option subscription.
+        self.unsubscribe_option(t["token"])
         self._trade = None
         self._reset_pattern_state()
 
@@ -586,16 +622,12 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
 
     def _log_csv(self, row: dict):
         fname  = CFG["csv_file"]
-        exists = os.path.isfile(fname)
         fields = [
             "timestamp", "symbol", "action", "price",
             "sl", "tp", "status", "pnl", "reason", "mode", "order_id",
+            "cost_rs", "net_pnl",
         ]
-        with open(fname, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=fields)
-            if not exists:
-                w.writeheader()
-            w.writerow({k: row.get(k, "") for k in fields})
+        append_row(fname, fields, row)
 
     def eod_summary(self):
         log.info(f"\n[{self.name}] {'='*50}")
@@ -605,7 +637,7 @@ class BankNiftyCandleBreakoutStrategy(BaseStrategy):
             log.info(
                 f"[{self.name}]   {t['symbol']} [{t['exit_reason']}] "
                 f"entry={t['entry']:.2f} exit={t['exit_price']:.2f} "
-                f"PnL={t['pnl']:.0f} ({t['pnl'] / t['qty']:.1f}/unit)"
+                f"PnL={t['pnl']:.0f} ({t['pnl'] / t['qty']:.1f}/unit) net={t['net']:.0f}"
             )
-        log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
+        log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f} (net {self._today_net:.0f})")
         log.info(f"[{self.name}] {'='*50}\n")
