@@ -103,8 +103,10 @@ of round-trip cost per trade. Re-pricing every live signal on Kite 1-min
 option candles, the setup that held up (incl. a worst-case entry-minute
 stress test) was:
   - SL 20 premium points (unchanged), NO take-profit.
-  - Time stop: close every trade time_stop_min (45) minutes after entry
-    (reason TIME_45), or at close_time, whichever comes first.
+  - Time stop: close every trade time_stop_min (30) minutes after entry
+    (reason TIME_30), or at close_time, whichever comes first. (45 min was
+    the first pick; changed to 30 the same day — replay: +44k base / +21k
+    stress vs +52k / +26k for 45, both with up to 3 open trades.)
   - Up to max_open_trades (3) positions at once. Scanning keeps running
     while trades are open, so the trade count stays near the old one.
   - No trading on BankNifty expiry day (0-DTE theta was never tested).
@@ -177,7 +179,7 @@ CFG = {
     "sl_points"              : 20.0,
     "tp_points"              : None,   # None = no take-profit (exit by SL / time stop / EOD)
     "sl_grace_seconds"       : 5,
-    "time_stop_min"          : 45,     # close a trade this many minutes after entry
+    "time_stop_min"          : 30,     # close a trade this many minutes after entry
     "max_open_trades"        : 3,      # concurrent positions; scanning continues below this
     "skip_expiry_day"        : True,   # don't trade on the BankNifty expiry date
 
