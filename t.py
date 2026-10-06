@@ -89,6 +89,7 @@ from core.instruments import InstrumentStore, StockOptionStore
 from core.premarket   import PreMarketData
 from core.pcr_kite    import WsPCR
 from core.order_router import OrderRouter
+from core.tick_recorder import TickRecorder
 
 # ── Strategies — ADD/REMOVE here to enable/disable ──────────────────────────
 from strategies.spike                import SpikeStrategy
@@ -144,6 +145,8 @@ PID_FILE       = "trader.pid"
 PREMARKET_TIME = dtime(9,  8)    # Start pre-market setup at 9:08 AM IST
 MARKET_START   = dtime(9, 14)    # Start WebSocket at 9:14 AM IST
 MARKET_END     = dtime(15, 0)    # MarketHub forces WS close at 3:31 PM IST
+
+RECORD_TICKS   = True             # archive ticks/chain/PCR to data/ticks/<date>/
 
 PCR_SPOT_RANGE  = 1000   # points either side of ATM
 PCR_STRIKE_STEP       = 100    # strike interval for BankNifty WsPCR subscriptions
@@ -310,6 +313,7 @@ def main():
     # RT's worst day per trade (-Rs 437 avg) and the rest of the day-of-expiry
     # behaviour was never backtested. V1 / MORNING_BO keep the nearest expiry.
     stock_instruments_rolled = StockOptionStore()
+    nfo_raw = nse_raw = None
     try:
         nfo_raw = hub.kite.instruments("NFO")
         nse_raw = hub.kite.instruments("NSE")
@@ -463,6 +467,21 @@ def main():
         log.info("No strategies active today. Exiting.")
         return
 
+    # ── Tick recorder — our own data archive (independent of Kite history) ───
+    recorder = None
+    if RECORD_TICKS:
+        try:
+            recorder = TickRecorder(hub, stock_universe=STOCK_UNIVERSE,
+                                    pm_bn=pm, pm_nifty=nifty_pm)
+            if recorder.setup(hub.kite, nfo_raw=nfo_raw, nse_raw=nse_raw):
+                recorder.start()
+                atexit.register(recorder.stop)
+            else:
+                recorder = None
+        except Exception as e:
+            log.error(f"TickRecorder setup failed — trading continues without it: {e}")
+            recorder = None
+
     # ── Backfill historical candles (warm up indicators for late starts) ──────
     hub.backfill(hub.kite, index_token=260105)
 
@@ -505,6 +524,9 @@ def main():
 
     # ── Start MarketHub (WebSocket) — runs until 3:31 PM IST ─────────────────
     hub.run()
+
+    if recorder:
+        recorder.stop()
 
     # ── WsPCR EOD teardown (Bug B fix) ────────────────────────────────────────
     # Properly release all hub refcounts held by WsPCR instances.

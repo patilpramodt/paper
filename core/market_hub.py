@@ -225,6 +225,13 @@ class MarketHub:
         # the tick, and strategies outside the set still never get called.
         self._token_owner  : dict[int, set[str]] = {}
 
+        # TICK RECORDER (core/tick_recorder.py): tokens subscribed only so
+        # they are archived. They stay on the WebSocket even when every
+        # strategy releases them, and their ticks are never dispatched to
+        # strategies unless a strategy also subscribes them.
+        self._passive      : set[int]            = set()
+        self.recorder      = None
+
         # Shared infrastructure
         self.index_candles = CandleBuilder(minutes=5)
         self.session_vwap  = SessionVWAP()
@@ -368,11 +375,24 @@ class MarketHub:
             if new_count == 0:
                 do_unsubscribe = True
 
-        if do_unsubscribe and self._ws:
+        if do_unsubscribe and self._ws and token not in self._passive:
             try:
                 self._ws.unsubscribe([token])
             except Exception as e:
                 log.warning(f"  Unsubscribe error for {token}: {e}")
+
+    def subscribe_passive(self, tokens):
+        """Subscribe tokens for recording only — not routed to strategies."""
+        with self._lock:
+            new = [t for t in tokens if t not in self._passive]
+            self._passive.update(new)
+            to_ws = [t for t in new if self._sub_refcount.get(t, 0) == 0]
+        if to_ws and self._ws:
+            try:
+                self._ws.subscribe(to_ws)
+                self._ws.set_mode(self._ws.MODE_FULL, to_ws)
+            except Exception as e:
+                log.warning(f"  Passive subscribe error ({len(to_ws)} tokens): {e}")
 
     def last_price(self, token: int) -> float | None:
         """Get last known price for any subscribed token."""
@@ -458,6 +478,9 @@ class MarketHub:
         now = _now_ist()
         t   = now.time()
 
+        if self.recorder is not None:
+            self.recorder.on_ticks(now, ticks)
+
         # Ignore outside market hours
         if t < MARKET_OPEN or t > market_close_for(now.date()):
             return
@@ -509,6 +532,10 @@ class MarketHub:
                 # Extra index (e.g. Nifty 50) — route only to matching strategies
                 self._handle_extra_index_tick(token, price, now, tick_ts)
             else:
+                # Recorder-only token: cached above, nobody to deliver to.
+                if token in self._passive and self._sub_refcount.get(token, 0) == 0:
+                    continue
+
                 # OWNED TOKEN (STOCK_OPT_SCANNER family): deliver to every
                 # current owner of this token, and no one else.
                 owners = self._token_owner.get(token)
@@ -611,10 +638,11 @@ class MarketHub:
         # REFCOUNT FIX: was list(self._subscribed) — now derived from refcount.
         with self._lock:
             tokens = [t for t, c in self._sub_refcount.items() if c > 0]
+            tokens += [t for t in self._passive if self._sub_refcount.get(t, 0) == 0]
         if tokens:
             ws.subscribe(tokens)
             ws.set_mode(ws.MODE_FULL, tokens)
-        log.info(f" Subscribed {len(tokens)} tokens: {tokens}")
+        log.info(f" Subscribed {len(tokens)} tokens ({len(self._passive)} recorder-only)")
 
     def _on_close(self, ws, code, reason):
         log.warning(f"WebSocket closed [{code}]: {reason}")

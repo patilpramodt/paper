@@ -107,3 +107,6 @@ Thumbs.db
 *.7z
 
 trader.pid
+
+# Recorded market data (core/tick_recorder.py)
+/data/
