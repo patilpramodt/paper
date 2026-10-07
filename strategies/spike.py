@@ -227,6 +227,20 @@ CFG = {
 
 class SpikeStrategy(BaseStrategy):
 
+    # ── Entry-logic variant ───────────────────────────────────────────────────
+    # Subclasses in strategies/spike_variants.py override these to A/B test
+    # different entry rules alongside this one. SL / trail / exits are shared.
+    #   "2CANDLE"  : first 2 consecutive same-colour 10s candles (this class)
+    #   "COLOR_5S" : colour of 9:15:00 → 9:15:05 move, one shot
+    #   "GAP_2M"   : gap day only; colour of 9:15:00 → 9:17:00 move must
+    #                match the gap direction, one shot
+    ENTRY_MODE    = "2CANDLE"
+    STRATEGY_NAME = "SPIKE"
+    CSV_FILE      = CFG["csv_file"]
+    # Seconds after start_time at which the one-shot colour check fires
+    # (ignored by 2CANDLE).
+    OPEN_WAIT_SEC = 0
+
     @property
     def LIVE_MODE(self) -> bool:
         """Recomputed on every access — True unless today (IST) is a paper day."""
@@ -234,7 +248,7 @@ class SpikeStrategy(BaseStrategy):
 
     @property
     def name(self) -> str:
-        return "SPIKE"
+        return self.STRATEGY_NAME
 
     def __init__(self, market_hub):
         super().__init__(market_hub)
@@ -259,7 +273,12 @@ class SpikeStrategy(BaseStrategy):
         self._completed         : list           = []
         self._pending_entry     = None
 
-        self._prev_body_high    : Optional[float] = None
+        # One-shot open-colour state (COLOR_5S / GAP_2M only)
+        self._open_price        : Optional[float]    = None
+        self._open_tick_ts      : Optional[datetime] = None
+        self._open_check_done   : bool               = False
+
+        self._prev_body_high   : Optional[float] = None
         self._prev_body_low     : Optional[float] = None
         self._prev_last5m_high  : Optional[float] = None
         self._prev_last5m_low   : Optional[float] = None
@@ -270,7 +289,7 @@ class SpikeStrategy(BaseStrategy):
         self._lock              = threading.Lock()
 
         mode_tag = "[LIVE]" if self.LIVE_MODE else "[PAPER]"
-        log.info(f"[SPIKE] Initialized in {mode_tag} mode (today; re-checked daily)")
+        log.info(f"[{self.name}] Initialized in {mode_tag} mode (today; re-checked daily)")
 
     # ── Pre-market ────────────────────────────────────────────────────────────
 
@@ -281,7 +300,7 @@ class SpikeStrategy(BaseStrategy):
         _scan_deadline = (CFG["last_entry_time"] if CFG["full_day_mode"]
                           else CFG["spike_exit_time"])
         if now >= _scan_deadline:
-            log.warning(f"[SPIKE] Started after entry window ({_scan_deadline}) — skipping today.")
+            log.warning(f"[{self.name}] Started after entry window ({_scan_deadline}) — skipping today.")
             self._trade_done = True
             return True
 
@@ -293,19 +312,19 @@ class SpikeStrategy(BaseStrategy):
         self._prev_last5m_close = pm.prev_last5m_close
         self._expiry_date       = pm.expiry_date
 
-        log.info(f"[SPIKE] Pre-market | "
+        log.info(f"[{self.name}] Pre-market | "
                  f"body=[{self._prev_body_low} – {self._prev_body_high}] "
                  f"prev_close={pm.prev_close} | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
 
         ref_price = pm.prev_close or pm.prev_last5m_close
 
         if ref_price is None:
-            log.warning(f"[SPIKE] No prev_close and no prev_last5m_close — "
+            log.warning(f"[{self.name}] No prev_close and no prev_last5m_close — "
                         f"cannot pre-subscribe options. Will attempt on first tick.")
             return True
 
         strike = get_atm_strike(ref_price)
-        log.info(f"[SPIKE] Token lookup | strike={strike} "
+        log.info(f"[{self.name}] Token lookup | strike={strike} "
                  f"expiry={pm.expiry_date} ref_price={ref_price:.2f} "
                  f"(source={'prev_close' if pm.prev_close else 'prev_last5m_close'})")
 
@@ -319,15 +338,15 @@ class SpikeStrategy(BaseStrategy):
 
         if ce_tok:
             self.subscribe_option(ce_tok)
-            log.info(f"[SPIKE] Pre-subscribed CE: {ce_sym} ({ce_tok})")
+            log.info(f"[{self.name}] Pre-subscribed CE: {ce_sym} ({ce_tok})")
         else:
-            log.error(f"[SPIKE] CE token not found | strike={strike} expiry={pm.expiry_date}")
+            log.error(f"[{self.name}] CE token not found | strike={strike} expiry={pm.expiry_date}")
 
         if pe_tok:
             self.subscribe_option(pe_tok)
-            log.info(f"[SPIKE] Pre-subscribed PE: {pe_sym} ({pe_tok})")
+            log.info(f"[{self.name}] Pre-subscribed PE: {pe_sym} ({pe_tok})")
         else:
-            log.error(f"[SPIKE] PE token not found | strike={strike} expiry={pm.expiry_date}")
+            log.error(f"[{self.name}] PE token not found | strike={strike} expiry={pm.expiry_date}")
 
         return True
 
@@ -365,7 +384,9 @@ class SpikeStrategy(BaseStrategy):
 
         if not self._market_opened and t >= CFG["start_time"]:
             self._market_opened = True
-            log.info(f"[SPIKE] Market open tick received: {price:.2f}")
+            self._open_price    = price
+            self._open_tick_ts  = tick_ts or ts
+            log.info(f"[{self.name}] Market open tick received: {price:.2f}")
             if self._pre_ce_token is None or self._pre_pe_token is None:
                 self._subscribe_atm_on_open(price)
 
@@ -385,7 +406,7 @@ class SpikeStrategy(BaseStrategy):
         _entry_deadline = (CFG["last_entry_time"] if CFG["full_day_mode"]
                            else CFG["spike_exit_time"])
         if not self._trade_done and self._trade is None and t >= _entry_deadline:
-            log.info(f"[SPIKE] Entry window closed ({_entry_deadline}) — no new entries today.")
+            log.info(f"[{self.name}] Entry window closed ({_entry_deadline}) — no new entries today.")
             self._trade_done = True
 
         # BUG FIX 7: Guard _pending_entry so a second candle signal cannot
@@ -394,9 +415,12 @@ class SpikeStrategy(BaseStrategy):
         if (not self._trade_done and
                 self._trade is None and
                 self._pending_entry is None and   # BUG FIX 7
-                self._cooldown_ok(ts) and
-                closed_8s is not None):
-            self._check_2candle_signal(closed_8s, price, ts)
+                self._cooldown_ok(ts)):
+            if self.ENTRY_MODE == "2CANDLE":
+                if closed_8s is not None:
+                    self._check_2candle_signal(closed_8s, price, ts)
+            elif not self._open_check_done:
+                self._check_open_color_signal(price, ts, tick_ts or ts)
 
         # Force-exit an open trade at the end of its holding window.
         # Original behaviour force-closed at spike_exit_time (09:30) even if
@@ -449,7 +473,7 @@ class SpikeStrategy(BaseStrategy):
                 not self._trade_done):           # BUG FIX 8
             p = self._pending_entry
             self._pending_entry = None
-            log.info(f"[SPIKE] Pending entry resolved — first live tick for {p['sym']} "
+            log.info(f"[{self.name}] Pending entry resolved — first live tick for {p['sym']} "
                      f"@ {price:.2f} (was stale at entry signal time)")
             self._build_entry(p["sym"], p["token"], p["signal"], ts, p["reason"])
             return
@@ -476,7 +500,7 @@ class SpikeStrategy(BaseStrategy):
             self._trade["entry"], self._trade["highest_seen"], self._trade["sl"]
         )
         if new_sl > self._trade["sl"]:
-            log.info(f"[SPIKE] TSL: {self._trade['sl']:.0f} → {new_sl:.0f} "
+            log.info(f"[{self.name}] TSL: {self._trade['sl']:.0f} → {new_sl:.0f} "
                      f"(highest={self._trade['highest_seen']:.0f})")
             self._trade["sl"] = new_sl
 
@@ -484,7 +508,7 @@ class SpikeStrategy(BaseStrategy):
         sl_active_from = self._trade.get("sl_active_from")
         if sl_active_from is not None and ts < sl_active_from:
             log.debug(
-                f"[SPIKE] SL grace active — skipping SL check "
+                f"[{self.name}] SL grace active — skipping SL check "
                 f"(ts={ts.strftime('%H:%M:%S')} < active_from={sl_active_from.strftime('%H:%M:%S')}) "
                 f"price={price:.0f} sl={self._trade['sl']:.0f}"
             )
@@ -500,7 +524,7 @@ class SpikeStrategy(BaseStrategy):
         from core.instruments import get_atm_strike
         strike = get_atm_strike(open_price)
         expiry = self._expiry_date
-        log.info(f"[SPIKE] Late-subscribing ATM options on open tick | "
+        log.info(f"[{self.name}] Late-subscribing ATM options on open tick | "
                  f"strike={strike} expiry={expiry} open={open_price:.2f}")
 
         ce_tok, ce_sym = self._instruments.get_option_token(strike, "CE", expiry)
@@ -510,13 +534,13 @@ class SpikeStrategy(BaseStrategy):
             self.subscribe_option(ce_tok)
             self._pre_ce_token = ce_tok
             self._pre_ce_sym   = ce_sym
-            log.info(f"[SPIKE] Late-subscribed CE: {ce_sym} ({ce_tok})")
+            log.info(f"[{self.name}] Late-subscribed CE: {ce_sym} ({ce_tok})")
 
         if pe_tok and self._pre_pe_token is None:
             self.subscribe_option(pe_tok)
             self._pre_pe_token = pe_tok
             self._pre_pe_sym   = pe_sym
-            log.info(f"[SPIKE] Late-subscribed PE: {pe_sym} ({pe_tok})")
+            log.info(f"[{self.name}] Late-subscribed PE: {pe_sym} ({pe_tok})")
 
     # ── Gap direction (reference only — does not trigger entry) ───────────────
 
@@ -529,36 +553,36 @@ class SpikeStrategy(BaseStrategy):
         h5, l5 = self._prev_last5m_high, self._prev_last5m_low
 
         if h5 is not None and l5 is not None:
-            log.info(f"[SPIKE] Gap ref → prev last 5-min: "
+            log.info(f"[{self.name}] Gap ref → prev last 5-min: "
                      f"H={h5:.0f}  L={l5:.0f}  Today open={open_price:.0f}")
             if open_price > h5:
                 self._gap_direction = "CE"
-                log.info(f"[SPIKE]  GAP UP: open={open_price:.0f} > last5m_high={h5:.0f}  (ref only)")
+                log.info(f"[{self.name}]  GAP UP: open={open_price:.0f} > last5m_high={h5:.0f}  (ref only)")
             elif open_price < l5:
                 self._gap_direction = "PE"
-                log.info(f"[SPIKE]  GAP DOWN: open={open_price:.0f} < last5m_low={l5:.0f}  (ref only)")
+                log.info(f"[{self.name}]  GAP DOWN: open={open_price:.0f} < last5m_low={l5:.0f}  (ref only)")
             else:
                 self._gap_direction = "BOTH"
-                log.info(f"[SPIKE]  NO GAP: open inside [{l5:.0f}–{h5:.0f}] (ref only)")
+                log.info(f"[{self.name}]  NO GAP: open inside [{l5:.0f}–{h5:.0f}] (ref only)")
             return
 
-        log.warning("[SPIKE] Last 5-min candle data unavailable — falling back to daily body")
+        log.warning(f"[{self.name}] Last 5-min candle data unavailable — falling back to daily body")
         bh, bl = self._prev_body_high, self._prev_body_low
 
         if bh is None or bl is None:
             self._gap_direction = "BOTH"
-            log.warning("[SPIKE] No gap reference at all — defaulting to BOTH")
+            log.warning(f"[{self.name}] No gap reference at all — defaulting to BOTH")
             return
 
         if open_price > bh:
             self._gap_direction = "CE"
-            log.info(f"[SPIKE]  GAP UP (fallback): open={open_price:.0f} > body_high={bh:.0f} (ref only)")
+            log.info(f"[{self.name}]  GAP UP (fallback): open={open_price:.0f} > body_high={bh:.0f} (ref only)")
         elif open_price < bl:
             self._gap_direction = "PE"
-            log.info(f"[SPIKE]  GAP DOWN (fallback): open={open_price:.0f} < body_low={bl:.0f} (ref only)")
+            log.info(f"[{self.name}]  GAP DOWN (fallback): open={open_price:.0f} < body_low={bl:.0f} (ref only)")
         else:
             self._gap_direction = "BOTH"
-            log.info(f"[SPIKE]  NO GAP (fallback): open inside [{bl:.0f}–{bh:.0f}]")
+            log.info(f"[{self.name}]  NO GAP (fallback): open inside [{bl:.0f}–{bh:.0f}]")
 
     # ── 2-candle signal ───────────────────────────────────────────────────────
 
@@ -572,7 +596,7 @@ class SpikeStrategy(BaseStrategy):
         if not signal:
             return
 
-        log.info(f"[SPIKE] 2-candle signal: {signal} at {ts.strftime('%H:%M:%S')}")
+        log.info(f"[{self.name}] 2-candle signal: {signal} at {ts.strftime('%H:%M:%S')}")
 
         if signal == "CE" and self._pre_ce_token:
             sym, token = self._pre_ce_sym, self._pre_ce_token
@@ -582,16 +606,83 @@ class SpikeStrategy(BaseStrategy):
             from core.instruments import get_atm_strike
             strike = get_atm_strike(index_price)
             expiry = self._expiry_date
-            log.info(f"[SPIKE] Fallback token lookup | signal={signal} "
+            log.info(f"[{self.name}] Fallback token lookup | signal={signal} "
                      f"strike={strike} expiry={expiry}")
             token, sym = self._instruments.get_option_token(strike, signal, expiry)
 
         if not token or not sym:
-            log.error(f"[SPIKE] No token for {signal} — trade SKIPPED")
+            log.error(f"[{self.name}] No token for {signal} — trade SKIPPED")
             return
 
         self.subscribe_option(token)
         self._build_entry(sym, token, signal, ts, reason="2x8s_signal")
+
+    # ── One-shot open-colour signal (COLOR_5S / GAP_2M) ───────────────────────
+
+    def _check_open_color_signal(self, index_price: float, ts: datetime, tick_ts: datetime):
+        """
+        Colour of the move from the 9:15 open tick to the first tick at or
+        after start_time + OPEN_WAIT_SEC. Green → CE, red → PE, flat → skip.
+        GAP_2M additionally requires a gap day and colour == gap direction.
+        Evaluated exactly once per day; no trade on a miss.
+        """
+        anchor = tick_ts.replace(hour=CFG["start_time"].hour,
+                                 minute=CFG["start_time"].minute,
+                                 second=0, microsecond=0)
+        check_at = anchor + timedelta(seconds=self.OPEN_WAIT_SEC)
+        if tick_ts < check_at:
+            return
+
+        self._open_check_done = True
+
+        def _skip(why: str):
+            log.info(f"[{self.name}] No entry today — {why}")
+            self._trade_done = True
+
+        # The open tick must have arrived before the check time, otherwise
+        # we started late and _open_price is not the real 9:15 open.
+        if self._open_price is None or self._open_tick_ts is None or \
+                self._open_tick_ts >= check_at:
+            _skip(f"no open tick before {check_at.strftime('%H:%M:%S')} "
+                  f"(first tick at {self._open_tick_ts})")
+            return
+
+        move = index_price - self._open_price
+        color = "CE" if move > 0 else "PE" if move < 0 else None
+        log.info(f"[{self.name}] Open colour check @ {tick_ts.strftime('%H:%M:%S')} | "
+                 f"open={self._open_price:.2f} now={index_price:.2f} "
+                 f"move={move:+.2f} → {color or 'FLAT'} | gap={self._gap_direction}")
+
+        if color is None:
+            _skip("flat move, no colour")
+            return
+
+        if self.ENTRY_MODE == "GAP_2M":
+            if self._gap_direction not in ("CE", "PE"):
+                _skip(f"not a gap day (gap={self._gap_direction})")
+                return
+            if color != self._gap_direction:
+                _skip(f"{self.OPEN_WAIT_SEC}s colour {color} disagrees with gap "
+                      f"{self._gap_direction}")
+                return
+
+        signal = color
+        if signal == "CE" and self._pre_ce_token:
+            sym, token = self._pre_ce_sym, self._pre_ce_token
+        elif signal == "PE" and self._pre_pe_token:
+            sym, token = self._pre_pe_sym, self._pre_pe_token
+        else:
+            from core.instruments import get_atm_strike
+            strike = get_atm_strike(index_price)
+            token, sym = self._instruments.get_option_token(strike, signal, self._expiry_date)
+
+        if not token or not sym:
+            _skip(f"no token for {signal}")
+            return
+
+        self.subscribe_option(token)
+        self._build_entry(sym, token, signal, ts,
+                          reason=f"{self.ENTRY_MODE.lower()}_signal")
 
     # ── Entry ─────────────────────────────────────────────────────────────────
 
@@ -615,7 +706,7 @@ class SpikeStrategy(BaseStrategy):
         if (not opt_price or opt_price <= 0) or \
            (price_ts is None or price_ts < market_open_today):
             log.warning(
-                f"[SPIKE] No valid post-9:15 price for {sym} "
+                f"[{self.name}] No valid post-9:15 price for {sym} "
                 f"(price={opt_price} priced_at={price_ts}) — storing pending entry"
             )
             self._pending_entry = {
@@ -624,7 +715,7 @@ class SpikeStrategy(BaseStrategy):
             return
 
         if not self._acquire_slot():
-            log.warning("[SPIKE] Trade slot blocked — another live strategy has a position")
+            log.warning(f"[{self.name}] Trade slot blocked — another live strategy has a position")
             return
 
         # ── SL-to-cost sanity gate — see CFG["min_sl_to_cost_ratio"] ──────────
@@ -633,7 +724,7 @@ class SpikeStrategy(BaseStrategy):
             _est_cost = round_trip_cost_pts(entry_fill(opt_price), CFG["quantity"])
             if _est_cost > 0 and CFG["initial_sl_buffer"] < _ratio * _est_cost:
                 log.info(
-                    f"[SPIKE] Entry SKIPPED (sl_to_cost) | {sym} ltp={opt_price:.2f} "
+                    f"[{self.name}] Entry SKIPPED (sl_to_cost) | {sym} ltp={opt_price:.2f} "
                     f"| SL={CFG['initial_sl_buffer']}pts vs est round-trip cost="
                     f"{_est_cost:.2f}pts (ratio={CFG['initial_sl_buffer'] / _est_cost:.2f}"
                     f" < {_ratio}) — premium too high for a point-based stop"
@@ -643,7 +734,7 @@ class SpikeStrategy(BaseStrategy):
         result = self._place_buy(sym, token, CFG["quantity"], opt_price)
         if result is None:
             self._release_slot()
-            log.error(f"[SPIKE] BUY order FAILED for {sym} — entry aborted")
+            log.error(f"[{self.name}] BUY order FAILED for {sym} — entry aborted")
             return
 
         order_id, raw_fill = result
@@ -653,12 +744,12 @@ class SpikeStrategy(BaseStrategy):
         fill_price = raw_fill if self.LIVE_MODE else entry_fill(raw_fill)
         _rt_cost   = round_trip_cost_pts(fill_price, CFG["quantity"])
         log.info(
-            f"[SPIKE] Cost model | ltp={raw_fill:.2f} -> fill={fill_price:.2f} "
+            f"[{self.name}] Cost model | ltp={raw_fill:.2f} -> fill={fill_price:.2f} "
             f"| est round-trip cost={_rt_cost:.2f}pts"
         )
 
         log.info(
-            f"[SPIKE] BUY confirmed | pre_ltp={opt_price:.2f} "
+            f"[{self.name}] BUY confirmed | pre_ltp={opt_price:.2f} "
             f"fill_price={fill_price:.2f} | diff={fill_price - opt_price:+.2f}"
         )
 
@@ -666,7 +757,7 @@ class SpikeStrategy(BaseStrategy):
         sl_active_from = ts + timedelta(seconds=CFG["sl_grace_seconds"])
 
         log.info(
-            f"[SPIKE] SL grace period active until "
+            f"[{self.name}] SL grace period active until "
             f"{sl_active_from.strftime('%H:%M:%S')} "
             f"({CFG['sl_grace_seconds']}s after entry fill)"
         )
@@ -691,16 +782,16 @@ class SpikeStrategy(BaseStrategy):
 
         if signal == "CE" and self._pre_pe_token:
             self.unsubscribe_option(self._pre_pe_token)
-            log.info(f"[SPIKE] Unsubscribed unused PE leg: "
+            log.info(f"[{self.name}] Unsubscribed unused PE leg: "
                      f"{self._pre_pe_sym} ({self._pre_pe_token})")
         elif signal == "PE" and self._pre_ce_token:
             self.unsubscribe_option(self._pre_ce_token)
-            log.info(f"[SPIKE] Unsubscribed unused CE leg: "
+            log.info(f"[{self.name}] Unsubscribed unused CE leg: "
                      f"{self._pre_ce_sym} ({self._pre_ce_token})")
 
         mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
-            f"[SPIKE] [{mode_tag}] ENTRY {sym} @ {fill_price:.0f} | "
+            f"[{self.name}] [{mode_tag}] ENTRY {sym} @ {fill_price:.0f} | "
             f"SL={sl:.0f} | Trail kicks at {fill_price + CFG['trail_trigger_pts']:.0f} "
             f"| Reason={reason} | order_id={order_id}"
         )
@@ -771,7 +862,7 @@ class SpikeStrategy(BaseStrategy):
             if not still_open:
                 # Position closed by exchange (auto square-off or phantom fill)
                 log.warning(
-                    f"[SPIKE] SELL failed after 3 retries but position confirmed "
+                    f"[{self.name}] SELL failed after 3 retries but position confirmed "
                     f"CLOSED by exchange (auto square-off or phantom fill). "
                     f"Treating as closed."
                 )
@@ -783,7 +874,7 @@ class SpikeStrategy(BaseStrategy):
             # Position confirmed still OPEN — keep slot locked, start emergency thread
             log.error(
                 f"\n{'!'*60}\n"
-                f"[SPIKE] CRITICAL: SELL failed after 3 retries — "
+                f"[{self.name}] CRITICAL: SELL failed after 3 retries — "
                 f"position STILL OPEN for {t['symbol']}!\n"
                 f"  Slot is LOCKED — no other strategy can enter.\n"
                 f"  Emergency exit thread starting (retry every "
@@ -829,7 +920,7 @@ class SpikeStrategy(BaseStrategy):
                 _time_mod.sleep(retry_sec)
 
                 log.error(
-                    f"[SPIKE] Emergency exit attempt {attempt}/{max_attempts} | "
+                    f"[{self.name}] Emergency exit attempt {attempt}/{max_attempts} | "
                     f"{t['symbol']} | slot LOCKED"
                 )
 
@@ -837,7 +928,7 @@ class SpikeStrategy(BaseStrategy):
                 still_open = self._hub.order_router._is_position_open(t["symbol"])
                 if not still_open:
                     log.info(
-                        f"[SPIKE] Emergency exit: {t['symbol']} confirmed CLOSED "
+                        f"[{self.name}] Emergency exit: {t['symbol']} confirmed CLOSED "
                         f"by exchange on attempt {attempt}"
                     )
                     t["state"] = "CLOSED"
@@ -858,7 +949,7 @@ class SpikeStrategy(BaseStrategy):
                     t["state"] = "CLOSED"
                     self._release_slot()
                     log.info(
-                        f"[SPIKE] Emergency exit SUCCESS on attempt {attempt} "
+                        f"[{self.name}] Emergency exit SUCCESS on attempt {attempt} "
                         f"@ {sell_price:.0f}"
                     )
                     now = _now_ist()
@@ -867,14 +958,14 @@ class SpikeStrategy(BaseStrategy):
                     return
 
                 log.error(
-                    f"[SPIKE] Emergency exit attempt {attempt}/{max_attempts} FAILED | "
+                    f"[{self.name}] Emergency exit attempt {attempt}/{max_attempts} FAILED | "
                     f"{t['symbol']} | ltp={ltp:.0f}"
                 )
 
             # All attempts exhausted
             log.error(
                 f"\n{'!'*60}\n"
-                f"[SPIKE] GAVE UP emergency exit for {t['symbol']} after "
+                f"[{self.name}] GAVE UP emergency exit for {t['symbol']} after "
                 f"{max_attempts} attempts ({max_attempts * retry_sec // 60} min).\n"
                 f"  *** SQUARE OFF MANUALLY IN ZERODHA CONSOLE IMMEDIATELY! ***\n"
                 f"  Force-releasing slot to prevent indefinite lock.\n"
@@ -890,7 +981,7 @@ class SpikeStrategy(BaseStrategy):
             daemon=True,
         )
         thread.start()
-        log.info(f"[SPIKE] Emergency exit thread started for {t['symbol']}")
+        log.info(f"[{self.name}] Emergency exit thread started for {t['symbol']}")
 
     # ── Exit finalize (shared by normal + emergency paths) ────────────────────
 
@@ -927,7 +1018,7 @@ class SpikeStrategy(BaseStrategy):
 
         mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
-            f"[SPIKE] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
+            f"[{self.name}] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
             f"(ltp={raw_sell:.2f}) | gross={gross_pnl:.0f} net={pnl:.0f} "
             f"| cost_drag={gross_pnl - pnl:.0f} | Today {self._today_pnl:.0f} "
             f"| order_id={order_id}"
@@ -965,7 +1056,7 @@ class SpikeStrategy(BaseStrategy):
             self._opt_8s        = None
             _cap_txt = f"/{CFG['max_trades_day']}" if CFG["max_trades_day"] else ""
             log.info(
-                f"[SPIKE] Re-armed for next signal "
+                f"[{self.name}] Re-armed for next signal "
                 f"(trades today={self._trades_today}{_cap_txt}, "
                 f"Today {self._today_pnl:.0f})"
             )
@@ -1012,7 +1103,7 @@ class SpikeStrategy(BaseStrategy):
         return current_sl
 
     def _log_csv(self, row: dict):
-        fname  = CFG["csv_file"]
+        fname  = self.CSV_FILE
         exists = os.path.isfile(fname)
         fields = ["timestamp", "symbol", "action", "price",
                   "sl", "status", "pnl", "reason", "gap_direction", "mode", "order_id"]
@@ -1023,14 +1114,14 @@ class SpikeStrategy(BaseStrategy):
             w.writerow({k: row.get(k, "") for k in fields})
 
     def eod_summary(self):
-        log.info(f"\n[SPIKE] {'='*50}")
-        log.info(f"[SPIKE] END OF DAY | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
-        log.info(f"[SPIKE] Gap direction  : {self._gap_direction}")
-        log.info(f"[SPIKE] Trades taken   : {self._trades_today}")
+        log.info(f"\n[{self.name}] {'='*50}")
+        log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
+        log.info(f"[{self.name}] Gap direction  : {self._gap_direction}")
+        log.info(f"[{self.name}] Trades taken   : {self._trades_today}")
         for t in self._completed:
-            log.info(f"[SPIKE]   {t['symbol']} {t['exit_reason']} "
+            log.info(f"[{self.name}]   {t['symbol']} {t['exit_reason']} "
                      f"entry={t['entry']:.0f} exit={t['exit_price']:.0f} PnL={t['pnl']:.0f}")
-        log.info(f"[SPIKE] Today PnL      : {self._today_pnl:.0f}")
-        log.info(f"[SPIKE] {'='*50}\n")
+        log.info(f"[{self.name}] Today PnL      : {self._today_pnl:.0f}")
+        log.info(f"[{self.name}] {'='*50}\n")
 
 

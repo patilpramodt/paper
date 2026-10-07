@@ -256,9 +256,23 @@ class SpikeNiftyStrategy(BaseStrategy):
     # Expose the module-level flag as a class attribute so BaseStrategy works
     LIVE_MODE = LIVE_MODE
 
+    # ── Entry-logic variant ───────────────────────────────────────────────────
+    # Subclasses in strategies/spike_variants.py override these to A/B test
+    # different entry rules alongside this one. SL / trail / exits are shared.
+    #   "2CANDLE"  : first 2 consecutive same-colour 10s candles (this class)
+    #   "COLOR_5S" : colour of 9:15:00 → 9:15:05 move, one shot
+    #   "GAP_2M"   : gap day only; colour of 9:15:00 → 9:17:00 move must
+    #                match the gap direction, one shot
+    ENTRY_MODE    = "2CANDLE"
+    STRATEGY_NAME = "SPIKE_NIFTY"
+    CSV_FILE      = CFG["csv_file"]
+    # Seconds after start_time at which the one-shot colour check fires
+    # (ignored by 2CANDLE).
+    OPEN_WAIT_SEC = 0
+
     @property
     def name(self) -> str:
-        return "SPIKE_NIFTY"
+        return self.STRATEGY_NAME
 
     def __init__(self, market_hub):
         super().__init__(market_hub)
@@ -283,7 +297,12 @@ class SpikeNiftyStrategy(BaseStrategy):
         self._completed      : list           = []
         self._pending_entry  = None
 
-        self._prev_body_high    : Optional[float] = None
+        # One-shot open-colour state (COLOR_5S / GAP_2M only)
+        self._open_price     : Optional[float]    = None
+        self._open_tick_ts   : Optional[datetime] = None
+        self._open_check_done: bool               = False
+
+        self._prev_body_high   : Optional[float] = None
         self._prev_body_low     : Optional[float] = None
         self._prev_last5m_high  : Optional[float] = None
         self._prev_last5m_low   : Optional[float] = None
@@ -293,7 +312,7 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         self._lock = threading.Lock()
 
-        mode_tag = "[LIVE]" if LIVE_MODE else "[PAPER]"
+        mode_tag = "[LIVE]" if self.LIVE_MODE else "[PAPER]"
         log.info(
             f"[{self.name}] Initialized {mode_tag} | "
             f"qty={CFG['quantity']} SL=−{CFG['initial_sl_buffer']} "
@@ -331,7 +350,7 @@ class SpikeNiftyStrategy(BaseStrategy):
             f"[{self.name}] Pre-market | "
             f"body=[{self._prev_body_low} – {self._prev_body_high}] "
             f"prev_close={pm.prev_close} expiry={pm.expiry_date} "
-            f"mode={'LIVE' if LIVE_MODE else 'PAPER'}"
+            f"mode={'LIVE' if self.LIVE_MODE else 'PAPER'}"
         )
 
         ref_price = pm.prev_close or pm.prev_last5m_close
@@ -420,6 +439,8 @@ class SpikeNiftyStrategy(BaseStrategy):
 
         if not self._market_opened and t >= CFG["start_time"]:
             self._market_opened = True
+            self._open_price    = price
+            self._open_tick_ts  = tick_ts or ts
             log.info(f"[{self.name}] Market open tick received: {price:.2f}")
 
             if self._pre_ce_token is None or self._pre_pe_token is None:
@@ -450,9 +471,12 @@ class SpikeNiftyStrategy(BaseStrategy):
         if (not self._trade_done and
                 self._trade is None and
                 self._pending_entry is None and   # BUG FIX 7
-                self._cooldown_ok(ts) and
-                closed_8s is not None):
-            self._check_2candle_signal(closed_8s, price, ts)
+                self._cooldown_ok(ts)):
+            if self.ENTRY_MODE == "2CANDLE":
+                if closed_8s is not None:
+                    self._check_2candle_signal(closed_8s, price, ts)
+            elif not self._open_check_done:
+                self._check_open_color_signal(price, ts, tick_ts or ts)
 
         # Force-exit an open trade at the end of its holding window. Original
         # behaviour force-closed at spike_exit_time (09:30) even if the trade
@@ -682,6 +706,73 @@ class SpikeNiftyStrategy(BaseStrategy):
         # BUG FIX 1: was `f"2tick_candle_{color.lower()}"` — `color` was never defined.
         self._build_entry(sym, token, signal, ts, reason="2x10s_signal")
 
+    # ── One-shot open-colour signal (COLOR_5S / GAP_2M) ───────────────────────
+
+    def _check_open_color_signal(self, index_price: float, ts: datetime, tick_ts: datetime):
+        """
+        Colour of the move from the 9:15 open tick to the first tick at or
+        after start_time + OPEN_WAIT_SEC. Green → CE, red → PE, flat → skip.
+        GAP_2M additionally requires a gap day and colour == gap direction.
+        Evaluated exactly once per day; no trade on a miss.
+        """
+        anchor = tick_ts.replace(hour=CFG["start_time"].hour,
+                                 minute=CFG["start_time"].minute,
+                                 second=0, microsecond=0)
+        check_at = anchor + timedelta(seconds=self.OPEN_WAIT_SEC)
+        if tick_ts < check_at:
+            return
+
+        self._open_check_done = True
+
+        def _skip(why: str):
+            log.info(f"[{self.name}] No entry today — {why}")
+            self._trade_done = True
+
+        # The open tick must have arrived before the check time, otherwise
+        # we started late and _open_price is not the real 9:15 open.
+        if self._open_price is None or self._open_tick_ts is None or \
+                self._open_tick_ts >= check_at:
+            _skip(f"no open tick before {check_at.strftime('%H:%M:%S')} "
+                  f"(first tick at {self._open_tick_ts})")
+            return
+
+        move = index_price - self._open_price
+        color = "CE" if move > 0 else "PE" if move < 0 else None
+        log.info(f"[{self.name}] Open colour check @ {tick_ts.strftime('%H:%M:%S')} | "
+                 f"open={self._open_price:.2f} now={index_price:.2f} "
+                 f"move={move:+.2f} → {color or 'FLAT'} | gap={self._gap_direction}")
+
+        if color is None:
+            _skip("flat move, no colour")
+            return
+
+        if self.ENTRY_MODE == "GAP_2M":
+            if self._gap_direction not in ("CE", "PE"):
+                _skip(f"not a gap day (gap={self._gap_direction})")
+                return
+            if color != self._gap_direction:
+                _skip(f"{self.OPEN_WAIT_SEC}s colour {color} disagrees with gap "
+                      f"{self._gap_direction}")
+                return
+
+        signal = color
+        if signal == "CE" and self._pre_ce_token:
+            sym, token = self._pre_ce_sym, self._pre_ce_token
+        elif signal == "PE" and self._pre_pe_token:
+            sym, token = self._pre_pe_sym, self._pre_pe_token
+        else:
+            from core.instruments import get_atm_strike
+            strike = get_atm_strike(index_price, step=NIFTY_STRIKE_STEP)
+            token, sym = self._instruments.get_option_token(strike, signal, self._expiry_date)
+
+        if not token or not sym:
+            _skip(f"no token for {signal}")
+            return
+
+        self.subscribe_option(token)
+        self._build_entry(sym, token, signal, ts,
+                          reason=f"{self.ENTRY_MODE.lower()}_signal")
+
     # ── Entry ─────────────────────────────────────────────────────────────────
 
     def _build_entry(self, sym: str, token: int, signal: str, ts: datetime, reason: str):
@@ -778,7 +869,7 @@ class SpikeNiftyStrategy(BaseStrategy):
             self.unsubscribe_option(self._pre_ce_token)
             log.info(f"[{self.name}] Unsubscribed unused CE: {self._pre_ce_sym} ({self._pre_ce_token})")
 
-        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
             f"[{self.name}] [{mode_tag}] ENTRY {sym} @ {fill_price:.0f} | "
             f"SL={sl:.0f} (−{CFG['initial_sl_buffer']}) | "
@@ -848,7 +939,7 @@ class SpikeNiftyStrategy(BaseStrategy):
             return
 
         # ── ALL 3 RETRIES FAILED ───────────────────────────────────────────────
-        if LIVE_MODE:
+        if self.LIVE_MODE:
             still_open = self._hub.order_router._is_position_open(t["symbol"])
 
             if not still_open:
@@ -933,7 +1024,7 @@ class SpikeNiftyStrategy(BaseStrategy):
                 # Refresh LTP and try SELL
                 ltp = self.get_price(t["token"]) or ref_price
                 result = self._hub.order_router.place_sell(
-                    self.name, t["symbol"], t["token"], t["qty"], ltp, LIVE_MODE
+                    self.name, t["symbol"], t["token"], t["qty"], ltp, self.LIVE_MODE
                 )
 
                 if result:
@@ -1007,7 +1098,7 @@ class SpikeNiftyStrategy(BaseStrategy):
         if (not CFG["full_day_mode"]) or (_cap is not None and self._trades_today >= _cap):
             self._trade_done = True
 
-        mode_tag = "LIVE" if LIVE_MODE else "PAPER"
+        mode_tag = "LIVE" if self.LIVE_MODE else "PAPER"
         log.info(
             f"[{self.name}] [{mode_tag}] EXIT [{reason}] {t['symbol']} @ {sell_price:.2f} "
             f"(ltp={raw_sell:.2f}) | gross={gross_pnl:.0f} net={pnl:.0f} "
@@ -1106,7 +1197,7 @@ class SpikeNiftyStrategy(BaseStrategy):
         return current_sl
 
     def _log_csv(self, row: dict):
-        fname  = CFG["csv_file"]
+        fname  = self.CSV_FILE
         exists = os.path.isfile(fname)
         fields = [
             "timestamp", "symbol", "action", "price",
@@ -1120,7 +1211,7 @@ class SpikeNiftyStrategy(BaseStrategy):
 
     def eod_summary(self):
         log.info(f"\n[{self.name}] {'='*50}")
-        log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
+        log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if self.LIVE_MODE else 'PAPER'}")
         log.info(f"[{self.name}] Gap direction  : {self._gap_direction}")
         log.info(f"[{self.name}] Trades taken   : {self._trades_today}")
         for t in self._completed:

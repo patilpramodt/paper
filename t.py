@@ -94,6 +94,8 @@ from core.tick_recorder import TickRecorder
 # ── Strategies — ADD/REMOVE here to enable/disable ──────────────────────────
 from strategies.spike                import SpikeStrategy
 from strategies.spike_nifty          import SpikeNiftyStrategy
+from strategies.spike_variants       import (SpikeColor5sStrategy, SpikeGap2mStrategy,
+                                            SpikeNiftyColor5sStrategy, SpikeNiftyGap2mStrategy)
 from strategies.orb_v2               import ORBStrategy
 from strategies.scalper_v7_strategy  import ScalperV7Strategy
 from strategies.bb_stoch_strategy         import BBStochStrategy
@@ -118,6 +120,10 @@ from strategies.stock_opt_morning_breakout_strategy import StockOptMorningBreako
 ACTIVE_STRATEGIES = [
     SpikeStrategy,                    # Spike:                    9:15-9:30   BankNifty gap/spike
     SpikeNiftyStrategy,               # Spike Nifty:              9:15-9:30   Nifty 50 gap/spike
+    SpikeColor5sStrategy,             # Spike 5s colour (test):   9:15:05     one-shot, 5s open colour → CE/PE (PAPER only)
+    SpikeGap2mStrategy,               # Spike gap+2m (test):      9:17        one-shot, gap day + 2-min colour agrees (PAPER only)
+    SpikeNiftyColor5sStrategy,        # Spike Nifty 5s (test):    9:15:05     one-shot, 5s open colour → CE/PE (PAPER only)
+    SpikeNiftyGap2mStrategy,          # Spike Nifty gap+2m (test): 9:17       one-shot, gap day + 2-min colour agrees (PAPER only)
     ORBStrategy,                      # ORB v2:                   9:40-10:15  breakout trade
     ScalperV7Strategy,                # Scalper V7:               all-day     11-filter momentum scalper
     BBStochStrategy,                  # BB+Stoch BankNifty:       all-day     Bollinger+Stoch+Volume
