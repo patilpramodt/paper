@@ -110,3 +110,6 @@ trader.pid
 
 # Recorded market data (core/tick_recorder.py)
 /data/
+
+# Claude Code personal settings
+.claude/settings.local.json
