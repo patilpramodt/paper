@@ -112,6 +112,7 @@ from strategies.stock_options_scanner_strategy import StockOptionsScannerStrateg
 from strategies.stock_options_scanner_realtime_strategy import StockOptionsScannerRealtimeStrategy
 from strategies.stock_options_scanner_orderflow_strategy import StockOptionsScannerOrderflowStrategy
 from strategies.stock_opt_morning_breakout_strategy import StockOptMorningBreakoutStrategy
+from strategies.orb30_strategy import ORB30Strategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -140,6 +141,7 @@ ACTIVE_STRATEGIES = [
     StockOptionsScannerRealtimeStrategy,  # Stock Opt Scanner RT:  9:30-14:45  same 15 stocks, real-time tick-level volume-surge entry (PAPER only)
     StockOptionsScannerOrderflowStrategy, # Stock Opt Scanner FLOW: 9:30-14:45 same 15 stocks, book+flow imbalance only, flat Rs300 TP / Rs2000 SL (PAPER only)
     StockOptMorningBreakoutStrategy,      # Stock Opt Morning BO:   9:45-11:30 same 15 stocks, 5-min HOD/LOD break + NIFTY bias + RS, 2/3 ATR spot exits (PAPER only)
+    ORB30Strategy,                        # ORB30:                  9:45-15:15 21 stocks + NIFTY + BANKNIFTY, first 30-min candle ±2 break on 30-min close, SL candle ∓5, Rs500 TP, 1 trade/instrument (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +221,7 @@ def setup_logging():
         "strategy.banknifty_candle_breakout":     "banknifty_candle_breakout.log",
         "strategy.nifty_candle_breakout_v2":       "nifty_candle_breakout_v2.log",
         "strategy.banknifty_candle_breakout_v2":   "banknifty_candle_breakout_v2.log",
+        "strategy.orb30":                          "orb30.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -451,7 +454,13 @@ def main():
             strat_index = getattr(strat, "INDEX_TOKEN", None)
             # Checked BEFORE the INDEX_TOKEN branch: STOCK_OPT_MORNING_BO has
             # INDEX_TOKEN=256265 (for NIFTY ticks) but needs the stock chain.
-            if strat.name in ("STOCK_OPT_SCANNER_RT", "STOCK_OPT_SCANNER_FLOW"):
+            if strat.name == "ORB30":
+                # Stocks + both indices: the rolled stock chain (no expiry-day
+                # lottery tickets) plus the NIFTY and BANKNIFTY index stores.
+                ok = strat.pre_market(pm, stock_instruments_rolled,
+                                      index_stores={"NIFTY": nifty_instruments,
+                                                    "BANKNIFTY": instruments})
+            elif strat.name in ("STOCK_OPT_SCANNER_RT", "STOCK_OPT_SCANNER_FLOW"):
                 ok = strat.pre_market(pm, stock_instruments_rolled)
             elif strat.name in ("STOCK_OPT_SCANNER", "STOCK_OPT_MORNING_BO"):
                 # All use the same fixed 15-stock chain. PreMarketData is
