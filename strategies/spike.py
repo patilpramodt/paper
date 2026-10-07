@@ -188,8 +188,8 @@ CFG = {
     # opened straight into the square-off.
     "last_entry_time"        : dtime(15, 0),
 
-    # None = unlimited trades per day. Set an int to cap it.
-    "max_trades_day"         : None,
+    # None = unlimited trades per day. Capped at 1: one trade per day.
+    "max_trades_day"         : 1,
 
     # Seconds to wait after an exit before a new entry signal is accepted.
     # 0 = no cooldown (the 2x10s candle pattern already imposes ~20s of
