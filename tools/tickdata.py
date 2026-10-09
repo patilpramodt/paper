@@ -14,25 +14,90 @@ tools/tickdata.py — load our own recorded market data (core/tick_recorder.py).
     instruments('2026-10-07'), premarket('2026-10-07')
 
 Groups: index, fut, nifty_opt, banknifty_opt, stock, stock_opt, other.
+
+Days pruned from this machine (tools/upload_ticks.py keeps the last KEEP_DAYS)
+are fetched on demand from the GitHub Release archive in TICK_REPO and cached
+back under data/ticks/<day>/. days(remote=True) lists every archived day.
 """
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 
 import pandas as pd
 
 ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 TICKS = os.path.join(ROOT, "ticks")
 CANDLES = os.path.join(ROOT, "candles")
+TICK_REPO = os.environ.get("TICK_REPO", "patilpramodt/TickData")
+SECRETS = os.path.join(os.path.dirname(ROOT), "config_secrets.env")
 
 
-def days():
-    return sorted(d for d in os.listdir(TICKS) if os.path.isdir(os.path.join(TICKS, d))) \
-        if os.path.isdir(TICKS) else []
+def gh_env():
+    """os.environ plus GH_TOKEN from config_secrets.env (None if no token anywhere)."""
+    env = dict(os.environ)
+    if env.get("GH_TOKEN"):
+        return env
+    if os.path.isfile(SECRETS):
+        for line in open(SECRETS):
+            k, _, v = line.strip().partition("=")
+            if k == "GH_TOKEN" and v:
+                env["GH_TOKEN"] = v.strip().strip('"').strip("'")
+                return env
+    return None
+
+
+def gh(*args, check=True):
+    env = gh_env()
+    if env is None:
+        raise RuntimeError("GH_TOKEN not set (add GH_TOKEN=... to config_secrets.env)")
+    return subprocess.run(["gh", *args, "--repo", TICK_REPO], env=env,
+                          capture_output=True, text=True, check=check)
+
+
+def remote_assets(day):
+    """{asset_name: size} in the day's release, or None if there is no release."""
+    r = gh("release", "view", str(day), "--json", "assets", check=False)
+    if r.returncode != 0:
+        return None
+    return {a["name"]: a["size"] for a in json.loads(r.stdout)["assets"]}
+
+
+def days(remote=False):
+    """Recorded days on this machine; remote=True adds every day archived on GitHub."""
+    local = {d for d in os.listdir(TICKS) if os.path.isdir(os.path.join(TICKS, d))} \
+        if os.path.isdir(TICKS) else set()
+    if remote:
+        r = gh("release", "list", "--limit", "5000", "--json", "tagName")
+        local |= {x["tagName"] for x in json.loads(r.stdout)}
+    return sorted(local)
+
+
+def _download(day, asset, dest):
+    """Fetch one release asset to dest. False if the day or asset isn't archived."""
+    with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+        r = gh("release", "download", str(day), "-p", asset, "-D", tmp, check=False)
+        src = os.path.join(tmp, asset)
+        if r.returncode != 0 or not os.path.isfile(src):
+            return False
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(src, dest)
+        print(f"tickdata: downloaded {day}/{asset} ({os.path.getsize(dest) / 1e6:,.1f} MB)")
+        return True
 
 
 def _p(day, name):
-    return os.path.join(TICKS, str(day), name)
+    """Local path of a day's file, downloading it from the archive if it was pruned."""
+    path = os.path.join(TICKS, str(day), name)
+    if not os.path.isfile(path) and gh_env() is not None:
+        _download(day, name, path)
+    return path
+
+
+def has(day, name):
+    return os.path.isfile(_p(day, name))
 
 
 def instruments(day):
@@ -112,6 +177,8 @@ def resample(df, rule="1min", ts_col="recv_ts", fill=False):
 def candles(day, group, rule="1min", symbol=None, fill=False):
     """Candles of any size for one day (1-min read from the prebuilt file if present)."""
     pre = os.path.join(CANDLES, "1m", str(day), f"{group}.csv.gz")
+    if rule == "1min" and not fill and not os.path.isfile(pre) and gh_env() is not None:
+        _download(day, f"candles_1m_{group}.csv.gz", pre)
     if rule == "1min" and not fill and os.path.isfile(pre):
         df = pd.read_csv(pre, parse_dates=["ts"])
         return df[df.symbol == symbol] if symbol else df
@@ -126,8 +193,8 @@ def candles_range(start, end, group, rule="1D", symbol=None, underlying=None):
     Pass underlying= to select by underlying for options (e.g. all NIFTY strikes).
     """
     frames = []
-    for d in days():
-        if str(start) <= d <= str(end) and os.path.isfile(_p(d, f"ticks_{group}.csv.gz")):
+    for d in days(remote=gh_env() is not None):
+        if str(start) <= d <= str(end) and has(d, f"ticks_{group}.csv.gz"):
             t = ticks(d, group, symbol=symbol)
             if underlying is not None:
                 inst = instruments(d)
