@@ -113,6 +113,7 @@ from strategies.stock_options_scanner_realtime_strategy import StockOptionsScann
 from strategies.stock_options_scanner_orderflow_strategy import StockOptionsScannerOrderflowStrategy
 from strategies.stock_opt_morning_breakout_strategy import StockOptMorningBreakoutStrategy
 from strategies.orb30_strategy import ORB30Strategy
+from strategies.orb30_rvol_strategy import ORB30RvolStrategy, ORB30RvolTrailStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -142,6 +143,8 @@ ACTIVE_STRATEGIES = [
     StockOptionsScannerOrderflowStrategy, # Stock Opt Scanner FLOW: 9:30-14:45 same 15 stocks, book+flow imbalance only, flat Rs300 TP / Rs2000 SL (PAPER only)
     StockOptMorningBreakoutStrategy,      # Stock Opt Morning BO:   9:45-11:30 same 15 stocks, 5-min HOD/LOD break + NIFTY bias + RS, 2/3 ATR spot exits (PAPER only)
     ORB30Strategy,                        # ORB30:                  9:45-15:15 21 stocks + NIFTY + BANKNIFTY, first 30-min candle ±2 break on 30-min close, SL candle ∓5, Rs500 TP, 1 trade/instrument (PAPER only)
+    ORB30RvolStrategy,                    # ORB30 RVOL (test):      ORB30 on 21 stocks only, first-30m volume >= 2x 14-day avg, candle SL, no target, hold to 15:15 (PAPER only)
+    ORB30RvolTrailStrategy,               # ORB30 RVOL TRAIL (test): same as ORB30 RVOL + Rs1000 step trail on option P&L (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -222,6 +225,8 @@ def setup_logging():
         "strategy.nifty_candle_breakout_v2":       "nifty_candle_breakout_v2.log",
         "strategy.banknifty_candle_breakout_v2":   "banknifty_candle_breakout_v2.log",
         "strategy.orb30":                          "orb30.log",
+        "strategy.orb30_rvol":                     "orb30_rvol.log",
+        "strategy.orb30_rvol_trail":               "orb30_rvol_trail.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
@@ -454,7 +459,7 @@ def main():
             strat_index = getattr(strat, "INDEX_TOKEN", None)
             # Checked BEFORE the INDEX_TOKEN branch: STOCK_OPT_MORNING_BO has
             # INDEX_TOKEN=256265 (for NIFTY ticks) but needs the stock chain.
-            if strat.name == "ORB30":
+            if strat.name in ("ORB30", "ORB30_RVOL", "ORB30_RVOL_TRAIL"):
                 # Stocks + both indices: the rolled stock chain (no expiry-day
                 # lottery tickets) plus the NIFTY and BANKNIFTY index stores.
                 ok = strat.pre_market(pm, stock_instruments_rolled,

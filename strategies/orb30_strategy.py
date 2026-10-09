@@ -87,6 +87,12 @@ class ORB30Strategy(BaseStrategy):
     INDEX_TOKEN = None          # BankNifty ticks via on_tick (also the heartbeat clock)
     LIVE_MODE   = LIVE_MODE
 
+    # Overridden by the variants in orb30_rvol_strategy.py
+    _log          = log
+    CSV_FILE      = CFG["csv_file"]
+    TARGET_RS     = CFG["target_rs"]   # None = no rupee target
+    TRADE_INDICES = True
+
     def __init__(self, market_hub):
         super().__init__(market_hub)
         self._stock_store = None
@@ -113,7 +119,7 @@ class ORB30Strategy(BaseStrategy):
 
     def pre_market(self, premarket_data, instruments, index_stores=None) -> bool:
         if not CFG["enabled"]:
-            log.info(f"[{self.name}] disabled via CFG")
+            self._log.info(f"[{self.name}] disabled via CFG")
             return False
 
         from core.instruments import StockOptionStore
@@ -127,12 +133,14 @@ class ORB30Strategy(BaseStrategy):
                 self.subscribe_option(tok)
                 self._hub.set_token_owner(tok, self.name)
         else:
-            log.error(f"[{self.name}] no StockOptionStore — trading indices only")
+            self._log.error(f"[{self.name}] no StockOptionStore — trading indices only")
 
         for sym, tok in (("NIFTY", NIFTY_TOKEN), ("BANKNIFTY", BANKNIFTY_TOKEN)):
+            if not self.TRADE_INDICES:
+                break
             store = (index_stores or {}).get(sym)
             if store is None or getattr(store, "_df", None) is None:
-                log.error(f"[{self.name}] no {sym} InstrumentStore — {sym} skipped")
+                self._log.error(f"[{self.name}] no {sym} InstrumentStore — {sym} skipped")
                 continue
             self._index_store[sym] = store
             self._add_inst(sym, tok, is_index=True)
@@ -142,10 +150,10 @@ class ORB30Strategy(BaseStrategy):
 
         self._seed_today()
         self._ready = True
-        log.info(
+        self._log.info(
             f"[{self.name}] ready | PAPER | {len(self._inst)} instruments | "
             f"mark ±{CFG['mark_buffer_pts']} SL buf {CFG['sl_buffer_pts']} | "
-            f"target Rs{CFG['target_rs']:.0f} | EOD {CFG['close_time']:%H:%M}"
+            f"{self._exit_desc()} | EOD {CFG['close_time']:%H:%M}"
         )
         return True
 
@@ -171,7 +179,7 @@ class ORB30Strategy(BaseStrategy):
                 raw = kite.historical_data(st["token"], start.strftime("%Y-%m-%d %H:%M:%S"),
                                            now.strftime("%Y-%m-%d %H:%M:%S"), "30minute")
             except Exception as e:
-                log.warning(f"[{self.name}] seed failed for {sym}: {e}")
+                self._log.warning(f"[{self.name}] seed failed for {sym}: {e}")
                 continue
             finally:
                 time.sleep(0.35)   # Kite historical API: 3 requests/second
@@ -181,7 +189,7 @@ class ORB30Strategy(BaseStrategy):
                     break
                 bar = {"ts": ts, "o": r["open"], "h": r["high"], "l": r["low"], "c": r["close"]}
                 self._on_bar_close(sym, bar, now, seeding=True)
-        log.info(f"[{self.name}] seeded today's candles for {len(self._inst)} instruments")
+        self._log.info(f"[{self.name}] seeded today's candles for {len(self._inst)} instruments")
 
     # ══════════════════════════════════════════════════════════════════════════
     # TICKS
@@ -260,7 +268,7 @@ class ORB30Strategy(BaseStrategy):
         if bt == CFG["session_open"]:
             st["upper"] = round(bar["h"] + st["mark_buf"], 2)
             st["lower"] = round(bar["l"] - st["mark_buf"], 2)
-            log.info(f"[{self.name}] {sym} first candle H {bar['h']:.2f} L {bar['l']:.2f} "
+            self._log.info(f"[{self.name}] {sym} first candle H {bar['h']:.2f} L {bar['l']:.2f} "
                      f"→ marks {st['upper']:.2f} / {st['lower']:.2f}")
             return
         if seeding or st["upper"] is None or st["traded"] or self._eod_done:
@@ -277,7 +285,7 @@ class ORB30Strategy(BaseStrategy):
             side, sl = "DOWN", round(bar["h"] + st["sl_buf"], 2)
         else:
             return
-        log.info(f"[{self.name}] {sym} {bar['ts']:%H:%M} candle close {c:.2f} "
+        self._log.info(f"[{self.name}] {sym} {bar['ts']:%H:%M} candle close {c:.2f} "
                  f"{'>' if side == 'UP' else '<'} mark {st['upper'] if side == 'UP' else st['lower']:.2f} "
                  f"→ {side}, SL spot {sl:.2f}")
         self._arm_entry(sym, side, c, sl, ts)
@@ -312,7 +320,7 @@ class ORB30Strategy(BaseStrategy):
         opt_type = "CE" if side == "UP" else "PE"
         tok, opt_symbol, lot, strike = self._pick_option(sym, spot, opt_type)
         if not tok or not lot:
-            log.warning(f"[{self.name}] {sym} no {opt_type} contract near {strike} — signal skipped")
+            self._log.warning(f"[{self.name}] {sym} no {opt_type} contract near {strike} — signal skipped")
             return
         if tok in self._pending:
             return
@@ -326,7 +334,7 @@ class ORB30Strategy(BaseStrategy):
             # Stock-option legs are owned by the stock strategies; join them.
             # Index strikes stay broadcast — owning would cut other strategies off.
             self._hub.set_token_owner(tok, self.name)
-        log.info(f"[{self.name}] {sym} arming {opt_symbol} (lot {lot})")
+        self._log.info(f"[{self.name}] {sym} arming {opt_symbol} (lot {lot})")
         px = self.get_price(tok)
         if px:
             self._try_fill_pending(tok, px, ts)
@@ -345,7 +353,7 @@ class ORB30Strategy(BaseStrategy):
         spread = self._spread(tok, ltp, self._inst[sym]["is_index"])
         res = self._place_buy(p["opt_symbol"], tok, p["qty"], ltp)
         if res is None:
-            log.error(f"[{self.name}] {p['opt_symbol']} BUY failed")
+            self._log.error(f"[{self.name}] {p['opt_symbol']} BUY failed")
             self._drop_pending(tok)
             return
         order_id, raw_fill = res
@@ -356,8 +364,8 @@ class ORB30Strategy(BaseStrategy):
         self._positions[sym] = tr
         self._opt_owner[tok] = sym
         self._inst[sym]["traded"] = True
-        log.info(f"[{self.name}] ENTRY {p['opt_symbol']} @ {fill:.2f} qty={p['qty']} | "
-                 f"spot {p['spot']:.2f} SL {p['sl_spot']:.2f} | target Rs{CFG['target_rs']:.0f}")
+        self._log.info(f"[{self.name}] ENTRY {p['opt_symbol']} @ {fill:.2f} qty={p['qty']} | "
+                 f"spot {p['spot']:.2f} SL {p['sl_spot']:.2f} | {self._exit_desc()}")
 
     def _drop_pending(self, tok: int):
         p = self._pending.pop(tok, None)
@@ -382,7 +390,7 @@ class ORB30Strategy(BaseStrategy):
         if tr is None:
             return
         exit_px = max(0.05, ltp - tr["spread"] / 2.0)
-        if (exit_px - tr["entry"]) * tr["qty"] >= CFG["target_rs"]:
+        if self.TARGET_RS is not None and (exit_px - tr["entry"]) * tr["qty"] >= self.TARGET_RS:
             self._exit(sym, "TARGET", ts, ltp)
 
     def _heartbeat(self, ts: datetime):
@@ -403,7 +411,7 @@ class ORB30Strategy(BaseStrategy):
 
         for tok in list(self._pending):
             if (ts - self._pending[tok]["ts"]).total_seconds() > CFG["opt_tick_wait_s"]:
-                log.warning(f"[{self.name}] {self._pending[tok]['opt_symbol']} no option tick — entry dropped")
+                self._log.warning(f"[{self.name}] {self._pending[tok]['opt_symbol']} no option tick — entry dropped")
                 self._drop_pending(tok)
 
         for sym in list(self._positions):
@@ -425,14 +433,14 @@ class ORB30Strategy(BaseStrategy):
             ltp = self.get_price(tok)
             pts = self.get_price_ts(tok)
             if pts and (ts - pts).total_seconds() > CFG["stale_price_sec"]:
-                log.warning(f"[{self.name}] {tr['opt_symbol']} exit on a {(ts - pts).total_seconds():.0f}s-old price")
+                self._log.warning(f"[{self.name}] {tr['opt_symbol']} exit on a {(ts - pts).total_seconds():.0f}s-old price")
             if ltp is None:
                 ltp = tr["entry"]
-                log.error(f"[{self.name}] {tr['opt_symbol']} NO option price at exit — booked at entry")
+                self._log.error(f"[{self.name}] {tr['opt_symbol']} NO option price at exit — booked at entry")
 
         res = self._place_sell_with_retry(tr["opt_symbol"], tok, qty, ltp)
         if res is None:
-            log.error(f"[{self.name}] EXIT FAILED {tr['opt_symbol']} — MANUAL CHECK REQUIRED")
+            self._log.error(f"[{self.name}] EXIT FAILED {tr['opt_symbol']} — MANUAL CHECK REQUIRED")
             return
         _, raw_exit = res
         exit_px = round(max(0.05, raw_exit - tr["spread"] / 2.0), 2) if not LIVE_MODE else raw_exit
@@ -447,7 +455,7 @@ class ORB30Strategy(BaseStrategy):
         if not self._inst[sym]["is_index"]:
             self._hub.clear_token_owner(tok, self.name)
         self.unsubscribe_option(tok)
-        log.info(f"[{self.name}] EXIT [{reason}] {tr['opt_symbol']} {tr['entry']:.2f} → {exit_px:.2f} | "
+        self._log.info(f"[{self.name}] EXIT [{reason}] {tr['opt_symbol']} {tr['entry']:.2f} → {exit_px:.2f} | "
                  f"gross={gross:.0f} net={net:.0f} | day={self._today_pnl:.0f}")
         self._log_trade(tr)
 
@@ -461,8 +469,11 @@ class ORB30Strategy(BaseStrategy):
         "entry_spot", "sl_spot", "exit_spot", "mode",
     ]
 
-    def _log_trade(self, tr: dict):
-        row = {
+    def _exit_desc(self) -> str:
+        return f"target Rs{self.TARGET_RS:.0f}" if self.TARGET_RS is not None else "no target"
+
+    def _row(self, tr: dict) -> dict:
+        return {
             "date": tr["entry_ts"].strftime("%Y-%m-%d"),
             "entry_time": tr["entry_ts"].strftime("%H:%M:%S"),
             "exit_time": tr["exit_ts"].strftime("%H:%M:%S"),
@@ -472,7 +483,10 @@ class ORB30Strategy(BaseStrategy):
             "entry_spot": tr["entry_spot"], "sl_spot": tr["sl_spot"],
             "exit_spot": tr.get("exit_spot") or "", "mode": "LIVE" if LIVE_MODE else "PAPER",
         }
-        fname = CFG["csv_file"]
+
+    def _log_trade(self, tr: dict):
+        row = self._row(tr)
+        fname = self.CSV_FILE
         try:
             exists = os.path.isfile(fname)
             with open(fname, "a", newline="") as f:
@@ -481,24 +495,24 @@ class ORB30Strategy(BaseStrategy):
                     w.writeheader()
                 w.writerow(row)
         except Exception as e:
-            log.error(f"[{self.name}] CSV write failed ({fname}): {e}")
+            self._log.error(f"[{self.name}] CSV write failed ({fname}): {e}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # EOD
     # ══════════════════════════════════════════════════════════════════════════
 
     def eod_summary(self):
-        log.info(f"[{self.name}] {'=' * 50}")
-        log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
+        self._log.info(f"[{self.name}] {'=' * 50}")
+        self._log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
         if self._positions:
-            log.error(f"[{self.name}] {len(self._positions)} POSITION(S) STILL OPEN: {list(self._positions)}")
+            self._log.error(f"[{self.name}] {len(self._positions)} POSITION(S) STILL OPEN: {list(self._positions)}")
         for t in self._completed:
-            log.info(f"[{self.name}]   {t['sym']:<11} {t['opt_symbol']} [{t['exit_reason']}] "
+            self._log.info(f"[{self.name}]   {t['sym']:<11} {t['opt_symbol']} [{t['exit_reason']}] "
                      f"{t['entry']:.2f} → {t['exit_price']:.2f} net={t['pnl']:.0f}")
         if self._completed:
             wins = sum(1 for t in self._completed if t["pnl"] > 0)
-            log.info(f"[{self.name}] Trades {len(self._completed)} | W/L {wins}/{len(self._completed) - wins} "
+            self._log.info(f"[{self.name}] Trades {len(self._completed)} | W/L {wins}/{len(self._completed) - wins} "
                      f"| NET {self._today_pnl:.0f} | avg {statistics.mean(t['pnl'] for t in self._completed):.0f}")
         else:
-            log.info(f"[{self.name}] no trades")
-        log.info(f"[{self.name}] {'=' * 50}")
+            self._log.info(f"[{self.name}] no trades")
+        self._log.info(f"[{self.name}] {'=' * 50}")
