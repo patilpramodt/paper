@@ -81,6 +81,8 @@ RECENTER_SEC   = 300     # extend strike ranges if spot drifts
 FLUSH_SEC      = 3
 GZ_LEVEL       = 5
 MIN_FREE_GB    = 3       # skip recording when the disk is nearly full
+CTX_MINUTES    = 60      # minutes of PCR / stock OI history kept for strategies
+CTX_OI_STEPS   = 3       # stock OI context sums strikes within this many steps of spot
 
 NIFTY_TOKEN = 256265
 BANKNIFTY_TOKEN = 260105
@@ -158,6 +160,12 @@ class TickRecorder:
         self._threads: list[threading.Thread] = []
         self._rows_written = {g: 0 for g in GROUPS}
         self._inst_lock = threading.Lock()
+
+        # Live option context for strategies (core/option_context.py), one
+        # entry per minute snapshot. Appends happen on the snapshot thread;
+        # readers copy with tuple() and must tolerate a missing minute.
+        self.ctx_nifty: deque = deque(maxlen=CTX_MINUTES)         # (ts, pcr_oi_atm10)
+        self.ctx_stock: dict[str, deque] = {}                     # sym -> (ts, ce_oi, pe_oi)
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -498,6 +506,37 @@ class TickRecorder:
                     pcr_oi_atm10=r(pe_n, ce_n), pcr_oi_all=r(pe_oi, ce_oi),
                     pcr_vol_all=r(pe_v, ce_v), ce_oi=ce_oi, pe_oi=pe_oi, max_pain=pain or "")
 
+    def _near_oi(self, root, spot):
+        """(CE OI, PE OI) summed over nearest-expiry strikes within
+        CTX_OI_STEPS strike steps of spot — the stock OI the option-context
+        gate was tested on (2026-10-10 study, chain_1m)."""
+        exps = self._expiries(root)
+        if not exps or not spot:
+            return None
+        rows = [(k[1], k[2], tok) for k, tok in self._opt_by_root[root].items()
+                if k[0] == exps[0] and tok in self._recorded]
+        strikes = sorted({r[0] for r in rows})
+        if len(strikes) < 2:
+            return None
+        step = min(b - a for a, b in zip(strikes, strikes[1:]) if b > a)
+        ce = pe = 0
+        for k, it, tok in rows:
+            if abs(k - spot) <= CTX_OI_STEPS * step:
+                if it == "CE":
+                    ce += self._hub.last_oi(tok)
+                else:
+                    pe += self._hub.last_oi(tok)
+        return (ce, pe) if ce and pe else None
+
+    def _update_ctx(self, now, sn):
+        pcr = sn.get("pcr_oi_atm10")
+        if pcr:
+            self.ctx_nifty.append((now, float(pcr)))
+        for s, tok in self._stock_spot.items():
+            oi = self._near_oi(s, self._hub.last_price(tok))
+            if oi:
+                self.ctx_stock.setdefault(s, deque(maxlen=CTX_MINUTES)).append((now, *oi))
+
     def _snapshot(self, now):
         h = self._hub
         n, bn, vix = h.last_price(NIFTY_TOKEN), h.last_price(BANKNIFTY_TOKEN), h.last_price(VIX_TOKEN)
@@ -516,6 +555,7 @@ class TickRecorder:
             row[f"nifty_{k}"] = v
         for k, v in sb.items():
             row[f"banknifty_{k}"] = v
+        self._update_ctx(now, sn)
         path = os.path.join(self._dir, "snapshot_1m.csv")
         header = not os.path.isfile(path)
         with open(path, "a", newline="") as f:

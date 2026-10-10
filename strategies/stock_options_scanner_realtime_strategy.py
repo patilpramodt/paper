@@ -151,6 +151,13 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
   stop loss, the Rs 5,000 cap and the EOD square-off are the only exits.
   2026-10-01: T45 added — every trade is closed 45 min after entry
   (t45_exit_min), whatever its P&L, unless SL/TP/EOD closed it first.
+  2026-10-10: T45 turned OFF. It cut P&L both in the 13-month spot backtest
+  and in the Oct 7-9 replay on recorded option quotes.
+
+  2026-10-10: OPTION-CONTEXT GATE (core/option_context.py), checked after
+  the entry gate — NIFTY PCR on the trade's side, NIFTY moving the same way,
+  and opposite-side OI building in the stock's own chain. Oct 7-9 RT trades
+  replayed on recorded quotes: 81 kept, +Rs570/trade, positive all 3 days.
 
   NOTE ON THE EOD BUG: the square-off runs BEFORE the trading-window guard
   in _heartbeat(). In spike.py and all four candle-breakout files the
@@ -170,6 +177,7 @@ from core.base_strategy import BaseStrategy
 from core.entry_gate import (
     SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason,
 )
+from core.option_context import OPT_CTX_DEFAULTS, OptionContext
 from core.costs import (
     effective_spread,
     fixed_costs_rs,
@@ -230,6 +238,10 @@ CFG = {
     "gate_rs_min_pct":    0.1,  # stock move from open minus NIFTY's, signal direction
     "gate_range_min_atr":    12.0,  # day high-low so far >= this x 1-min ATR14
     "require_vwap_align": False,
+    # 2026-10-10: option-chain confirmation (PCR + NIFTY direction + opposite
+    # OI build-up), checked after the entry gate. False = old behaviour.
+    "require_opt_ctx":    True,
+    "opt_ctx":            dict(OPT_CTX_DEFAULTS),
 
     # ── bar mechanics (still used for the volume baseline / ATR) ─────────────
     "bar_minutes":      3,
@@ -289,7 +301,7 @@ CFG = {
     "max_trades_day":       None,
     "time_stop_min":        None,   # time stop REMOVED — no trade is killed on age
     "stale_price_sec":      45,     # profit decisions ignore prints older than this
-    "t45_exit_min":         45,     # exit every trade 45 min after entry (None = off)
+    "t45_exit_min":         None,   # was 45 — off 2026-10-10, it cut P&L in both backtests
 
     # ── output ───────────────────────────────────────────────────────────────
     "csv_file": "stock_opt_scanner_rt_trades.csv",
@@ -420,6 +432,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             "rs_min_pct": CFG["gate_rs_min_pct"],
             "range_min_atr": CFG["gate_range_min_atr"],
         })
+        self._ctx          = OptionContext(market_hub, CFG["opt_ctx"])
         self._store        = None                 # StockOptionStore
         self._stocks       = {}                   # token -> _StockState
         self._by_sym       = {}                   # sym   -> _StockState
@@ -752,6 +765,15 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
                                  block=f"{why} {detail}".strip(), **meta)
                 return
             log.info(f"[{self.name}] {st.sym} {side} entry gate PASSED {g}")
+
+        if CFG["require_opt_ctx"]:
+            ok, why, g = self._ctx.check(st.sym, side, ts)
+            if not ok:
+                detail = " ".join(f"{k}={v}" for k, v in g.items())
+                self._log_signal(ts, st.sym, "OPT_CTX_BLOCK", side,
+                                 block=f"{why} {detail}".strip(), **meta)
+                return
+            log.info(f"[{self.name}] {st.sym} {side} option context PASSED {g}")
 
         atr = st.atr_or_est(CFG["atr_bars"])
         if atr is None:

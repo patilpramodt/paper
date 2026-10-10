@@ -106,6 +106,7 @@ from core.costs import effective_spread, fixed_costs_rs, net_pnl_rs
 from core.entry_gate import (
     SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason,
 )
+from core.option_context import OPT_CTX_DEFAULTS, OptionContext
 
 log = logging.getLogger("strategy.stock_opt_scanner_flow")
 
@@ -151,6 +152,11 @@ CFG = {
     "gate_mode":          "rs_off_extreme",
     "gate_rs_min_pct":    0.5,  # stock move from open minus NIFTY's, signal direction
     "gate_ext_min_atr":      3.0,   # price >= this x ATR14 back from day high (UP) / low (DOWN)
+    # 2026-10-10: option-chain confirmation (core/option_context.py) after the
+    # entry gate. Oct 7-9 FLOW trades replayed on recorded quotes: 41 kept,
+    # +Rs812/trade, positive all 3 days (all FLOW trades: -Rs233).
+    "require_opt_ctx":    True,
+    "opt_ctx":            dict(OPT_CTX_DEFAULTS),
 
     # ── option selection ─────────────────────────────────────────────────────
     "atm_offset_steps": 0,      # 0 = ATM
@@ -176,7 +182,7 @@ CFG = {
     "max_trades_per_stock": None,
     "max_trades_day":       None,
     "stale_price_sec":      45,
-    "t45_exit_min":         45,     # exit every trade 45 min after entry (None = off)
+    "t45_exit_min":         None,   # was 45 — off 2026-10-10, it cut P&L in both backtests
 
     # ── output ───────────────────────────────────────────────────────────────
     "csv_file": "stock_opt_scanner_flow_trades.csv",
@@ -236,6 +242,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             "rs_min_pct": CFG["gate_rs_min_pct"],
             "ext_min_atr": CFG["gate_ext_min_atr"],
         })
+        self._ctx           = OptionContext(market_hub, CFG["opt_ctx"])
         self._store        = None                 # StockOptionStore
         self._stocks        = {}                  # token -> _StockState
         self._by_sym        = {}                  # sym   -> _StockState
@@ -467,6 +474,12 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
                 log.debug(f"[{self.name}] {st.sym} {side} imbalance blocked by entry gate: {why} {g}")
                 return
             log.info(f"[{self.name}] {st.sym} {side} entry gate PASSED {g}")
+        if CFG["require_opt_ctx"]:
+            ok, why, g = self._ctx.check(st.sym, side, ts)
+            if not ok:
+                log.debug(f"[{self.name}] {st.sym} {side} imbalance blocked by option context: {why} {g}")
+                return
+            log.info(f"[{self.name}] {st.sym} {side} option context PASSED {g}")
         self._log_signal(ts, st.sym, "IMBALANCE_TRIGGER", side, **meta)
         log.info(
             f"[{self.name}] {st.sym} {side} imbalance @ {price:.2f} "

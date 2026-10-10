@@ -121,6 +121,16 @@ profit between CFG["target_rs_min"] and CFG["target_rs_max"].
   and a filtered record cannot tell you what the raw signal is worth. The
   stop loss, the Rs 5,000 cap and the EOD square-off are the only exits.
 
+  2026-10-10: on the 13-month spot backtest (5-min bars, Black-Scholes
+  repricing, selected Sep-Apr, checked May-Oct) this entry lost all day
+  (-Rs150/trade in both halves). Only the 09:30-10:30 thrusts WITH NIFTY
+  were positive in both halves with a spot bracket (+393 / +103 Rs/trade).
+  So: last_entry_time 10:30, the option-context gate (core/option_context.py:
+  NIFTY PCR + NIFTY direction + opposite OI build-up) after the bar gates,
+  and exit_mode "spot" — SL 1.5x / TP 3x atr5 on the stock, the same
+  bracket RT and FLOW use. The rupee ladder below is kept for exit_mode
+  "ladder".
+
   NOTE ON THE EOD BUG: the square-off runs BEFORE the trading-window guard
   in _heartbeat(). In spike.py and all four candle-breakout files the
   force-exit sat after `if t < start or t > close: return`, so it was dead
@@ -142,6 +152,8 @@ from core.costs import (
     net_pnl_rs,
     stock_round_trip_cost_pts,
 )
+from core.entry_gate import SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason
+from core.option_context import OPT_CTX_DEFAULTS, OptionContext
 
 log = logging.getLogger("strategy.stock_opt_scanner")
 
@@ -182,9 +194,19 @@ CFG = {
     # ── master switch ────────────────────────────────────────────────────────
     "enabled": True,
 
+    # 2026-10-10: trade only the original 14. On the 13-month backtest the 7
+    # names added 2026-09-28 lost -Rs1,024/trade out of sample under the new
+    # rules (the 14: +Rs151). UNIVERSE itself stays 21 — t.py and the tick
+    # recorder share it. None = trade the whole UNIVERSE.
+    "trade_universe": [
+        "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "INFY",
+        "TCS", "AXISBANK", "TATASTEEL", "BAJFINANCE", "KOTAKBANK",
+        "HINDALCO", "MARUTI", "LT", "ADANIENT",
+    ],
+
     # ── session windows (IST) ────────────────────────────────────────────────
     "start_time":      dtime(9, 30),   # skip the first 15 min of open chaos
-    "last_entry_time": dtime(14, 45),
+    "last_entry_time": dtime(10, 30),  # was 14:45 — 2026-10-10, see docstring
     "close_time":      dtime(15, 15),  # force square-off
     # Hour 10 was -20,919 across 132 entries roster-wide in the 56-session
     # study. Kept as a switch rather than a hard rule since that finding is
@@ -201,6 +223,8 @@ CFG = {
     "atr_bars":         14,
     "min_range_atr":    0.80,   # bar range vs ATR — reject dead bars
     "require_vwap_align": True,
+    "require_opt_ctx":    True,     # 2026-10-10: core/option_context.py
+    "opt_ctx":            dict(OPT_CTX_DEFAULTS),
 
     # ── option selection ─────────────────────────────────────────────────────
     "atm_offset_steps": 0,      # 0 = ATM. 1 = one step OTM (cheaper, lower delta)
@@ -241,6 +265,14 @@ CFG = {
     "max_trades_per_stock": None,
     "max_trades_day":       None,
     "time_stop_min":        None,   # time stop REMOVED — no trade is killed on age
+
+    # ── exit mode ────────────────────────────────────────────────────────────
+    # "spot"   (2026-10-10) SL 1.5x / TP 3x atr5 on the STOCK price, held to
+    #          target/stop/EOD (core/entry_gate.py). The ladder settings above
+    #          are NOT used in this mode; max_loss_rs is replaced by backstop_rs.
+    # "ladder" the rupee ladder, unchanged.
+    "exit_mode":        "spot",
+    "spot_exit":        dict(SPOT_EXIT_DEFAULTS, sl_atr=1.5),
     "stale_price_sec":      45,     # profit decisions ignore prints older than this
 
     # ── output ───────────────────────────────────────────────────────────────
@@ -325,6 +357,8 @@ class StockOptionsScannerStrategy(BaseStrategy):
 
     def __init__(self, market_hub):
         super().__init__(market_hub)
+        self._gate         = EntryGate(market_hub)   # atr5 for the spot exit only
+        self._ctx          = OptionContext(market_hub, CFG["opt_ctx"])
         self._store        = None                 # StockOptionStore
         self._stocks       = {}                   # token -> _StockState
         self._by_sym       = {}                   # sym   -> _StockState
@@ -365,7 +399,8 @@ class StockOptionsScannerStrategy(BaseStrategy):
             return False
 
         self._store = instruments
-        universe    = self._store.universe
+        universe    = [s for s in self._store.universe
+                       if not CFG["trade_universe"] or s in CFG["trade_universe"]]
         if not universe:
             log.error(f"[{self.name}] empty universe after instrument load — skipping day")
             return False
@@ -502,6 +537,7 @@ class StockOptionsScannerStrategy(BaseStrategy):
     # ── stock spot ticks → 3-minute bars ─────────────────────────────────────
 
     def _on_spot_tick(self, st: _StockState, price: float, ts: datetime, tick_ts: datetime):
+        self._gate.update(st.sym, price, ts)
         self._check_confirm(st, price, ts)
         # Volume for the bar comes from the DELTA of the cumulative
         # volume_traded field, not last_traded_quantity. last_traded_quantity
@@ -608,6 +644,10 @@ class StockOptionsScannerStrategy(BaseStrategy):
                 block = "below_vwap"
             elif side == "DOWN" and bar["c"] > vwap:
                 block = "above_vwap"
+        if block is None and CFG["require_opt_ctx"]:
+            ok, why, g = self._ctx.check(st.sym, side, ts)
+            if not ok:
+                block = f"{why} " + " ".join(f"{k}={v}" for k, v in g.items())
 
         meta = {
             "close": bar["c"], "body_ratio": body_ratio, "vol_ratio": vol_ratio,
@@ -822,6 +862,18 @@ class StockOptionsScannerStrategy(BaseStrategy):
                 f"[{CFG['min_sl_to_cost_ratio']}x cost {rt_pts:.2f}] — rejected, not widened"
             )
 
+        bracket = None
+        if block is None and CFG["exit_mode"] == "spot":
+            st_tok = self._by_sym[sym].token
+            spot   = self.get_price(st_tok) or p["spot"]
+            atr5   = self._gate.atr5(sym)
+            if not atr5:
+                block = "no_atr5"
+            else:
+                bracket = spot_bracket(p["side"], spot, atr5, CFG["spot_exit"])
+                bracket["spot_token"] = st_tok
+                sl_pts = CFG["spot_exit"]["backstop_rs"] / qty
+
         if block:
             log.info(f"[{self.name}] {sym} {p['opt_symbol']} entry BLOCKED — {block}")
             self._log_signal(ts, sym, "ENTRY_BLOCK", p["side"], block=block,
@@ -866,6 +918,8 @@ class StockOptionsScannerStrategy(BaseStrategy):
             ),
             "entry_oi": oi, "entry_volume": volume,
         }
+        if bracket:
+            tr.update(bracket)
         self._positions[tok] = tr
         self._pending.pop(tok, None)
         self._trades_today += 1
@@ -920,6 +974,13 @@ class StockOptionsScannerStrategy(BaseStrategy):
 
         exit_px = round(max(0.05, ltp - tr["spread"] / 2.0), 2)
         unreal  = (exit_px - tr["entry"]) * qty - fixed_costs_rs(qty, tr["entry"], exit_px)
+
+        if "sl_spot" in tr:
+            age = (ts - tr["entry_ts"]).total_seconds() / 60.0
+            why = spot_exit_reason(tr, self.get_price(tr["spot_token"]), unreal, age, CFG["spot_exit"])
+            if why:
+                self._exit(tok, why, ts, ltp)
+            return
 
         # ── 1. hard cap ──────────────────────────────────────────────────────
         if unreal >= CFG["target_rs_max"]:

@@ -52,6 +52,29 @@ still one month of real option data — treat the paper record as the test.
 
   One open position per stock. max_trades_per_stock / max_losses_per_stock
   never bound in the backtest (a stock rarely breaks out twice by 11:30).
+
+═══════════════════════════════════════════════════════════════════════════
+  2026-10-10 CHANGES
+═══════════════════════════════════════════════════════════════════════════
+  13-month backtest (Sep 2025 - Oct 2026, 5-min spot, Black-Scholes option
+  repricing that matched the live MBO fills at r=0.99; selected on Sep-Apr,
+  checked on May-Oct):
+
+                                     train Rs/trade   test Rs/trade
+    as it was (to 11:30, SL 2 ATR)        -164            +117
+    to 10:30, SL 1.5 ATR                  +335            +210
+    ... + 1 strike ITM                    +443            +239
+
+   - last_bar_start 11:30 -> 10:30. The 10:30-11:30 breakouts lost in both
+     halves; the first 45 minutes after 09:45 carry the edge.
+   - sl_atr 2.0 -> 1.5. TP stays 3.0. Time stops, trailing and break-even
+     stops were tested and all lost out of sample.
+   - itm_steps 1: one strike in the money. On the recorded chain an ITM1
+     strike pays ~16% less spread per unit of delta than ATM.
+   - option context: NIFTY ATM±10 OI PCR must be on the trade's side
+     (core/option_context.py). NIFTY direction is already rule 4. Oct 7-9
+     MBO trades with it: 7, +Rs1,193/trade replayed; against it: 5, losing.
+     VIX level / change were tested on 13 months and not used.
 """
 
 import csv
@@ -65,6 +88,7 @@ from typing import Optional
 
 from core.base_strategy import BaseStrategy
 from core.costs import effective_spread, fixed_costs_rs, net_pnl_rs
+from core.option_context import OPT_CTX_DEFAULTS, OptionContext
 
 log = logging.getLogger("strategy.stock_opt_morning_bo")
 
@@ -88,7 +112,7 @@ CFG = {
 
     # ── session (IST) ────────────────────────────────────────────────────────
     "first_bar_start": dtime(9, 45),   # 7th bar of the day — needs an opening range
-    "last_bar_start":  dtime(11, 30),
+    "last_bar_start":  dtime(10, 30),  # was 11:30 — see 2026-10-10 notes
     "close_time":      dtime(15, 10),
 
     # ── signal ───────────────────────────────────────────────────────────────
@@ -101,17 +125,22 @@ CFG = {
     "seed_days":     5,                # calendar days of history fetched at start
 
     # ── exits (multiples of stock ATR, applied to the SPOT) ──────────────────
-    "sl_atr":        2.0,
+    "sl_atr":        1.5,              # was 2.0 (2026-10-10)
     "tp_atr":        3.0,
     "max_loss_rs":   4000.0,           # safety net on the option leg only
 
     # ── option selection / gates ─────────────────────────────────────────────
-    "atm_delta":       0.47,           # measured on real Sep-2026 ATM stock options
+    "itm_steps":       1,              # strikes in the money (0 = ATM, the pre-2026-10-10 setting)
+    "atm_delta":       0.57,           # delta of the bought strike: ATM 0.47-0.50, ITM1 ~0.58 (Oct 2026 chain)
     "min_net_tp_rs":   300.0,
     "opt_tick_wait_s": 20,
     "prem_min":        3.0,
     "max_spread_pct":  0.05,           # of premium
     "skip_expiry_day": True,           # nearest-expiry ATM on expiry day is a lottery ticket
+
+    # ── option-chain confirmation (core/option_context.py) ───────────────────
+    "require_opt_ctx": True,
+    "opt_ctx":         dict(OPT_CTX_DEFAULTS, nifty_dir=False, oi_flow=False),
     "lots":            1,
 
     # ── limits ───────────────────────────────────────────────────────────────
@@ -191,6 +220,7 @@ class StockOptMorningBreakoutStrategy(BaseStrategy):
         self._eod_done   = False
         self._last_hb    = None
         self._expiry_day = False
+        self._ctx        = OptionContext(market_hub, CFG["opt_ctx"])
 
     @property
     def name(self) -> str:
@@ -451,6 +481,10 @@ class StockOptMorningBreakoutStrategy(BaseStrategy):
             block = f"nifty_bias={nb}"
         elif rs is None or sgn * rs < CFG["rs_min"]:
             block = f"rs={rs if rs is None else round(rs, 4)}"
+        elif CFG["require_opt_ctx"]:
+            ok, why, g = self._ctx.check(sym, side, ts)
+            if not ok:
+                block = f"{why} " + " ".join(f"{k}={v}" for k, v in g.items())
         if block:
             self._log_signal(ts, sym, "GATE_BLOCK", side, block=block, **meta)
             return
@@ -466,6 +500,9 @@ class StockOptMorningBreakoutStrategy(BaseStrategy):
         sym = st["sym"]
         opt_type = "CE" if side == "UP" else "PE"
         strike = self._store.atm_strike(sym, spot)
+        if strike is not None and CFG["itm_steps"]:
+            itm = CFG["itm_steps"] * self._store.strike_step(sym)
+            strike = round(strike - itm if opt_type == "CE" else strike + itm, 2)
         tok, opt_symbol, lot = self._store.get_option(sym, strike, opt_type)
         if not tok:
             self._log_signal(ts, sym, "NO_CONTRACT", side, block=f"strike={strike}")
