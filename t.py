@@ -114,6 +114,7 @@ from strategies.stock_options_scanner_orderflow_strategy import StockOptionsScan
 from strategies.stock_opt_morning_breakout_strategy import StockOptMorningBreakoutStrategy
 from strategies.orb30_strategy import ORB30Strategy
 from strategies.orb30_rvol_strategy import ORB30RvolStrategy, ORB30RvolTrailStrategy
+from strategies.banknifty_2candle_breakout_strategy import BankNifty2CandleBreakoutStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -145,6 +146,7 @@ ACTIVE_STRATEGIES = [
     ORB30Strategy,                        # ORB30:                  9:45-15:15 21 stocks + NIFTY + BANKNIFTY, first 30-min candle ±2 break on 30-min close, SL candle ∓5, Rs500 TP, 1 trade/instrument (PAPER only)
     ORB30RvolStrategy,                    # ORB30 RVOL (test):      ORB30 on 21 stocks only, first-30m volume >= 2x 14-day avg, candle SL, no target, hold to 15:15 (PAPER only)
     ORB30RvolTrailStrategy,               # ORB30 RVOL TRAIL (test): same as ORB30 RVOL + Rs1000 step trail on option P&L (PAPER only)
+    BankNifty2CandleBreakoutStrategy,     # BankNifty 2-Candle BO:  9:16-15:15 first opposite-colour 1-min pair range, close breakout → SELL ATM PE/CE, 1:1 on index, 1 re-entry after SL (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,6 +229,7 @@ def setup_logging():
         "strategy.orb30":                          "orb30.log",
         "strategy.orb30_rvol":                     "orb30_rvol.log",
         "strategy.orb30_rvol_trail":               "orb30_rvol_trail.log",
+        "strategy.banknifty_2candle_bo":           "banknifty_2candle_bo.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)

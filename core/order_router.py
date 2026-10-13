@@ -907,6 +907,119 @@ class OrderRouter:
         return None
 
     # ─────────────────────────────────────────────────────────────────────────
+    #  Short-option support (added for BANKNIFTY_2CANDLE_BO) — additive only.
+    #  SELL-to-open / BUY-to-close already work through place_sell / place_buy
+    #  (same MIS MARKET + market_protection order). Nothing above is changed.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def place_buy_with_retry(
+        self,
+        strategy_name: str,
+        symbol:        str,
+        token:         int,
+        qty:           int,
+        ltp:           float,
+        live_mode:     bool,
+        max_retries:   int = 3,
+    ) -> Optional[Tuple[str, float]]:
+        """
+        BUY-to-close counterpart of place_sell_with_retry(), for short legs.
+        Same flow: free retry after attempt 1, position check from attempt 2,
+        stop if the position is already flat, loud MANUAL alert at the end.
+        """
+        for attempt in range(1, max_retries + 1):
+            log.info(
+                f"[Router] BUY-to-close attempt {attempt}/{max_retries} | "
+                f"{strategy_name} | {symbol} | qty={qty} | ltp={ltp:.2f}"
+            )
+            result = self.place_buy(strategy_name, symbol, token, qty, ltp, live_mode)
+            if result is not None:
+                return result
+            if not live_mode:
+                return None
+
+            log.warning(f"[Router] BUY-to-close attempt {attempt}/{max_retries} FAILED | "
+                        f"{strategy_name} | {symbol}")
+            if attempt > 1 and not self._is_position_open(symbol):
+                log.warning(f"[Router] {symbol} short is ALREADY FLAT — no further BUY retries")
+                return None
+            fresh = self._hub.last_price(token)
+            if fresh:
+                ltp = fresh
+
+        log.error(
+            f"\n{'!'*60}\n"
+            f"[Router][CRITICAL] BUY-to-close FAILED after {max_retries} attempts "
+            f"— SHORT position STILL OPEN!\n"
+            f"  Strategy  : {strategy_name}\n"
+            f"  Symbol    : {symbol}  qty={qty}\n"
+            f"  → *** SQUARE OFF MANUALLY IN ZERODHA CONSOLE NOW! ***\n"
+            f"{'!'*60}"
+        )
+        return None
+
+    def net_quantity(self, symbol: str) -> Optional[int]:
+        """
+        Signed net quantity for `symbol` from kite.positions() (negative = short).
+        0 if no position. None on API error — the caller decides what is safe.
+        Used for position reconciliation after a restart.
+        """
+        kite = self._hub.kite
+        if kite is None:
+            return None
+        try:
+            for pos in kite.positions().get("net", []):
+                if pos.get("tradingsymbol") == symbol:
+                    return int(pos.get("quantity") or 0)
+            return 0
+        except Exception as exc:
+            log.warning(f"[Router] net_quantity({symbol}) API error: {exc}")
+            return None
+
+    def check_margin(
+        self,
+        strategy_name:    str,
+        symbol:           str,
+        qty:              int,
+        transaction_type: str,
+        fallback_required: float,
+    ) -> Tuple[bool, float, float]:
+        """
+        LIVE pre-trade margin check → (ok, required_rs, available_rs).
+        Required comes from kite.order_margins() for this exact order, or
+        `fallback_required` if that call fails. Available = equity 'net'.
+        If available margin cannot be read, returns ok=False (cannot verify).
+        Read-only: places nothing.
+        """
+        kite = self._hub.kite
+        if kite is None:
+            return False, fallback_required, 0.0
+        required = fallback_required
+        try:
+            res = kite.order_margins([{
+                "exchange": kite.EXCHANGE_NFO, "tradingsymbol": symbol,
+                "transaction_type": transaction_type, "variety": kite.VARIETY_REGULAR,
+                "product": kite.PRODUCT_MIS, "order_type": kite.ORDER_TYPE_MARKET,
+                "quantity": qty, "price": 0, "trigger_price": 0,
+            }])
+            if res and res[0].get("total"):
+                required = float(res[0]["total"])
+        except Exception as exc:
+            log.warning(f"[Router] order_margins({symbol}) failed: {exc} — "
+                        f"using fallback Rs {fallback_required:,.0f}")
+        try:
+            available = float(kite.margins(segment="equity")["net"])
+        except Exception as exc:
+            log.error(f"[Router] margins() failed: {exc} — cannot verify margin")
+            return False, required, 0.0
+        ok = available >= required
+        log.info(
+            f"[Router] Margin check {strategy_name} | {transaction_type} {symbol} x{qty} | "
+            f"required={required:,.0f} available={available:,.0f} → {'OK' if ok else 'INSUFFICIENT'}"
+        )
+        return ok, required, available
+
+    # ─────────────────────────────────────────────────────────────────────────
     #  Internal — paper simulation
     # ─────────────────────────────────────────────────────────────────────────
 

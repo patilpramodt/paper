@@ -107,6 +107,13 @@ class InstrumentStore:
 
         return None, None   # historical expiry  caller uses B-S fallback
 
+    def lot_size(self, token: int) -> int:
+        """Lot size of a contract, from the live NFO dump (0 if unknown). Never hard-code it."""
+        if self._df is None or "lot_size" not in self._df.columns:
+            return 0
+        hit = self._df[self._df["instrument_token"] == int(token)]
+        return int(hit.iloc[0]["lot_size"]) if not hit.empty else 0
+
     def get_nearest_expiry_token(
         self,
         spot: float,
