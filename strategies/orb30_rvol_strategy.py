@@ -11,7 +11,7 @@ ORB30 (strategies/orb30_strategy.py) with two changes:
            day decides: below the threshold, the stock is done for the day.
 
   EXIT     ORB30_RVOL        no target — candle SL or 15:15 square-off
-           ORB30_RVOL_TRAIL  no target — candle SL, plus a Rs1000 step lock on
+           ORB30_RVOL_TRAIL  rvol >= 3 (not 2); no target — candle SL, plus a Rs1000 step lock on
                              option P&L: peak +1000 -> stop at entry (Rs0),
                              +2000 -> +1000, +3000 -> +2000 ...  (gross, bid side)
 
@@ -29,6 +29,7 @@ from strategies.orb30_strategy import CFG as BASE_CFG, ORB30Strategy, _now_ist
 
 CFG = {
     "rvol_min":        2.0,
+    "rvol_min_trail":  3.0,         # TRAIL only: 1-yr backtest +Rs280/trade at >=3 vs +Rs64 at >=2
     "rvol_lookback":   14,          # prior sessions averaged
     "rvol_min_days":   10,          # fewer prior sessions -> no rvol -> no trade
     "history_days":    30,          # calendar days fetched at pre-market
@@ -44,6 +45,7 @@ class ORB30RvolStrategy(ORB30Strategy):
     TARGET_RS     = None
     TRADE_INDICES = False
     TRAIL_STEP_RS = None
+    RVOL_MIN      = CFG["rvol_min"]
 
     _FIELDS = ORB30Strategy._FIELDS + ["rvol", "peak_pnl"]
 
@@ -59,7 +61,7 @@ class ORB30RvolStrategy(ORB30Strategy):
 
     def _exit_desc(self) -> str:
         trail = f" + Rs{self.TRAIL_STEP_RS:.0f} step trail" if self.TRAIL_STEP_RS else ""
-        return f"rvol>={CFG['rvol_min']} | no target{trail}"
+        return f"rvol>={self.RVOL_MIN} | no target{trail}"
 
     # ── relative volume ──────────────────────────────────────────────────────
 
@@ -113,8 +115,8 @@ class ORB30RvolStrategy(ORB30Strategy):
                 continue
             if v:
                 self._rvol[sym] = round(v / avg, 2)
-        hot = sorted(((r, s) for s, r in self._rvol.items() if r >= CFG["rvol_min"]), reverse=True)
-        self._log.info(f"[{self.name}] rvol for {len(self._rvol)} stocks | in play (>= {CFG['rvol_min']}): "
+        hot = sorted(((r, s) for s, r in self._rvol.items() if r >= self.RVOL_MIN), reverse=True)
+        self._log.info(f"[{self.name}] rvol for {len(self._rvol)} stocks | in play (>= {self.RVOL_MIN}): "
                        + (", ".join(f"{s} {r:.1f}" for r, s in hot) or "none"))
 
     def _heartbeat(self, ts: datetime):
@@ -126,11 +128,11 @@ class ORB30RvolStrategy(ORB30Strategy):
 
     def _arm_entry(self, sym: str, side: str, spot: float, sl_spot: float, ts: datetime):
         rvol = self._rvol.get(sym)
-        if rvol is None or rvol < CFG["rvol_min"]:
+        if rvol is None or rvol < self.RVOL_MIN:
             # rvol is fixed for the day, so the first breakout decides.
             self._inst[sym]["traded"] = True
             self._log.info(f"[{self.name}] {sym} skipped — rvol "
-                           f"{'n/a' if rvol is None else f'{rvol:.2f}'} < {CFG['rvol_min']}")
+                           f"{'n/a' if rvol is None else f'{rvol:.2f}'} < {self.RVOL_MIN}")
             return
         self._log.info(f"[{self.name}] {sym} rvol {rvol:.2f} — in play")
         super()._arm_entry(sym, side, spot, sl_spot, ts)
@@ -160,6 +162,7 @@ class ORB30RvolTrailStrategy(ORB30RvolStrategy):
     _log          = logging.getLogger("strategy.orb30_rvol_trail")
     CSV_FILE      = "orb30_rvol_trail_trades.csv"
     TRAIL_STEP_RS = CFG["trail_step_rs"]
+    RVOL_MIN      = CFG["rvol_min_trail"]
 
     @property
     def name(self) -> str:
