@@ -11,7 +11,7 @@ ORB30 (strategies/orb30_strategy.py) with two changes:
            day decides: below the threshold, the stock is done for the day.
 
   EXIT     ORB30_RVOL        no target — candle SL or 15:15 square-off
-           ORB30_RVOL_TRAIL  rvol >= 3 (not 2); no target — candle SL, plus a Rs1000 step lock on
+           ORB30_RVOL_TRAIL  rvol >= 2.5 (not 2); no target — candle SL, plus a Rs1000 step lock on
                              option P&L: peak +1000 -> stop at entry (Rs0),
                              +2000 -> +1000, +3000 -> +2000 ...  (gross, bid side)
 
@@ -29,7 +29,7 @@ from strategies.orb30_strategy import CFG as BASE_CFG, ORB30Strategy, _now_ist
 
 CFG = {
     "rvol_min":        2.0,
-    "rvol_min_trail":  3.0,         # TRAIL only: 1-yr backtest +Rs280/trade at >=3 vs +Rs64 at >=2
+    "rvol_min_trail":  2.5,         # TRAIL only: 1-yr backtest +48.8k / +Rs232/trade at >=2.5 vs +20.5k / +Rs64 at >=2
     "rvol_lookback":   14,          # prior sessions averaged
     "rvol_min_days":   10,          # fewer prior sessions -> no rvol -> no trade
     "history_days":    30,          # calendar days fetched at pre-market
