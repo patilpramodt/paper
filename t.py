@@ -115,6 +115,7 @@ from strategies.stock_opt_morning_breakout_strategy import StockOptMorningBreako
 from strategies.orb30_strategy import ORB30Strategy
 from strategies.orb30_rvol_strategy import ORB30RvolStrategy, ORB30RvolTrailStrategy
 from strategies.banknifty_2candle_breakout_strategy import BankNifty2CandleBreakoutStrategy
+from strategies.heikin_ashi_atm_strategy import NiftyHeikinAshiATMStrategy, BankNiftyHeikinAshiATMStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  STRATEGY REGISTRY — Add new strategy CLASS here (not instance)
@@ -147,6 +148,8 @@ ACTIVE_STRATEGIES = [
     ORB30RvolStrategy,                    # ORB30 RVOL (test):      ORB30 on 21 stocks only, first-30m volume >= 2x 14-day avg, candle SL, no target, hold to 15:15 (PAPER only)
     ORB30RvolTrailStrategy,               # ORB30 RVOL TRAIL (test): same as ORB30 RVOL + Rs1000 step trail on option P&L (PAPER only)
     BankNifty2CandleBreakoutStrategy,     # BankNifty 2-Candle BO:  9:16-15:15 first opposite-colour 1-min pair range, close breakout → SELL ATM PE/CE, 1:1 on index, 1 re-entry after SL (PAPER only)
+    NiftyHeikinAshiATMStrategy,           # Nifty HA5 ATM:          9:15-15:15 5-min Heikin Ashi, 2 same-colour candles → BUY ATM CE/PE, exit on first opposite colour (PAPER only)
+    BankNiftyHeikinAshiATMStrategy,       # BankNifty HA5 ATM:      same rules on BankNifty (PAPER only)
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +233,8 @@ def setup_logging():
         "strategy.orb30_rvol":                     "orb30_rvol.log",
         "strategy.orb30_rvol_trail":               "orb30_rvol_trail.log",
         "strategy.banknifty_2candle_bo":           "banknifty_2candle_bo.log",
+        "strategy.nifty_ha5_atm":                  "nifty_ha5_atm.log",
+        "strategy.banknifty_ha5_atm":              "banknifty_ha5_atm.log",
     }
     for name, fname in _STRAT.items():
         lg = logging.getLogger(name)
