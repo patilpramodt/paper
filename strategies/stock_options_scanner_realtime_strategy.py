@@ -178,6 +178,8 @@ from core.entry_gate import (
     SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason,
 )
 from core.option_context import OPT_CTX_DEFAULTS, OptionContext
+from core.csv_log import append_row
+from core.vix_tracker import VIX_FIELDS, VIX_TRADE_FIELDS, VixTracker
 from core.costs import (
     effective_spread,
     fixed_costs_rs,
@@ -445,6 +447,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         self._ready        = False
         self._eod_done     = False
         self._last_hb      = None
+        self._vix          = VixTracker(market_hub, "STOCK_OPT_SCANNER_RT")   # log only
 
     @property
     def name(self) -> str:
@@ -490,6 +493,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             self.subscribe_option(tok)
             self._hub.set_token_owner(tok, self.name)
 
+        self._vix.start()
         self._ready = True
         log.info(
             f"[{self.name}] ready | mode={'LIVE' if LIVE_MODE else 'PAPER'} | "
@@ -531,6 +535,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
 
     def _heartbeat(self, ts: datetime):
         t = ts.time()
+        self._vix.update(ts)
 
         # ── EOD square-off FIRST ─────────────────────────────────────────────
         # Deliberately before any window guard. In spike.py and all four
@@ -1233,13 +1238,13 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         "cost_drag", "rt_cost_pts", "spread", "reason", "mode", "order_id",
         "time_in_trade_s", "entry_oi", "entry_volume", "opt_atr", "peak",
         "trail_pts", "protected", "trail_armed", "stale_exit",
-    ]
+    ] + VIX_FIELDS + VIX_TRADE_FIELDS
 
     _SIGNAL_FIELDS = [
         "timestamp", "stock", "event", "side", "block_reason",
         "close", "vol_ratio", "roc", "vwap",
         "ltp", "spread", "oi", "opt_volume", "rt_cost",
-    ]
+    ] + VIX_FIELDS
 
     def _log_trade(self, ts, tr, action, price, status, pnl, gross, reason):
         row = {
@@ -1260,6 +1265,12 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             "trail_armed": int(tr.get("trail_armed", False)),
             "stale_exit": tr.get("stale_exit", 0),
         }
+        row.update(self._vix.fields(ts))
+        if action == "ENTRY":
+            tr["vix_entry"] = row.get("vix", "")
+        row["vix_entry"] = tr.get("vix_entry", "")
+        if action != "ENTRY" and row["vix_entry"] and row.get("vix"):
+            row["vix_chg_trade_pct"] = round((row["vix"] / row["vix_entry"] - 1) * 100, 3)
         self._write_csv(CFG["csv_file"], self._TRADE_FIELDS, row)
 
     def _log_signal(self, ts, sym, event, side, block="", **kw):
@@ -1267,6 +1278,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "stock": sym, "event": event, "side": side, "block_reason": block,
         }
+        row.update(self._vix.fields(ts))
         for k, v in kw.items():
             row[k] = round(v, 4) if isinstance(v, float) else v
         self._write_csv(
@@ -1277,12 +1289,8 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
     @staticmethod
     def _write_csv(fname, fields, row):
         try:
-            exists = os.path.isfile(fname)
-            with open(fname, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=fields)
-                if not exists:
-                    w.writeheader()
-                w.writerow({k: row.get(k, "") for k in fields})
+            # append_row rewrites the header once if columns were added (VIX)
+            append_row(fname, fields, row)
         except Exception as e:
             log.error(f"[STOCK_OPT_SCANNER] CSV write failed ({fname}): {e}")
 
@@ -1294,6 +1302,7 @@ class StockOptionsScannerRealtimeStrategy(BaseStrategy):
         log.info(f"\n[{self.name}] {'=' * 50}")
         log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
         log.info(f"[{self.name}] Trades taken   : {self._trades_today}")
+        log.info(f"[{self.name}] VIX            : {self._vix.summary()}")
 
         if self._positions:
             log.error(

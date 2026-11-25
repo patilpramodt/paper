@@ -107,6 +107,8 @@ from core.entry_gate import (
     SPOT_EXIT_DEFAULTS, EntryGate, spot_bracket, spot_exit_reason,
 )
 from core.option_context import OPT_CTX_DEFAULTS, OptionContext
+from core.csv_log import append_row
+from core.vix_tracker import VIX_FIELDS, VIX_TRADE_FIELDS, VixTracker
 
 log = logging.getLogger("strategy.stock_opt_scanner_flow")
 
@@ -255,6 +257,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
         self._ready          = False
         self._eod_done       = False
         self._last_hb         = None
+        self._vix             = VixTracker(market_hub, "STOCK_OPT_SCANNER_FLOW")   # log only
 
     @property
     def name(self) -> str:
@@ -297,6 +300,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             self.subscribe_option(tok)
             self._hub.set_token_owner(tok, self.name)
 
+        self._vix.start()
         self._ready = True
         log.info(
             f"[{self.name}] ready | mode={'LIVE' if LIVE_MODE else 'PAPER'} | "
@@ -323,6 +327,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
 
     def _heartbeat(self, ts: datetime):
         t = ts.time()
+        self._vix.update(ts)
 
         # ── EOD square-off FIRST — same fix as V1/RT (must run before the
         # window guard below, or it's dead code, as it was in spike.py etc.)
@@ -800,11 +805,11 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
         "price", "qty", "lot", "sl", "sl_pts", "status", "pnl", "gross_pnl",
         "cost_drag", "spread", "reason", "mode", "order_id",
         "time_in_trade_s", "entry_book", "entry_flow", "stale_exit",
-    ]
+    ] + VIX_FIELDS + VIX_TRADE_FIELDS
 
     _SIGNAL_FIELDS = [
         "timestamp", "stock", "event", "side", "book", "flow",
-    ]
+    ] + VIX_FIELDS
 
     def _log_trade(self, ts, tr, action, price, status, pnl, gross, reason):
         row = {
@@ -822,6 +827,12 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             "entry_flow": round(tr.get("entry_flow", 0.0), 4),
             "stale_exit": tr.get("stale_exit", 0),
         }
+        row.update(self._vix.fields(ts))
+        if action == "ENTRY":
+            tr["vix_entry"] = row.get("vix", "")
+        row["vix_entry"] = tr.get("vix_entry", "")
+        if action != "ENTRY" and row["vix_entry"] and row.get("vix"):
+            row["vix_chg_trade_pct"] = round((row["vix"] / row["vix_entry"] - 1) * 100, 3)
         self._write_csv(CFG["csv_file"], self._TRADE_FIELDS, row)
 
     def _log_signal(self, ts, sym, event, side, **kw):
@@ -829,6 +840,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
             "timestamp": ts.strftime("%Y-%m-%d %H:%M:%S"),
             "stock": sym, "event": event, "side": side,
         }
+        row.update(self._vix.fields(ts))
         for k, v in kw.items():
             row[k] = round(v, 4) if isinstance(v, float) else v
         self._write_csv(
@@ -839,12 +851,8 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
     @staticmethod
     def _write_csv(fname, fields, row):
         try:
-            exists = os.path.isfile(fname)
-            with open(fname, "a", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=fields)
-                if not exists:
-                    w.writeheader()
-                w.writerow({k: row.get(k, "") for k in fields})
+            # append_row rewrites the header once if columns were added (VIX)
+            append_row(fname, fields, row)
         except Exception as e:
             log.error(f"[STOCK_OPT_SCANNER_FLOW] CSV write failed ({fname}): {e}")
 
@@ -856,6 +864,7 @@ class StockOptionsScannerOrderflowStrategy(BaseStrategy):
         log.info(f"\n[{self.name}] {'=' * 50}")
         log.info(f"[{self.name}] END OF DAY | mode={'LIVE' if LIVE_MODE else 'PAPER'}")
         log.info(f"[{self.name}] Trades taken   : {self._trades_today}")
+        log.info(f"[{self.name}] VIX            : {self._vix.summary()}")
 
         if self._positions:
             log.error(
